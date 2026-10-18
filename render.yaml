@@ -8,3 +8,7 @@ services:
     envVars:
       - key: SUBSCRIPTION_URL
         sync: false
+      - key: UPSTREAM_X_HWID
+        sync: false
+      - key: UPSTREAM_USER_AGENT
+        sync: false

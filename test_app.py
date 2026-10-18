@@ -136,6 +136,24 @@ class SubscriptionRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(headers["x-hwid"], "configured-device")
         self.assertEqual(headers["x-device-os"], "iOS")
 
+    async def test_fixed_hwid_uses_happ_user_agent_for_browser_request(self):
+        with patch.dict("os.environ", {"UPSTREAM_X_HWID": "configured-device"}, clear=True):
+            headers = relay._upstream_request_headers(
+                make_request([(b"user-agent", b"Mozilla/5.0 Chrome/browser")])
+            )
+
+        self.assertEqual(headers["user-agent"], "Happ")
+        self.assertEqual(headers["x-hwid"], "configured-device")
+
+    async def test_payload_inspection_counts_servers_and_detects_limit_message(self):
+        body = base64.b64encode(
+            b"vless://one@example\nvmess://two@example\n"
+        )
+        self.assertEqual(relay._inspect_payload(body), (2, False))
+
+        placeholder = base64.b64encode(b"DEVICE LIMIT FULL (5/5) - remove a device first")
+        self.assertEqual(relay._inspect_payload(placeholder), (0, True))
+
     async def test_client_profile_change_refetches_instead_of_serving_wrong_cache(self):
         seen = []
 

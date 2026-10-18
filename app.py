@@ -1,6 +1,8 @@
 import asyncio
+import base64
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -37,6 +39,8 @@ UPSTREAM_HEADER_ENV = {
     "x-ver-os": "UPSTREAM_X_VER_OS",
     "x-app-version": "UPSTREAM_X_APP_VERSION",
 }
+UPSTREAM_DEFAULT_USER_AGENT = "Happ"
+SERVER_URI_PATTERN = re.compile(rb"(?i)(?:vless|vmess|trojan|ss|hysteria2?|tuic)://")
 SKIP_RESPONSE_HEADERS = frozenset(
     {
         "connection",
@@ -81,6 +85,15 @@ def _upstream_request_headers(request: Request) -> dict[str, str]:
         configured_value = os.getenv(env_name, "").strip()
         if configured_value:
             headers[header] = configured_value
+
+    # If a fixed HWID is configured but this request came from a browser, don't
+    # send the browser identity upstream. Use a Happ-style UA unless overridden.
+    fixed_hwid = os.getenv("UPSTREAM_X_HWID", "").strip()
+    configured_ua = os.getenv("UPSTREAM_USER_AGENT", "").strip()
+    incoming_ua = _client_headers(request).get("user-agent", "").lower()
+    is_browser = any(token in incoming_ua for token in ("mozilla", "chrome", "safari", "firefox", "edg/"))
+    if fixed_hwid and not configured_ua and is_browser:
+        headers["user-agent"] = UPSTREAM_DEFAULT_USER_AGENT
     return headers
 
 
@@ -102,12 +115,33 @@ def _profile_summary(headers: dict[str, str]) -> str:
     )
 
 
+def _inspect_payload(body: bytes) -> tuple[int, bool]:
+    """Return URI count and device-limit marker status without exposing body data."""
+    candidate = body
+    compact = b"".join(body.split())
+    if compact and len(compact) <= 4 * 1024 * 1024:
+        try:
+            decoded = base64.b64decode(
+                compact + b"=" * ((4 - len(compact) % 4) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+            if SERVER_URI_PATTERN.search(decoded) or b"device limit" in decoded.lower():
+                candidate = decoded
+        except (ValueError, base64.binascii.Error):
+            pass
+    lowered = candidate.lower()
+    device_limit = b"device limit full" in lowered or b"remove a device first" in lowered
+    return len(SERVER_URI_PATTERN.findall(candidate)), device_limit
+
+
 async def _fetch_snapshot(headers: dict[str, str]) -> SubscriptionSnapshot:
     if not SUBSCRIPTION_URL:
         raise HTTPException(status_code=503, detail="SUBSCRIPTION_URL is not configured.")
     if http is None:
         raise HTTPException(status_code=503, detail="Subscription service is not ready.")
 
+    logger.info("Fetching upstream subscription (%s).", _profile_summary(headers))
     try:
         upstream = await http.get(SUBSCRIPTION_URL, headers=headers)
     except httpx.HTTPError as exc:
@@ -128,6 +162,18 @@ async def _fetch_snapshot(headers: dict[str, str]) -> SubscriptionSnapshot:
         )
 
     content_type = upstream.headers.get("content-type", "").lower()
+    uri_count, device_limit = _inspect_payload(upstream.content)
+    logger.info(
+        "Upstream response (status=%d, content-type=%s, bytes=%d, server-links=%d, device-limit=%s).",
+        upstream.status_code,
+        content_type or "unspecified",
+        len(upstream.content),
+        uri_count,
+        "yes" if device_limit else "no",
+    )
+    if device_limit:
+        logger.warning("Upstream returned its device-limit placeholder; forwarding it unchanged.")
+
     body_prefix = upstream.content.lstrip(b"\xef\xbb\xbf \t\r\n").lower()
     if "text/html" in content_type or body_prefix.startswith((b"<!doctype html", b"<html")):
         logger.warning(
@@ -185,10 +231,14 @@ async def current_snapshot(request: Request) -> SubscriptionSnapshot:
 
     request_headers = _upstream_request_headers(request)
     if _snapshot is not None and request_headers == _upstream_headers:
+        logger.info("Subscription cache hit (age-seconds=%d).", max(0, int(time.monotonic() - _snapshot.fetched_at)))
         return _snapshot
+
+    logger.info("Subscription cache miss; fetching with current request profile.")
 
     async with _refresh_lock:
         if _snapshot is not None and request_headers == _upstream_headers:
+            logger.info("Subscription cache hit after lock (age-seconds=%d).", max(0, int(time.monotonic() - _snapshot.fetched_at)))
             return _snapshot
 
         # A browser, health probe, or VPN client can be the first caller.
@@ -213,6 +263,12 @@ async def current_snapshot(request: Request) -> SubscriptionSnapshot:
 async def lifespan(_: FastAPI):
     global http, _refresh_task
     http = httpx.AsyncClient(follow_redirects=True, timeout=20.0)
+    logger.info(
+        "Relay started (subscription-url-configured=%s, fixed-hwid-configured=%s, fixed-user-agent-configured=%s).",
+        "yes" if SUBSCRIPTION_URL else "no",
+        "yes" if os.getenv("UPSTREAM_X_HWID", "").strip() else "no",
+        "yes" if os.getenv("UPSTREAM_USER_AGENT", "").strip() else "no",
+    )
     try:
         yield
     finally:
@@ -236,6 +292,7 @@ async def serve_subscription(request: Request) -> Response:
 
     logger.info("Subscription request (%s).", _profile_summary(_upstream_request_headers(request)))
     snapshot = await current_snapshot(request)
+    logger.info("Serving subscription (bytes=%d, age-seconds=%d).", len(snapshot.body), max(0, int(time.monotonic() - snapshot.fetched_at)))
     return Response(content=snapshot.body, headers=snapshot.headers)
 
 
