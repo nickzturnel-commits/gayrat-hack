@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import os
 import time
@@ -65,6 +66,26 @@ def _client_headers(request: Request) -> dict[str, str]:
     }
 
 
+def _is_device_limit_response(body: bytes) -> bool:
+    markers = (b"device limit full", b"remove a device first")
+    if any(marker in body.lower() for marker in markers):
+        return True
+
+    compact = b"".join(body.split())
+    if not compact or len(compact) > 4 * 1024 * 1024:
+        return False
+    try:
+        decoded = base64.b64decode(
+            compact + b"=" * ((4 - len(compact) % 4) % 4),
+            altchars=b"-_",
+            validate=True,
+        )
+    except (ValueError, base64.binascii.Error):
+        return False
+    decoded = decoded.lower()
+    return any(marker in decoded for marker in markers)
+
+
 async def _fetch_snapshot(headers: dict[str, str]) -> SubscriptionSnapshot:
     if not SUBSCRIPTION_URL:
         raise HTTPException(status_code=503, detail="SUBSCRIPTION_URL is not configured.")
@@ -82,12 +103,32 @@ async def _fetch_snapshot(headers: dict[str, str]) -> SubscriptionSnapshot:
             detail=f"Subscription server returned {upstream.status_code}.",
         )
 
+    if _is_device_limit_response(upstream.content):
+        raise HTTPException(
+            status_code=502,
+            detail="The subscription source reports that its device limit is full.",
+        )
+
+    content_type = upstream.headers.get("content-type", "").lower()
+    body_prefix = upstream.content.lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    if "text/html" in content_type or body_prefix.startswith((b"<!doctype html", b"<html")):
+        raise HTTPException(
+            status_code=502,
+            detail="Upstream returned a web page instead of subscription data.",
+        )
+
     response_headers = {
         name.lower(): value
         for name, value in upstream.headers.items()
         if name.lower() not in SKIP_RESPONSE_HEADERS
     }
     response_headers["cache-control"] = "no-store, no-cache, must-revalidate"
+    logger.info(
+        "Fetched subscription payload (content-type=%s, bytes=%d, device-headers=%s).",
+        content_type or "unspecified",
+        len(upstream.content),
+        ",".join(sorted(name for name in headers if name.startswith("x-"))) or "none",
+    )
     return SubscriptionSnapshot(
         body=upstream.content,
         headers=response_headers,
@@ -95,39 +136,52 @@ async def _fetch_snapshot(headers: dict[str, str]) -> SubscriptionSnapshot:
     )
 
 
-async def _refresh_loop(headers: dict[str, str]) -> None:
+async def _refresh_loop() -> None:
     global _snapshot
     while True:
         await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
         try:
-            updated = await _fetch_snapshot(headers)
+            async with _refresh_lock:
+                current_headers = _upstream_headers
+                if current_headers is None:
+                    continue
+                updated = await _fetch_snapshot(current_headers)
+                _snapshot = updated
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             # Never include the secret URL or subscription body in logs.
             logger.warning("Subscription refresh failed (%s).", type(exc).__name__)
             continue
-        _snapshot = updated
         logger.info("Subscription cache refreshed.")
 
 
 async def current_snapshot(request: Request) -> SubscriptionSnapshot:
     global _snapshot, _upstream_headers, _refresh_task
 
-    if _snapshot is not None:
+    request_headers = _client_headers(request)
+    if _snapshot is not None and request_headers == _upstream_headers:
         return _snapshot
 
     async with _refresh_lock:
-        if _snapshot is not None:
+        if _snapshot is not None and request_headers == _upstream_headers:
             return _snapshot
 
-        _upstream_headers = _client_headers(request)
-        try:
-            _snapshot = await _fetch_snapshot(_upstream_headers)
-        except HTTPException:
-            raise
+        # A browser, health probe, or VPN client can be the first caller.
+        # Refresh whenever the incoming client profile differs so one caller
+        # cannot poison the shared cache for another.
+        updated = await _fetch_snapshot(request_headers)
+        _snapshot = updated
+        _upstream_headers = request_headers
 
-        _refresh_task = asyncio.create_task(_refresh_loop(_upstream_headers.copy()))
+        if _refresh_task is not None:
+            _refresh_task.cancel()
+            try:
+                await _refresh_task
+            except asyncio.CancelledError:
+                pass
+
+        _refresh_task = asyncio.create_task(_refresh_loop())
         return _snapshot
 
 

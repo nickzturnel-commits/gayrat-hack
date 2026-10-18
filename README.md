@@ -9,7 +9,7 @@ The service fetches a VPN subscription from `SUBSCRIPTION_URL`, caches the upstr
 3. Run `uvicorn app:app --host 0.0.0.0 --port 8000`.
 4. Add `http://localhost:8000/` or `http://localhost:8000/sub.txt` to the VPN client.
 
-On the first GET request, the relay fetches the upstream subscription and forwards supported client headers, including User-Agent and device headers. It caches the body and response headers in memory, then refreshes the cache every 15 minutes using the same headers. If a refresh fails, the last successful response remains available. Before the first successful fetch, subscription requests return an error. `HEAD` requests and `/health` do not fetch the upstream.
+On a GET request, the relay fetches the upstream subscription with supported client headers, including User-Agent and device headers such as `X-HWID`. The shared in-memory cache is refreshed if a request arrives with a different forwarded header profile, so an earlier browser request cannot leave a web page cached for a VPN client. HTML responses and known device-limit placeholder responses are rejected instead of being cached as subscription data. The relay refreshes the cache every 15 minutes using the most recently successful client profile; if a refresh fails, the last successful response remains available. Before the first successful fetch, subscription requests return an error. `HEAD` requests and `/health` do not fetch the upstream.
 
 ## Render deployment
 

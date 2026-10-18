@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import unittest
 from unittest.mock import patch
 
@@ -99,6 +100,54 @@ class SubscriptionRelayTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(caught.exception.status_code, 503)
 
+    async def test_client_profile_change_refetches_instead_of_serving_wrong_cache(self):
+        seen = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            user_agent = request.headers.get("user-agent", "")
+            seen.append(user_agent)
+            return httpx.Response(
+                200,
+                content=f"profile={user_agent}".encode(),
+                headers={"content-type": "text/plain"},
+            )
+
+        relay.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        browser_response = await relay.serve_subscription(make_request([(b"user-agent", b"Browser/test")]))
+        happ_response = await relay.serve_subscription(make_request([(b"user-agent", b"Happ/test")]))
+
+        self.assertEqual(browser_response.body, b"profile=Browser/test")
+        self.assertEqual(happ_response.body, b"profile=Happ/test")
+        self.assertEqual(seen, ["Browser/test", "Happ/test"])
+
+    async def test_html_page_is_rejected_and_not_cached(self):
+        relay.http = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(200, text="<!doctype html><html>panel</html>", headers={"content-type": "text/html"})
+            )
+        )
+
+        with self.assertRaises(HTTPException) as caught:
+            await relay.serve_subscription(make_request([(b"user-agent", b"Browser/test")]))
+
+        self.assertEqual(caught.exception.status_code, 502)
+        self.assertIsNone(relay._snapshot)
+
+    async def test_base64_encoded_device_limit_placeholder_is_rejected(self):
+        placeholder = base64.b64encode(
+            b"vless://not-a-real-server#DEVICE LIMIT FULL (5/5) - remove a device first"
+        )
+        relay.http = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, content=placeholder))
+        )
+
+        with self.assertRaises(HTTPException) as caught:
+            await relay.serve_subscription(make_request([(b"user-agent", b"Happ/test")]))
+
+        self.assertEqual(caught.exception.status_code, 502)
+        self.assertIn("device limit", caught.exception.detail.lower())
+        self.assertIsNone(relay._snapshot)
+
     async def test_refresh_reuses_headers_and_keeps_last_good_snapshot_on_failure(self):
         original = relay.SubscriptionSnapshot(b"old", {}, 1.0)
         replacement = relay.SubscriptionSnapshot(b"new", {}, 2.0)
@@ -121,7 +170,8 @@ class SubscriptionRelayTests(unittest.IsolatedAsyncioTestCase):
             relay, "_fetch_snapshot", side_effect=fetch
         ):
             with self.assertRaises(asyncio.CancelledError):
-                await relay._refresh_loop(stable_headers)
+                relay._upstream_headers = stable_headers
+                await relay._refresh_loop()
 
         self.assertIs(relay._snapshot, replacement)
         self.assertEqual(seen_headers, [stable_headers, stable_headers, stable_headers])
