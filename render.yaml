@@ -6,9 +6,35 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
       - key: SUBSCRIPTION_URL
         sync: false
       - key: UPSTREAM_X_HWID
         sync: false
       - key: UPSTREAM_USER_AGENT
+        sync: false
+      - key: UPSTREAM_X_DEVICE_INFO
+        sync: false
+      - key: UPSTREAM_X_DEVICE_MODEL
+        sync: false
+      - key: UPSTREAM_X_DEVICE_OS
+        sync: false
+      - key: UPSTREAM_X_VER_OS
+        sync: false
+      - key: UPSTREAM_X_APP_VERSION
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_PASSWORD_HASH
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: SYNC_KEY
+        sync: false
+      - key: DRIVE_API_KEY
         sync: false

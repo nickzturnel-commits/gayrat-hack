@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import PlainTextResponse
 
+import panel as admin_panel
+
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -309,3 +311,6 @@ async def subscription_file(request: Request):
 @app.get("/health", response_class=PlainTextResponse)
 async def health():
     return "ok"
+
+
+admin_panel.install(app)
