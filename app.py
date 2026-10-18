@@ -65,6 +65,24 @@ def _client_headers(request: Request) -> dict[str, str]:
     }
 
 
+def _profile_summary(headers: dict[str, str]) -> str:
+    user_agent = headers.get("user-agent", "").lower()
+    if "happ" in user_agent:
+        client = "happ"
+    elif any(token in user_agent for token in ("mozilla", "chrome", "safari", "firefox", "edg/")):
+        client = "browser"
+    elif user_agent:
+        client = "other"
+    else:
+        client = "none"
+    return "client=%s, user-agent=%s, hwid=%s, device-headers=%s" % (
+        client,
+        "present" if user_agent else "missing",
+        "present" if headers.get("x-hwid") else "missing",
+        ",".join(sorted(name for name in headers if name.startswith("x-"))) or "none",
+    )
+
+
 async def _fetch_snapshot(headers: dict[str, str]) -> SubscriptionSnapshot:
     if not SUBSCRIPTION_URL:
         raise HTTPException(status_code=503, detail="SUBSCRIPTION_URL is not configured.")
@@ -74,9 +92,17 @@ async def _fetch_snapshot(headers: dict[str, str]) -> SubscriptionSnapshot:
     try:
         upstream = await http.get(SUBSCRIPTION_URL, headers=headers)
     except httpx.HTTPError as exc:
+        logger.warning("Subscription fetch failed (transport=%s; %s).", type(exc).__name__, _profile_summary(headers))
         raise HTTPException(status_code=502, detail="Could not fetch the subscription.") from exc
 
     if upstream.status_code >= 400:
+        logger.warning(
+            "Subscription source returned an error (status=%d, content-type=%s, bytes=%d; %s).",
+            upstream.status_code,
+            upstream.headers.get("content-type", "unspecified").lower(),
+            len(upstream.content),
+            _profile_summary(headers),
+        )
         raise HTTPException(
             status_code=502,
             detail=f"Subscription server returned {upstream.status_code}.",
@@ -85,6 +111,12 @@ async def _fetch_snapshot(headers: dict[str, str]) -> SubscriptionSnapshot:
     content_type = upstream.headers.get("content-type", "").lower()
     body_prefix = upstream.content.lstrip(b"\xef\xbb\xbf \t\r\n").lower()
     if "text/html" in content_type or body_prefix.startswith((b"<!doctype html", b"<html")):
+        logger.warning(
+            "Subscription source returned HTML (content-type=%s, bytes=%d; %s).",
+            content_type or "unspecified",
+            len(upstream.content),
+            _profile_summary(headers),
+        )
         raise HTTPException(
             status_code=502,
             detail="Upstream returned a web page instead of subscription data.",
@@ -183,6 +215,7 @@ async def serve_subscription(request: Request) -> Response:
     if request.method == "HEAD":
         return Response(status_code=200, media_type="text/plain")
 
+    logger.info("Subscription request (%s).", _profile_summary(_client_headers(request)))
     snapshot = await current_snapshot(request)
     return Response(content=snapshot.body, headers=snapshot.headers)
 

@@ -100,6 +100,19 @@ class SubscriptionRelayTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(caught.exception.status_code, 503)
 
+    async def test_profile_diagnostics_never_include_header_values(self):
+        summary = relay._profile_summary(
+            {
+                "user-agent": "Happ/private-version",
+                "x-hwid": "private-device-id",
+                "x-device-os": "private-device-os",
+            }
+        )
+
+        self.assertIn("client=happ", summary)
+        self.assertIn("hwid=present", summary)
+        self.assertNotIn("private", summary)
+
     async def test_client_profile_change_refetches_instead_of_serving_wrong_cache(self):
         seen = []
 
