@@ -13,6 +13,8 @@ On a GET request, the relay fetches the upstream subscription with supported cli
 
 Opening the relay URL in a regular browser sends the browser's User-Agent, which may cause the upstream service to return its web interface; the relay reports this as an error and does not cache that page. Add the relay URL to the VPN client so it can send its own User-Agent and device headers. If the upstream reports that its device limit is full, the relay forwards that response unchanged; it cannot turn the provider's device-limit message into usable server links. Render logs identify whether the request looked like Happ or a browser and whether an HWID was present, without printing header values, the subscription URL, or its response body. The official Happ documentation describes HWID forwarding and User-Agent configuration: https://github.com/HappDev/happ_su/blob/main/dev-docs/app-management.md.
 
+To make a browser or other caller use a fixed client profile, optionally set `UPSTREAM_USER_AGENT` and `UPSTREAM_X_HWID` in Render's environment settings. Device fields `UPSTREAM_X_DEVICE_INFO`, `UPSTREAM_X_DEVICE_MODEL`, `UPSTREAM_X_DEVICE_OS`, `UPSTREAM_X_VER_OS`, and `UPSTREAM_X_APP_VERSION` are also supported. Each configured value overrides the matching incoming header. Use values belonging to your own authorized Happ device; do not invent an HWID. If these variables are empty, headers from the incoming VPN-client request are forwarded as before. Configured values are never written to logs.
+
 ## Render deployment
 
 Create a Render Web Service from this repository using `render.yaml`. Set `SUBSCRIPTION_URL` in the service environment; keep it private. Use the Render service URL as the subscription URL in the VPN client.

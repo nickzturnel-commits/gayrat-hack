@@ -28,6 +28,15 @@ REQUEST_HEADERS = frozenset(
         "x-app-version",
     }
 )
+UPSTREAM_HEADER_ENV = {
+    "user-agent": "UPSTREAM_USER_AGENT",
+    "x-hwid": "UPSTREAM_X_HWID",
+    "x-device-info": "UPSTREAM_X_DEVICE_INFO",
+    "x-device-model": "UPSTREAM_X_DEVICE_MODEL",
+    "x-device-os": "UPSTREAM_X_DEVICE_OS",
+    "x-ver-os": "UPSTREAM_X_VER_OS",
+    "x-app-version": "UPSTREAM_X_APP_VERSION",
+}
 SKIP_RESPONSE_HEADERS = frozenset(
     {
         "connection",
@@ -63,6 +72,16 @@ def _client_headers(request: Request) -> dict[str, str]:
         for name, value in request.headers.items()
         if name.lower() in REQUEST_HEADERS
     }
+
+
+def _upstream_request_headers(request: Request) -> dict[str, str]:
+    """Use configured device headers when present; otherwise forward the caller profile."""
+    headers = _client_headers(request)
+    for header, env_name in UPSTREAM_HEADER_ENV.items():
+        configured_value = os.getenv(env_name, "").strip()
+        if configured_value:
+            headers[header] = configured_value
+    return headers
 
 
 def _profile_summary(headers: dict[str, str]) -> str:
@@ -164,7 +183,7 @@ async def _refresh_loop() -> None:
 async def current_snapshot(request: Request) -> SubscriptionSnapshot:
     global _snapshot, _upstream_headers, _refresh_task
 
-    request_headers = _client_headers(request)
+    request_headers = _upstream_request_headers(request)
     if _snapshot is not None and request_headers == _upstream_headers:
         return _snapshot
 
@@ -215,7 +234,7 @@ async def serve_subscription(request: Request) -> Response:
     if request.method == "HEAD":
         return Response(status_code=200, media_type="text/plain")
 
-    logger.info("Subscription request (%s).", _profile_summary(_client_headers(request)))
+    logger.info("Subscription request (%s).", _profile_summary(_upstream_request_headers(request)))
     snapshot = await current_snapshot(request)
     return Response(content=snapshot.body, headers=snapshot.headers)
 

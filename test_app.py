@@ -113,6 +113,29 @@ class SubscriptionRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("hwid=present", summary)
         self.assertNotIn("private", summary)
 
+    async def test_configured_upstream_profile_overrides_browser_headers(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "UPSTREAM_USER_AGENT": "Happ/configured",
+                "UPSTREAM_X_HWID": "configured-device",
+                "UPSTREAM_X_DEVICE_OS": "iOS",
+            },
+            clear=True,
+        ):
+            headers = relay._upstream_request_headers(
+                make_request(
+                    [
+                        (b"user-agent", b"Chrome/browser"),
+                        (b"x-hwid", b"browser-must-not-win"),
+                    ]
+                )
+            )
+
+        self.assertEqual(headers["user-agent"], "Happ/configured")
+        self.assertEqual(headers["x-hwid"], "configured-device")
+        self.assertEqual(headers["x-device-os"], "iOS")
+
     async def test_client_profile_change_refetches_instead_of_serving_wrong_cache(self):
         seen = []
 
