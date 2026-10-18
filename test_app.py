@@ -133,20 +133,25 @@ class SubscriptionRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.status_code, 502)
         self.assertIsNone(relay._snapshot)
 
-    async def test_base64_encoded_device_limit_placeholder_is_rejected(self):
+    async def test_device_limit_response_is_forwarded_without_rewriting(self):
         placeholder = base64.b64encode(
             b"vless://not-a-real-server#DEVICE LIMIT FULL (5/5) - remove a device first"
         )
         relay.http = httpx.AsyncClient(
-            transport=httpx.MockTransport(lambda _: httpx.Response(200, content=placeholder))
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(
+                    200,
+                    content=placeholder,
+                    headers={"content-type": "text/plain; charset=utf-8"},
+                )
+            )
         )
 
-        with self.assertRaises(HTTPException) as caught:
-            await relay.serve_subscription(make_request([(b"user-agent", b"Happ/test")]))
+        response = await relay.serve_subscription(make_request([(b"user-agent", b"Happ/test")]))
 
-        self.assertEqual(caught.exception.status_code, 502)
-        self.assertIn("device limit", caught.exception.detail.lower())
-        self.assertIsNone(relay._snapshot)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.body, placeholder)
+        self.assertEqual(response.headers["content-type"], "text/plain; charset=utf-8")
 
     async def test_refresh_reuses_headers_and_keeps_last_good_snapshot_on_failure(self):
         original = relay.SubscriptionSnapshot(b"old", {}, 1.0)

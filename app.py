@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import logging
 import os
 import time
@@ -66,26 +65,6 @@ def _client_headers(request: Request) -> dict[str, str]:
     }
 
 
-def _is_device_limit_response(body: bytes) -> bool:
-    markers = (b"device limit full", b"remove a device first")
-    if any(marker in body.lower() for marker in markers):
-        return True
-
-    compact = b"".join(body.split())
-    if not compact or len(compact) > 4 * 1024 * 1024:
-        return False
-    try:
-        decoded = base64.b64decode(
-            compact + b"=" * ((4 - len(compact) % 4) % 4),
-            altchars=b"-_",
-            validate=True,
-        )
-    except (ValueError, base64.binascii.Error):
-        return False
-    decoded = decoded.lower()
-    return any(marker in decoded for marker in markers)
-
-
 async def _fetch_snapshot(headers: dict[str, str]) -> SubscriptionSnapshot:
     if not SUBSCRIPTION_URL:
         raise HTTPException(status_code=503, detail="SUBSCRIPTION_URL is not configured.")
@@ -101,12 +80,6 @@ async def _fetch_snapshot(headers: dict[str, str]) -> SubscriptionSnapshot:
         raise HTTPException(
             status_code=502,
             detail=f"Subscription server returned {upstream.status_code}.",
-        )
-
-    if _is_device_limit_response(upstream.content):
-        raise HTTPException(
-            status_code=502,
-            detail="The subscription source reports that its device limit is full.",
         )
 
     content_type = upstream.headers.get("content-type", "").lower()
