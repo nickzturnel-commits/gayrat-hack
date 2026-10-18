@@ -17,7 +17,78 @@ function setup() {
   Logger.log('Настройки проверены. Существующий триггер updateSub оставлен без изменений.');
 }
 
+// Render calls this deployed web app immediately after an admin change.
+// Deploy once as a Web app (execute as you; access: anyone); SYNC_KEY is checked here.
+function doPost(e) {
+  let lock;
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const base = (props.getProperty(SX.PROP_URL) || '').trim().replace(/\/+$/, '');
+    const key = (props.getProperty(SX.PROP_KEY) || '').trim();
+    const data = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+    if (!base || !key || !constantTimeEquals_(String(data.sync_key || ''), key)) {
+      return json_({ ok: false, error: 'Недействительные настройки или доступ.' });
+    }
+    if (data.action !== 'sync') return json_({ ok: false, error: 'Неизвестное действие.' });
+    lock = LockService.getScriptLock();
+    lock.waitLock(15000);
+
+    const manifest = fetchManifest_(base, key, Array.isArray(data.user_ids) ? data.user_ids : null);
+    if (!manifest || !Array.isArray(manifest.users) || !manifest.users.length) {
+      return json_({ ok: false, error: 'Манифест пуст или недоступен.' });
+    }
+    const wanted = Array.isArray(data.user_ids) ? new Set(data.user_ids.map(String)) : null;
+    const users = wanted ? manifest.users.filter(user => wanted.has(String(user.id))) : manifest.users;
+    let processed = 0;
+    let failed = 0;
+    users.forEach(user => {
+      try {
+        processUser_(base, key, user);
+        processed++;
+      } catch (err) {
+        failed++;
+        const message = safeError_(err);
+        Logger.log('Немедленная доставка не удалась для id=' + String(user && user.id) + ': ' + message);
+        if (user && user.id != null) {
+          try {
+            const rememberedId = PropertiesService.getScriptProperties().getProperty('PENDING_FILE_' + user.id);
+            report_(base, key, user.id, user.drive_file_id || rememberedId || null, false, message);
+          } catch (reportErr) {
+            Logger.log('Не удалось отправить отчёт для id=' + String(user.id) + '.');
+          }
+        }
+      }
+    });
+    Logger.log('Немедленная доставка: обработано ' + processed + ', ошибок ' + failed + '.');
+    return json_({ ok: true, processed: processed, failed: failed });
+  } catch (err) {
+    Logger.log('Немедленная доставка не выполнена (' + safeError_(err) + ').');
+    return json_({ ok: false, error: 'Не удалось выполнить доставку.' });
+  } finally {
+    if (lock && lock.hasLock()) lock.releaseLock();
+  }
+}
+
+function json_(value) {
+  return ContentService.createTextOutput(JSON.stringify(value)).setMimeType(ContentService.MimeType.JSON);
+}
+
+function constantTimeEquals_(left, right) {
+  let diff = left.length ^ right.length;
+  const size = Math.max(left.length, right.length);
+  for (let i = 0; i < size; i++) diff |= (left.charCodeAt(i) || 0) ^ (right.charCodeAt(i) || 0);
+  return diff === 0;
+}
+
 function updateSub() {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(15000);
+  } catch (err) {
+    Logger.log('Синхронизация уже выполняется; повтор будет при следующем запуске.');
+    return;
+  }
+  try {
   const started = Date.now();
   const props = PropertiesService.getScriptProperties();
   const base = (props.getProperty(SX.PROP_URL) || '').trim().replace(/\/+$/, '');
@@ -65,10 +136,14 @@ function updateSub() {
     Logger.log('Остановлено по бюджету времени; продолжение начнётся с элемента ' + next + '.');
   }
   Logger.log('Синхронизация завершена: обработано ' + processed + ' из ' + users.length + '.');
+  } finally {
+    lock.releaseLock();
+  }
 }
 
-function fetchManifest_(base, key) {
-  const url = base + '/api/sync/manifest';
+function fetchManifest_(base, key, userIds) {
+  const suffix = userIds && userIds.length ? '?user_ids=' + encodeURIComponent(userIds.map(String).join(',')) : '';
+  const url = base + '/api/sync/manifest' + suffix;
   let lastStatus = 0;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
