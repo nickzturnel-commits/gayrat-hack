@@ -8,12 +8,15 @@ CREATE TABLE IF NOT EXISTS users (
     drive_file_id TEXT UNIQUE,
     title_override TEXT,
     announce_override TEXT,
+    traffic_limit_bytes BIGINT CHECK (traffic_limit_bytes IS NULL OR traffic_limit_bytes BETWEEN 1000000 AND 1000000000000),
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'pending_delete')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_synced_at TIMESTAMPTZ,
     last_sync_error TEXT
 );
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS traffic_limit_bytes BIGINT;
 
 CREATE TABLE IF NOT EXISTS servers (
     id TEXT PRIMARY KEY,

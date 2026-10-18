@@ -62,6 +62,9 @@ QUOTE_DEFAULTS = ["🚀 Скорость — наш конёк", "🔒 Твои 
 DEFAULT_SETTINGS = {
     "title": "Secure X", "support_url": "https://t.me/moserrr1", "web_page_url": "", "update_interval": 1,
     "timezone": "Asia/Ashgabat", "announce_enabled": True, "announce_refresh_minutes": 5,
+    # None means inherit the upstream account limit. Per-user limits are metadata;
+    # provider usage counters remain account-wide because it does not expose per-user usage.
+    "default_traffic_limit_bytes": None,
     "quotes": QUOTE_DEFAULTS, "footers": FOOTER_DEFAULTS, "days": DAY_DEFAULTS,
 }
 
@@ -222,6 +225,8 @@ class PanelState:
         self.announce_cache: tuple[float, str] | None = None
         self.announce_quote: str | None = None
         self.login_fails: dict[str, tuple[int, float]] = {}
+        self.drive_push_last: float = 0.0
+        self.drive_push_error: str | None = None
 
     @property
     def db_configured(self):
@@ -235,6 +240,10 @@ class PanelState:
     @property
     def sync_configured(self):
         return bool(os.getenv("SYNC_KEY", "").strip())
+
+    @property
+    def drive_push_configured(self):
+        return bool(os.getenv("DRIVE_SYNC_URL", "").strip() and self.sync_configured)
 
     async def connect(self):
         if not self.db_configured:
@@ -281,6 +290,37 @@ class PanelState:
         if self.pool is None and required:
             raise HTTPException(503, self.db_error or DB_HINT)
         return self.pool
+
+    async def push_drive_sync(self, user_ids: list[int] | None = None) -> dict:
+        """Ask the authenticated Apps Script web app to update Drive immediately."""
+        target = os.getenv("DRIVE_SYNC_URL", "").strip()
+        key = os.getenv("SYNC_KEY", "").strip()
+        if not target or not key:
+            message = "Мгновенная доставка не настроена: добавьте DRIVE_SYNC_URL в Render"
+            self.drive_push_error = message
+            return {"ok": False, "pending": True, "message": message}
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(150.0, connect=12.0)) as client:
+                response = await client.post(target, headers={"X-Sync-Key": key, "Accept": "application/json"},
+                                             json={"action": "sync", "user_ids": user_ids, "sync_key": key})
+            if response.status_code >= 400:
+                raise ValueError("Apps Script отклонил запрос")
+            try:
+                result = response.json()
+            except Exception as exc:
+                raise ValueError("Apps Script вернул некорректный ответ") from exc
+            if not isinstance(result, dict) or not result.get("ok"):
+                raise ValueError("Apps Script не подтвердил доставку")
+            self.drive_push_last = time.time()
+            failed = int(result.get("failed", 0) or 0)
+            self.drive_push_error = f"Не удалось обновить файлов: {failed}" if failed else None
+            return {"ok": failed == 0, "pending": False,
+                    "message": self.drive_push_error or "Изменения сразу отправлены в Google Drive",
+                    "processed": int(result.get("processed", 0) or 0), "failed": failed}
+        except Exception as exc:
+            self.drive_push_error = "Не удалось сразу обновить Google Drive; автоматическая попытка повторится позже"
+            log.warning("Immediate Drive update failed (%s)", type(exc).__name__)
+            return {"ok": False, "pending": True, "message": self.drive_push_error}
 
     async def fetch_upstream(self, force=False):
         now = time.monotonic()
@@ -416,6 +456,7 @@ class UserBody(BaseModel):
     expires_at: datetime | None = None
     title_override: str | None = Field(default=None, max_length=200)
     announce_override: str | None = Field(default=None, max_length=4000)
+    traffic_limit_bytes: int | None = Field(default=None, ge=1_000_000, le=1_000_000_000_000)
 
 
 class ServerBody(BaseModel):
@@ -500,16 +541,16 @@ async def _announce(settings: dict) -> str:
     return value
 
 
-def _userinfo(headers: dict) -> str:
+def _userinfo(headers: dict, traffic_limit_bytes: int | None = None) -> str:
     value = headers.get("subscription-userinfo", "")
-    if not value:
-        return "upload=0; download=0; total=0; expire=0"
     parts = {}
     for token in value.split(";"):
         if "=" in token:
             key, val = token.strip().split("=", 1)
             if key.strip().lower() in {"upload", "download", "total", "expire"} and val.strip().isdigit():
                 parts[key.strip().lower()] = val.strip()
+    if traffic_limit_bytes is not None:
+        parts["total"] = str(traffic_limit_bytes)
     return "; ".join(f"{k}={parts.get(k, '0')}" for k in ("upload", "download", "total", "expire"))
 
 
@@ -528,8 +569,10 @@ async def _sync_servers(conn, body: bytes):
     return parsed
 
 
-async def build_manifest_content(conn, user, body: bytes, headers: dict, settings: dict, announce: str | None = None) -> str:
-    servers = await _sync_servers(conn, body)
+async def build_manifest_content(conn, user, body: bytes, headers: dict, settings: dict,
+                                 announce: str | None = None, servers: list[dict] | None = None) -> str:
+    if servers is None:
+        servers = await _sync_servers(conn, body)
     now = datetime.now(timezone.utc)
     expired = user["expires_at"] is not None and user["expires_at"] <= now
     active = bool(user["enabled"]) and not expired and user["status"] == "active"
@@ -544,7 +587,7 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
     else:
         announcement = await _announce(settings)
     title = user["title_override"] or settings.get("title", "Secure X")
-    info = _userinfo(headers)
+    info = _userinfo(headers, user.get("traffic_limit_bytes"))
     if user["expires_at"] is not None:
         parts = dict(token.strip().split("=", 1) for token in info.split(";") if "=" in token)
         parts["expire"] = str(int(user["expires_at"].timestamp()))
@@ -659,7 +702,10 @@ async def dashboard(request: Request):
             "last_success_at": state.upstream_fetched_at or None, "server_count": len(_extract_uris(_decode_subscription(state.upstream_body))) if state.upstream_body else 0,
             "warning": state.upstream_warning}, "traffic": {"upload": data.get("upload", 0), "download": data.get("download", 0),
             "total": data.get("total", 0), "expire": data.get("expire", 0)}, "users": user_count,
-            "last_script_request": last_script, "sync_errors": errors, "sync_enabled": state.sync_configured}
+            "last_script_request": last_script, "sync_errors": errors, "sync_enabled": state.sync_configured,
+            "drive_delivery": {"configured": state.drive_push_configured,
+                               "last_success_at": state.drive_push_last or None,
+                               "warning": state.drive_push_error}}
 
 
 @router.get("/api/admin/users")
@@ -682,10 +728,11 @@ async def users_create(data: UserBody, request: Request):
         if count >= 30:
             raise HTTPException(409, "Достигнут лимит панели: максимум 30 пользователей")
         slug = _slugify(data.name)
-        row = await conn.fetchrow("""INSERT INTO users(name,slug,note,enabled,expires_at,title_override,announce_override)
-            VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *""", data.name.strip(), slug, data.note, data.enabled,
-            _expiry_utc(data.expires_at), data.title_override, data.announce_override)
-    return {"user": _serialize(row)}
+        row = await conn.fetchrow("""INSERT INTO users(name,slug,note,enabled,expires_at,title_override,announce_override,traffic_limit_bytes)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *""", data.name.strip(), slug, data.note, data.enabled,
+            _expiry_utc(data.expires_at), data.title_override, data.announce_override, data.traffic_limit_bytes)
+    drive_sync = await state.push_drive_sync([row["id"]])
+    return {"user": _serialize(row), "drive_sync": drive_sync}
 
 
 @router.put("/api/admin/users/{user_id}")
@@ -696,10 +743,12 @@ async def users_update(user_id: int, data: UserBody, request: Request):
     pool = await state.db()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""UPDATE users SET name=$2,note=$3,enabled=$4,expires_at=$5,title_override=$6,
-            announce_override=$7,updated_at=now() WHERE id=$1 AND status='active' RETURNING *""", user_id,
-            data.name.strip(), data.note, data.enabled, _expiry_utc(data.expires_at), data.title_override, data.announce_override)
+            announce_override=$7,traffic_limit_bytes=$8,updated_at=now() WHERE id=$1 AND status='active' RETURNING *""", user_id,
+            data.name.strip(), data.note, data.enabled, _expiry_utc(data.expires_at), data.title_override, data.announce_override,
+            data.traffic_limit_bytes)
     if not row: raise HTTPException(404, "Пользователь не найден")
-    return {"user": _serialize(row)}
+    drive_sync = await state.push_drive_sync([user_id])
+    return {"user": _serialize(row), "drive_sync": drive_sync}
 
 
 @router.delete("/api/admin/users/{user_id}")
@@ -709,7 +758,8 @@ async def users_delete(user_id: int, request: Request):
     async with pool.acquire() as conn:
         row = await conn.fetchrow("UPDATE users SET status='pending_delete',enabled=FALSE,updated_at=now() WHERE id=$1 RETURNING id", user_id)
     if not row: raise HTTPException(404, "Пользователь не найден")
-    return {"ok": True, "status": "pending_delete"}
+    drive_sync = await state.push_drive_sync([user_id])
+    return {"ok": True, "status": "pending_delete", "drive_sync": drive_sync}
 
 
 @router.get("/api/admin/users/{user_id}/preview")
@@ -740,6 +790,12 @@ async def drive_link(user_id: int, request: Request):
     return {"link": f"https://www.googleapis.com/drive/v3/files/{user['drive_file_id']}?{query}", "pending": False}
 
 
+@router.post("/api/admin/drive/sync")
+async def drive_sync_now(request: Request):
+    _auth(request, csrf=True)
+    return await state.push_drive_sync()
+
+
 @router.get("/api/admin/servers")
 async def servers_list(request: Request):
     _auth(request)
@@ -756,7 +812,7 @@ async def servers_update(server_id: str, data: ServerBody, request: Request):
     async with pool.acquire() as conn:
         row = await conn.fetchrow("UPDATE servers SET custom_name=$2,hidden=$3,sort_order=$4 WHERE id=$1 RETURNING *", server_id, data.custom_name, data.hidden, data.sort_order)
     if not row: raise HTTPException(404, "Сервер не найден")
-    return {"server": _serialize(row)}
+    return {"server": _serialize(row), "drive_sync": await state.push_drive_sync()}
 
 
 class BulkServerBody(BaseModel):
@@ -770,7 +826,7 @@ async def servers_bulk(data: BulkServerBody, request: Request):
     pool = await state.db()
     async with pool.acquire() as conn:
         result = await conn.execute("UPDATE servers SET hidden=$1 WHERE id=ANY($2::text[])", data.hidden, data.server_ids)
-    return {"ok": True, "updated": int(result.rsplit(" ", 1)[-1])}
+    return {"ok": True, "updated": int(result.rsplit(" ", 1)[-1]), "drive_sync": await state.push_drive_sync()}
 
 
 @router.post("/api/admin/servers/refresh")
@@ -780,7 +836,7 @@ async def servers_refresh(request: Request):
     pool = await state.db()
     async with pool.acquire() as conn:
         servers = await _sync_servers(conn, body)
-    return {"count": len(servers)}
+    return {"count": len(servers), "drive_sync": await state.push_drive_sync()}
 
 
 @router.put("/api/admin/users/{user_id}/servers/{server_id}")
@@ -792,7 +848,7 @@ async def user_server_update(user_id: int, server_id: str, data: UserServerBody,
         if not exists: raise HTTPException(404, "Пользователь не найден")
         await conn.execute("""INSERT INTO user_servers(user_id,server_id,hidden,custom_name) VALUES($1,$2,$3,$4)
             ON CONFLICT(user_id,server_id) DO UPDATE SET hidden=EXCLUDED.hidden,custom_name=EXCLUDED.custom_name""", user_id, server_id, data.hidden, data.custom_name)
-    return {"ok": True}
+    return {"ok": True, "drive_sync": await state.push_drive_sync([user_id])}
 
 
 @router.get("/api/admin/users/{user_id}/servers")
@@ -827,6 +883,16 @@ async def settings_put(data: SettingsBody, request: Request):
     if "update_interval" in values:
         try: values["update_interval"] = max(1, min(168, int(values["update_interval"])))
         except Exception: raise HTTPException(422, "Интервал профиля должен быть числом от 1 до 168")
+    if "default_traffic_limit_bytes" in values:
+        traffic_limit = values["default_traffic_limit_bytes"]
+        if traffic_limit is not None:
+            try:
+                traffic_limit = int(traffic_limit)
+            except Exception:
+                raise HTTPException(422, "Лимит трафика должен быть от 1 МБ до 1 ТБ или общим от провайдера")
+            if traffic_limit < 1_000_000 or traffic_limit > 1_000_000_000_000:
+                raise HTTPException(422, "Лимит трафика должен быть от 1 МБ до 1 ТБ")
+            values["default_traffic_limit_bytes"] = traffic_limit
     allowed = set(DEFAULT_SETTINGS)
     if set(values) - allowed: raise HTTPException(422, "Неизвестные настройки")
     string_limits = {"title": 200, "support_url": 2048, "web_page_url": 2048, "timezone": 128}
@@ -855,7 +921,8 @@ async def settings_put(data: SettingsBody, request: Request):
             for key, value in values.items():
                 await conn.execute("INSERT INTO settings(key,value) VALUES($1,$2::jsonb) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", key, json.dumps(value, ensure_ascii=False))
     state.announce_cache = None
-    return {"settings": values}
+    drive_sync = await state.push_drive_sync() if set(values) - {"default_traffic_limit_bytes"} else None
+    return {"settings": values, "drive_sync": drive_sync}
 
 
 def _check_sync(request: Request):
@@ -886,15 +953,28 @@ async def sync_manifest(request: Request):
     # Fetch before touching DB/output. Cold starts and expired cache trigger this request directly.
     body, headers, _stale = await state.fetch_upstream()
     pool = await state.db()
+    selected_ids = None
+    selected = request.query_params.get("user_ids", "").strip()
+    if selected:
+        try:
+            selected_ids = list(dict.fromkeys(int(part) for part in selected.split(",") if part))
+        except ValueError:
+            raise HTTPException(422, "Некорректный список пользователей")
+        if not selected_ids or len(selected_ids) > 30 or any(value <= 0 for value in selected_ids):
+            raise HTTPException(422, "Некорректный список пользователей")
     async with pool.acquire() as conn:
         await conn.execute("INSERT INTO app_state(key,value) VALUES('last_script_request',to_jsonb(now())) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value")
         settings = await _settings(conn)
-        rows = await conn.fetch("SELECT * FROM users ORDER BY id")
+        servers = await _sync_servers(conn, body)
+        if selected_ids:
+            rows = await conn.fetch("SELECT * FROM users WHERE id=ANY($1::bigint[]) ORDER BY id", selected_ids)
+        else:
+            rows = await conn.fetch("SELECT * FROM users ORDER BY id")
         # Same announcement text shared across every user in this manifest response.
         announce = await _announce(settings) if settings.get("announce_enabled", True) else ""
         manifest = []
         for user in rows:
-            content = "" if user["status"] == "pending_delete" else await build_manifest_content(conn, user, body, headers, settings, announce)
+            content = "" if user["status"] == "pending_delete" else await build_manifest_content(conn, user, body, headers, settings, announce, servers)
             manifest.append({"id": user["id"], "slug": user["slug"], "status": user["status"], "enabled": user["enabled"],
                              "drive_file_id": user["drive_file_id"], "name": user["name"], "content": content})
     log.info("Apps Script manifest generated: users=%d stale-cache=%s", len(manifest), "yes" if _stale else "no")

@@ -36,5 +36,7 @@ services:
         sync: false
       - key: SYNC_KEY
         sync: false
+      - key: DRIVE_SYNC_URL
+        sync: false
       - key: DRIVE_API_KEY
         sync: false
