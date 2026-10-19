@@ -607,6 +607,7 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
         upstream_by_id = {server["id"]: server for server in servers}
         overrides = await conn.fetch("SELECT server_id,hidden,custom_name FROM user_servers WHERE user_id=$1", user["id"])
         overrides_by_id = {row["server_id"]: row for row in overrides}
+        server_lines = []
         for global_row in global_rows:
             server = upstream_by_id.get(global_row["id"])
             if not server:
@@ -616,7 +617,12 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
             if override and override["hidden"] is None and global_row["hidden"]: continue
             if not override and global_row["hidden"]: continue
             name = (override["custom_name"] if override and override["custom_name"] else None) or global_row["custom_name"] or server["name"]
-            lines.append(rename_server_uri(server["uri"], name) if name != server["name"] else server["uri"])
+            server_lines.append(rename_server_uri(server["uri"], name) if name != server["name"] else server["uri"])
+        if not server_lines:
+            # Do not let Apps Script replace a working Drive profile with a
+            # metadata-only file that Happ rejects as having no server links.
+            raise HTTPException(502, "Для этой подписки нет доступных серверов. Обновите список серверов и проверьте, что они не скрыты.")
+        lines.extend(server_lines)
     return "\n".join(lines) + "\n"
 
 
