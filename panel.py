@@ -174,7 +174,18 @@ def rename_server_uri(uri: str, name: str) -> str:
 
 def _extract_uris(text: str) -> list[str]:
     # Upstream supports one URI per line. Ignore human-readable metadata lines.
-    return [m.group(0).strip() for line in text.splitlines() if (m := URI_LINE.match(line))]
+    uris = []
+    seen = set()
+    for line in text.splitlines():
+        match = URI_LINE.match(line)
+        if not match:
+            continue
+        uri = match.group(0).strip()
+        server_id = parse_server_uri(uri)["id"]
+        if server_id not in seen:
+            seen.add(server_id)
+            uris.append(uri)
+    return uris
 
 
 def _is_html(body: bytes, content_type: str) -> bool:
@@ -588,7 +599,11 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
         announcement = await _announce(settings)
     # Give every generated Drive profile a distinct default name in Happ. The
     # underlying server credentials remain those from the shared upstream.
-    title = user["title_override"] or f"{settings.get('title', 'Secure X')} · {user['name']}"
+    title = user["title_override"] or f"{settings.get('title', 'Secure X')} · {user.get('name', user.get('slug', 'Пользователь'))}"
+    if expired:
+        title = f"Подписка истекла · {user.get('name', user.get('slug', 'Пользователь'))}"
+    elif not user["enabled"] or user["status"] != "active":
+        title = f"Подписка отключена · {user.get('name', user.get('slug', 'Пользователь'))}"
     info = _userinfo(headers, user.get("traffic_limit_bytes"))
     if user["expires_at"] is not None:
         parts = dict(token.strip().split("=", 1) for token in info.split(";") if "=" in token)
@@ -623,6 +638,9 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
             # metadata-only file that Happ rejects as having no server links.
             raise HTTPException(502, "Для этой подписки нет доступных серверов. Обновите список серверов и проверьте, что они не скрыты.")
         lines.extend(server_lines)
+    else:
+        reason = "Подписка истекла" if expired else "Подписка отключена"
+        lines.append("vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?type=tcp&encryption=none#" + quote(reason, safe=""))
     return "\n".join(lines) + "\n"
 
 

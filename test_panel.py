@@ -113,6 +113,10 @@ class UriTests(unittest.TestCase):
         self.assertEqual(panel._decode_subscription(base64.b64encode(raw.encode())), raw.strip())
         self.assertIsNotNone(panel._invalid_payload(base64.b64encode(b"DEVICE LIMIT FULL"), ""))
 
+    def test_duplicate_server_entries_with_different_names_collapse(self):
+        entries = "vless://id@host:443#First\nvless://id@host:443#Second\n"
+        self.assertEqual(panel._extract_uris(entries), ["vless://id@host:443#First"])
+
 
 class UpstreamCacheTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -222,7 +226,8 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
             result = await panel.sync_manifest(make_request({"X-Sync-Key": "sync"}))
         self.assertEqual(len(result["users"]), 2)
         self.assertIn("vless://", result["users"][0]["content"])
-        self.assertNotIn("vless://", result["users"][1]["content"])
+        self.assertEqual(result["users"][1]["content"].count("vless://"), 1)
+        self.assertIn("127.0.0.1:1", result["users"][1]["content"])
         self.assertIn("⛔ Подписка отключена", base64.b64decode(result["users"][1]["content"].split("#announce: base64:")[1].splitlines()[0]).decode())
         self.assertIn("download=8", result["users"][0]["content"])
 
@@ -239,7 +244,7 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Personal%20B", content)
         self.assertIn("Global%20A", content)
 
-    async def test_user_expiry_overrides_provider_expiry_and_removes_servers(self):
+    async def test_user_expiry_overrides_provider_expiry_and_uses_one_placeholder(self):
         expires = datetime.now(timezone.utc) - timedelta(days=2)
         user = {"id": 5, "enabled": True, "expires_at": expires, "announce_override": None,
                 "title_override": None, "status": "active"}
@@ -248,7 +253,8 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
             {"subscription-userinfo": "upload=1; download=2; total=500; expire=1"},
             dict(panel.DEFAULT_SETTINGS, announce_enabled=False))
         self.assertIn(f"expire={int(expires.timestamp())}", content)
-        self.assertNotIn("vless://", content)
+        self.assertEqual(content.count("vless://"), 1)
+        self.assertIn("127.0.0.1:1", content)
         encoded_announce = content.split("#announce: base64:", 1)[1].splitlines()[0]
         self.assertIn("Подписка истекла", base64.b64decode(encoded_announce).decode())
 
