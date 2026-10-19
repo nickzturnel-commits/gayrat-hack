@@ -1,24 +1,82 @@
-# VPN subscription relay
+# Secure X VPN subscription relay
 
-The service fetches a VPN subscription from `SUBSCRIPTION_URL`, caches the upstream response, and serves it from `/` or `/sub.txt`. It preserves the subscription body and relevant upstream headers so VPN clients can consume the original format.
+FastAPI service with the original raw subscription relay and an independent admin panel. The relay keeps its existing behavior at `/`, `/sub.txt`, and `/health`; its request profile and HWID header forwarding are separate from panel synchronization.
 
-## Local use
+The admin panel manages subscriber profiles and servers in Supabase. Changes made in the panel are pushed immediately to Google Drive through a protected Apps Script Web App. The existing five-minute Apps Script trigger remains as a recovery path. The established Drive file `160lsZ2nDrSXTzA09r9jeGHnd6QyFylw9` is seeded as **Основная (legacy)** so its existing URL remains the same.
 
-1. Install Python 3.10 or newer and run `pip install -r requirements.txt`.
-2. Copy `.env.example` to `.env` and set `SUBSCRIPTION_URL` to the private upstream subscription URL.
+## Render environment
+
+Create or update the Render Web Service from `render.yaml`. Set these environment values in the service dashboard; secret values are never stored in this repository:
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `SUBSCRIPTION_URL` | Yes for relay and admin sync | Provider subscription URL |
+| `UPSTREAM_USER_AGENT` | No | Provider request User-Agent; panel uses `Happ` when empty |
+| `UPSTREAM_X_HWID` | No | Fixed authorized device identity |
+| `UPSTREAM_X_DEVICE_INFO` | No | Optional upstream device metadata |
+| `UPSTREAM_X_DEVICE_MODEL` | No | Optional upstream device model |
+| `UPSTREAM_X_DEVICE_OS` | No | Optional upstream operating system |
+| `UPSTREAM_X_VER_OS` | No | Optional upstream OS version |
+| `UPSTREAM_X_APP_VERSION` | No | Optional client version |
+| `DATABASE_URL` | Yes for panel data | Supabase PostgreSQL URL |
+| `ADMIN_USERNAME` | Yes for panel | Login name |
+| `ADMIN_PASSWORD` or `ADMIN_PASSWORD_HASH` | Yes for panel | Login password or supported password hash |
+| `SESSION_SECRET` | Yes for panel | Long random value used to sign sessions |
+| `SYNC_KEY` | Yes for Apps Script | Shared secret sent as `X-Sync-Key` |
+| `DRIVE_SYNC_URL` | Yes for instant panel updates | Deployed Apps Script Web App URL ending in `/exec` |
+| `DRIVE_API_KEY` | Yes to show Drive subscription links | Google Drive API key, returned only to authenticated administrators |
+
+`ADMIN_PASSWORD_HASH`, when set, takes precedence over `ADMIN_PASSWORD`. Supported encodings are `pbkdf2_sha256$salt$urlsafe_base64_digest` (310,000 PBKDF2-SHA256 rounds) and `scrypt$salt$urlsafe_base64_digest` (`n=16384, r=8, p=1`). Keep the hash string in Render secrets just like a password. Use a random `SESSION_SECRET` of at least 32 characters. If the admin credentials or `SESSION_SECRET` are missing or invalid, panel API access is disabled. If `SYNC_KEY` is missing, Apps Script endpoints are disabled. The relay itself remains available if the database cannot connect.
+
+Use a Supabase connection string from **Project → Connect**. Render may not be able to reach a direct `db.<project>.supabase.co` host over IPv6. In that case choose **Session pooler** in Supabase and put that connection string in `DATABASE_URL`; the service accepts both direct connections and pooler users such as `postgres.<project-ref>`. The connection is made with SSL and individual connection parameters rather than passing the URL to the driver. For a password with spaces or reserved URL characters, percent-encode them (` ` → `%20`, `@` → `%40`, `%` → `%25`). Raw spaces and `@` in the password are parsed too, but percent-encoding is preferred. Never paste the real database password into GitHub, documentation, issues, or logs.
+
+On first successful database connection the service runs `schema.sql` idempotently, seeds settings, and creates the legacy subscriber if it is not already present. The pool is small and lazy; temporary database failures do not stop the relay. The admin page reports a safe connection error and the Session Pooler recommendation.
+
+## Local setup
+
+1. Install Python 3.10+ and run `pip install -r requirements.txt`.
+2. Copy `.env.example` to `.env` and fill the values needed for your environment. Do not commit `.env`.
 3. Run `uvicorn app:app --host 0.0.0.0 --port 8000`.
-4. Add `http://localhost:8000/` or `http://localhost:8000/sub.txt` to the VPN client.
+4. Open `https://<service>/admin` (or the local URL) and log in with `ADMIN_USERNAME` and the configured password.
 
-On a GET request, the relay fetches the upstream subscription with supported client headers, including User-Agent and device headers such as `X-HWID`. The shared in-memory cache is refreshed if a request arrives with a different forwarded header profile, so an earlier browser request cannot leave a web page cached for a VPN client. HTML responses are rejected instead of being cached as subscription data. Other upstream bodies, including a device-limit message, are passed through unchanged. The relay refreshes the cache every 15 minutes using the most recently successful client profile; if a refresh fails, the last successful response remains available. Before the first successful fetch, subscription requests return an error. `HEAD` requests and `/health` do not fetch the upstream.
+## Google Apps Script installation
 
-Opening the relay URL in a regular browser sends the browser's User-Agent, which may cause the upstream service to return its web interface; the relay reports this as an error and does not cache that page. Add the relay URL to the VPN client so it can send its own User-Agent and device headers. If the upstream reports that its device limit is full, the relay forwards that response unchanged; it cannot turn the provider's device-limit message into usable server links. Render logs identify whether the request looked like Happ or a browser and whether an HWID was present, without printing header values, the subscription URL, or its response body. The official Happ documentation describes HWID forwarding and User-Agent configuration: https://github.com/HappDev/happ_su/blob/main/dev-docs/app-management.md.
+The source is [`apps_script/Code.gs`](apps_script/Code.gs). Replace the contents of the existing Apps Script project with this file; keep the existing `updateSub` time trigger set to every five minutes as a recovery path.
 
-For a fixed device profile, set `UPSTREAM_X_HWID` in Render Environment. When a browser request arrives and a fixed HWID is configured, the relay uses the generic `Happ` User-Agent instead of the browser's value. Set `UPSTREAM_USER_AGENT` to override it with the exact User-Agent from your Happ app if your provider requires that. Device fields `UPSTREAM_X_DEVICE_INFO`, `UPSTREAM_X_DEVICE_MODEL`, `UPSTREAM_X_DEVICE_OS`, `UPSTREAM_X_VER_OS`, and `UPSTREAM_X_APP_VERSION` are also supported. Configured values override matching incoming headers. Use values belonging to your own authorized Happ device; do not invent an HWID. If `UPSTREAM_X_HWID` is empty, headers from the incoming VPN-client request are forwarded as before. Configured values are never written to logs.
+1. In Apps Script open **Project Settings → Script Properties** and add `RENDER_URL` with value `https://gayrat-hack.onrender.com` and `SYNC_KEY` with the same secret as the Render environment variable. Do not put either secret in `Code.gs`.
+2. Save the script, choose `setup` in the function selector, and run it once. It validates the properties and deliberately does not create or delete triggers.
+3. Run `updateSub()` once and approve the Google Drive and external request permissions. This initial run updates existing files and creates files for current users.
+4. In Apps Script click **Deploy → New deployment → Web app**. Set **Execute as** to your account and **Who has access** to **Anyone**, then deploy and approve access. Copy the Web App URL ending in `/exec`.
+5. In Render add `DRIVE_SYNC_URL` with that `/exec` URL and redeploy. `SYNC_KEY` must match the Script Property. The Web App checks this secret on every request; do not share the URL together with the key.
+6. Keep the existing `updateSub` trigger. Thereafter user, server, and profile setting changes made in `/admin` call the Web App immediately; no manual Apps Script run is needed. The trigger retries as a backup.
 
-Render logs show startup configuration presence, request profile type, cache hit/miss, upstream status/content type/size, number of recognizable server links, and whether a device-limit placeholder was returned. They never print the subscription URL, HWID, other header values, or response body.
+The Web App receives targeted updates for an individual subscriber and updates all profiles when global server/settings values change. It fetches the manifest from Render, skips file writes when the contents are identical, and reports Drive IDs and results back to Render. New users get a text file shared as **Anyone with the link — Viewer**; existing files are updated in place. `pending_delete` files are moved to Trash, and the database row is removed only after a successful Drive operation. The five-minute `updateSub()` trigger remains a repair/recovery path.
 
-## Render deployment
+Apps Script compares the current file text with generated content and skips `setContent` when it is identical. Announcement text is cached on Render for `announce_refresh_minutes`, so time/weather/quote changes do not force a write on every request. The default is 5 minutes; for 10 or more users, 60 minutes is recommended to reduce Drive writes and Apps Script runtime quota use. The Apps Script execution keeps a user cursor if it approaches the six-minute runtime limit and resumes on the next trigger.
 
-Create a Render Web Service from this repository using `render.yaml`. Set `SUBSCRIPTION_URL` in the service environment; keep it private. Use the Render service URL as the subscription URL in the VPN client.
+## Panel and subscription behavior
 
-The cache is in memory. A sleeping or restarted free service fetches a fresh snapshot on the next GET request, then resumes its 15-minute refresh cycle. The application does not log the subscription URL or response body.
+- **Dashboard:** upstream cache and warning, provider account traffic, subscriber counts, instant Drive delivery status, database status and delivery errors.
+- **Users:** add/edit, enabled state, expiry, profile title and announcement overrides, generated preview, Drive link, and deletion. User changes are sent to Drive immediately.
+- **Servers:** global rename/hide/order and per-user rename/hide. Removed upstream servers remain visible in the panel marked as absent and are omitted from generated profiles.
+- **Settings:** profile title, support URL, update interval, timezone, announcements, refresh interval, weekday lines, quotes and footer templates.
+- `/api/sync/manifest` fetches the panel's upstream subscription itself whenever the separate 5-minute panel cache is empty or stale. It uses only configured `UPSTREAM_*` device headers and the fallback User-Agent `Happ`. The request timeout is 20 seconds. A good previous copy is served on refresh failure. HTML, device-limit responses and bodies without server URIs are rejected and never replace a good cache. If there is no good copy yet, manifest returns an error so Apps Script can retry without overwriting Drive.
+- Relay cache and panel upstream cache are separate. The original relay continues to pass the upstream response body and selected headers through as before.
+
+Generated Google Drive profiles show the provider's `subscription-userinfo` usage by default. The **Основная (legacy)** profile always shows it. For a user profile, the admin can turn on **Скрывать счётчик трафика в Happ**; the setting **Скрывать счётчик по умолчанию** applies only to newly created profiles and can be overridden per user. The shown upload, download, quota and expiry are the provider account's shared values, not per-user measurements. Because clients connect directly to the provider's VPN servers, this service cannot measure individual usage or enforce a separate per-user traffic quota. Expired or disabled users receive one nonworking placeholder server when their profile is regenerated and delivered to Drive. Device usage is not available through Drive. If a user has more than one client, Drive still serves the same public file URL to all of them.
+
+The admin UI has separate desktop and mobile pages. `/admin` selects a layout using viewport width and pointer capability; `/admin/desktop` and `/admin/mobile` open either layout directly. Shared CSS and JavaScript are served as local static assets without a build step or third-party CDN.
+
+## Migration without changing the existing link
+
+1. Configure Render environment variables and deploy this version. Keep the current Apps Script running while Render builds; the public relay endpoints are unchanged.
+2. Confirm `/health` returns `ok`, then open `/admin` and confirm the database status is connected. If it is unavailable, use the Supabase Session Pooler URL.
+3. Confirm the dashboard reports a successful upstream snapshot and a nonzero server count. A failed/empty manifest is not sent to Apps Script as a valid user list, so it cannot overwrite the current Drive file.
+4. Replace the old Apps Script source, set the two Script Properties, run `setup()` and `updateSub()` once, then deploy it as a Web App and set its `/exec` URL in Render as `DRIVE_SYNC_URL`. The legacy subscriber writes to the already-existing Drive file ID; its Drive API URL does not change.
+5. Confirm the old Happ link still loads, then create additional users in the panel. Their Drive files and links are created immediately by the Web App.
+
+The project has no dependency on an Apps Script trigger recreation: the existing five-minute trigger name remains `updateSub`.
+
+## Tests
+
+Run the isolated test suite with `python -m unittest -v`. Network calls in the new panel tests use local HTTP mocks. They do not access the real provider subscription, Google, or Supabase. No database integration test runs unless one is explicitly added and configured separately.

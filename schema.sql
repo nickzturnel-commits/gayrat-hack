@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS users (
     title_override TEXT,
     announce_override TEXT,
     traffic_limit_bytes BIGINT CHECK (traffic_limit_bytes IS NULL OR traffic_limit_bytes BETWEEN 1000000 AND 1000000000000),
+    hide_traffic_usage BOOLEAN NOT NULL DEFAULT FALSE,
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'pending_delete')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -17,6 +18,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS traffic_limit_bytes BIGINT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS hide_traffic_usage BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE TABLE IF NOT EXISTS servers (
     id TEXT PRIMARY KEY,

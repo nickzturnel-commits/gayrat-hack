@@ -211,6 +211,29 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ManifestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_user_traffic_toggle_uses_explicit_choice_or_admin_default(self):
+        class CreateConn(FakeConn):
+            async def fetchval(self, query, *args):
+                return 0
+            async def fetchrow(self, query, *args):
+                self.insert_query = query
+                self.insert_args = args
+                return {"id": 41, "hide_traffic_usage": args[-1]}
+
+        for explicit, default, expected in ((None, True, True), (False, True, False), (True, False, True)):
+            with self.subTest(explicit=explicit, default=default):
+                conn = CreateConn()
+                pool = FakePool(conn)
+                with patch.object(panel, "_auth"), \
+                     patch.object(panel.state, "db", new=AsyncMock(return_value=pool)), \
+                     patch.object(panel, "_settings", new=AsyncMock(return_value=dict(
+                         panel.DEFAULT_SETTINGS, hide_traffic_for_new_users=default))), \
+                     patch.object(panel.state, "push_drive_sync", new=AsyncMock(return_value={"ok": True})):
+                    data = panel.UserBody(name="New user", hide_traffic_usage=explicit)
+                    result = await panel.users_create(data, make_request())
+                self.assertEqual(result["user"]["hide_traffic_usage"], expected)
+                self.assertIn("hide_traffic_usage", conn.insert_query)
+
     async def test_manifest_builds_active_and_disabled_profiles(self):
         server = panel.parse_server_uri("vless://id@node.example#Origin")
         server_row = {"id": server["id"], "original_name": "Origin", "custom_name": None, "hidden": False, "sort_order": 0}
@@ -230,9 +253,8 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("127.0.0.1:1", result["users"][1]["content"])
         self.assertIn("⛔ Подписка отключена", base64.b64decode(result["users"][1]["content"].split("#announce: base64:")[1].splitlines()[0]).decode())
         self.assertIn("vless://id@node.example", result["users"][0]["content"])
-        self.assertNotIn("#subscription-userinfo:", result["users"][0]["content"])
-        self.assertNotIn("upload=", result["users"][0]["content"])
-        self.assertNotIn("#subscription-userinfo:", result["users"][1]["content"])
+        self.assertIn("#subscription-userinfo: upload=3; download=8; total=100; expire=0", result["users"][0]["content"])
+        self.assertIn("#subscription-userinfo: upload=3; download=8; total=100; expire=0", result["users"][1]["content"])
 
     async def test_global_and_user_overrides_control_order_names_and_visibility(self):
         a_uri, b_uri = "vless://a@a.example#A", "trojan://b@b.example#B"
@@ -255,12 +277,39 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         content = await panel.build_manifest_content(conn, user, b"vless://id@host#name",
             {"subscription-userinfo": "upload=1; download=2; total=500; expire=1"},
             dict(panel.DEFAULT_SETTINGS, announce_enabled=False))
-        self.assertNotIn("#subscription-userinfo:", content)
-        self.assertNotIn("expire=", content)
+        self.assertIn(f"#subscription-userinfo: upload=1; download=2; total=500; expire={int(expires.timestamp())}", content)
         self.assertEqual(content.count("vless://"), 1)
         self.assertIn("127.0.0.1:1", content)
         encoded_announce = content.split("#announce: base64:", 1)[1].splitlines()[0]
         self.assertIn("Подписка истекла", base64.b64decode(encoded_announce).decode())
+
+    async def test_user_can_hide_shared_counter_but_legacy_always_shows_it(self):
+        uri = "vless://id@node.example#Origin"
+        server = panel.parse_server_uri(uri)
+        conn = FakeConn(server={"id": server["id"], "original_name": "Origin", "custom_name": None,
+                               "hidden": False, "sort_order": 0})
+        headers = {"subscription-userinfo": "upload=11; download=22; total=33; expire=0"}
+        settings = dict(panel.DEFAULT_SETTINGS, announce_enabled=False)
+        user = {"id": 11, "slug": "person-1", "name": "Person", "enabled": True, "expires_at": None,
+                "title_override": None, "announce_override": None, "status": "active", "hide_traffic_usage": True}
+        legacy = dict(user, id=12, slug="legacy", name="Основная", drive_file_id=panel.LEGACY_DRIVE_FILE_ID)
+
+        hidden = await panel.build_manifest_content(conn, user, uri.encode(), headers, settings, servers=[server])
+        owner = await panel.build_manifest_content(conn, legacy, uri.encode(), headers, settings, servers=[server])
+        self.assertNotIn("#subscription-userinfo:", hidden)
+        self.assertIn("#subscription-userinfo: upload=11; download=22; total=33; expire=0", owner)
+
+    async def test_user_counter_defaults_to_visible_and_uses_provider_values(self):
+        uri = "vless://id@node.example#Origin"
+        server = panel.parse_server_uri(uri)
+        conn = FakeConn(server={"id": server["id"], "original_name": "Origin", "custom_name": None,
+                               "hidden": False, "sort_order": 0})
+        user = {"id": 13, "slug": "person-2", "name": "Person", "enabled": True, "expires_at": None,
+                "title_override": None, "announce_override": None, "status": "active"}
+        content = await panel.build_manifest_content(conn, user, uri.encode(),
+            {"subscription-userinfo": "upload=100; download=200; total=1000; expire=0"},
+            dict(panel.DEFAULT_SETTINGS, announce_enabled=False), servers=[server])
+        self.assertIn("#subscription-userinfo: upload=100; download=200; total=1000; expire=0", content)
 
     async def test_admin_routes_choose_separate_desktop_and_mobile_pages(self):
         transport = httpx.ASGITransport(app=app.app)
@@ -285,6 +334,8 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("matchMedia", device_script.text)
         self.assertEqual(stylesheet.status_code, 200)
         self.assertIn("prefers-reduced-motion", stylesheet.text)
+        self.assertIn(".hidden { display: none !important; }", stylesheet.text)
+        self.assertNotIn(".mobile-shell { display: block !important; }", stylesheet.text)
 
     async def test_pending_delete_is_removed_only_after_success_report(self):
         conn = FakeConn(status="pending_delete")

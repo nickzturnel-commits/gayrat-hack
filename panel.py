@@ -63,9 +63,10 @@ QUOTE_DEFAULTS = ["🚀 Скорость — наш конёк", "🔒 Твои 
 DEFAULT_SETTINGS = {
     "title": "Secure X", "support_url": "https://t.me/moserrr1", "web_page_url": "", "update_interval": 1,
     "timezone": "Asia/Ashgabat", "announce_enabled": True, "announce_refresh_minutes": 5,
-    # Kept for database/API compatibility with older admin panels. Generated
-    # client profiles no longer publish a usage counter or per-user quota.
+    # Individual profiles share provider usage. Admins may hide the counter on
+    # new user profiles, while the legacy account profile stays visible.
     "default_traffic_limit_bytes": None,
+    "hide_traffic_for_new_users": False,
     "quotes": QUOTE_DEFAULTS, "footers": FOOTER_DEFAULTS, "days": DAY_DEFAULTS,
 }
 
@@ -469,6 +470,7 @@ class UserBody(BaseModel):
     title_override: str | None = Field(default=None, max_length=200)
     announce_override: str | None = Field(default=None, max_length=4000)
     traffic_limit_bytes: int | None = Field(default=None, ge=1_000_000, le=1_000_000_000_000)
+    hide_traffic_usage: bool | None = None
 
 
 class ServerBody(BaseModel):
@@ -553,7 +555,7 @@ async def _announce(settings: dict) -> str:
     return value
 
 
-def _userinfo(headers: dict, traffic_limit_bytes: int | None = None) -> str:
+def _userinfo(headers: dict, expire_override: int | None = None) -> str:
     value = headers.get("subscription-userinfo", "")
     parts = {}
     for token in value.split(";"):
@@ -561,8 +563,8 @@ def _userinfo(headers: dict, traffic_limit_bytes: int | None = None) -> str:
             key, val = token.strip().split("=", 1)
             if key.strip().lower() in {"upload", "download", "total", "expire"} and val.strip().isdigit():
                 parts[key.strip().lower()] = val.strip()
-    if traffic_limit_bytes is not None:
-        parts["total"] = str(traffic_limit_bytes)
+    if expire_override is not None:
+        parts["expire"] = str(expire_override)
     return "; ".join(f"{k}={parts.get(k, '0')}" for k in ("upload", "download", "total", "expire"))
 
 
@@ -609,6 +611,10 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
              f"#profile-update-interval: {int(settings.get('update_interval', 1))}",
              "#announce: base64:" + base64.b64encode(announcement.encode()).decode(),
              "#support-url: " + str(settings.get("support_url", "https://t.me/moserrr1"))]
+    is_legacy = user.get("slug") == "legacy" or user.get("drive_file_id") == LEGACY_DRIVE_FILE_ID
+    if is_legacy or not bool(user.get("hide_traffic_usage", False)):
+        expiry = int(user["expires_at"].timestamp()) if user.get("expires_at") else None
+        lines.append("#subscription-userinfo: " + _userinfo(headers, expire_override=expiry))
     web_url = str(settings.get("web_page_url", "")).strip()
     if web_url:
         lines.append("#profile-web-page-url: " + web_url)
@@ -772,9 +778,12 @@ async def users_create(data: UserBody, request: Request):
         if count >= 30:
             raise HTTPException(409, "Достигнут лимит панели: максимум 30 пользователей")
         slug = _slugify(data.name)
-        row = await conn.fetchrow("""INSERT INTO users(name,slug,note,enabled,expires_at,title_override,announce_override,traffic_limit_bytes)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *""", data.name.strip(), slug, data.note, data.enabled,
-            _expiry_utc(data.expires_at), data.title_override, data.announce_override, data.traffic_limit_bytes)
+        settings = await _settings(conn)
+        hide_traffic = (data.hide_traffic_usage if data.hide_traffic_usage is not None
+                        else bool(settings.get("hide_traffic_for_new_users", False)))
+        row = await conn.fetchrow("""INSERT INTO users(name,slug,note,enabled,expires_at,title_override,announce_override,traffic_limit_bytes,hide_traffic_usage)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *""", data.name.strip(), slug, data.note, data.enabled,
+            _expiry_utc(data.expires_at), data.title_override, data.announce_override, data.traffic_limit_bytes, hide_traffic)
     drive_sync = await state.push_drive_sync([row["id"]])
     return {"user": _serialize(row), "drive_sync": drive_sync}
 
@@ -787,9 +796,11 @@ async def users_update(user_id: int, data: UserBody, request: Request):
     pool = await state.db()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""UPDATE users SET name=$2,note=$3,enabled=$4,expires_at=$5,title_override=$6,
-            announce_override=$7,traffic_limit_bytes=$8,updated_at=now() WHERE id=$1 AND status='active' RETURNING *""", user_id,
+            announce_override=$7,traffic_limit_bytes=$8,
+            hide_traffic_usage=CASE WHEN slug='legacy' OR drive_file_id=$10 THEN FALSE ELSE COALESCE($9,hide_traffic_usage) END,
+            updated_at=now() WHERE id=$1 AND status='active' RETURNING *""", user_id,
             data.name.strip(), data.note, data.enabled, _expiry_utc(data.expires_at), data.title_override, data.announce_override,
-            data.traffic_limit_bytes)
+            data.traffic_limit_bytes, data.hide_traffic_usage, LEGACY_DRIVE_FILE_ID)
     if not row: raise HTTPException(404, "Пользователь не найден")
     drive_sync = await state.push_drive_sync([user_id])
     return {"user": _serialize(row), "drive_sync": drive_sync}
@@ -956,6 +967,8 @@ async def settings_put(data: SettingsBody, request: Request):
                 raise HTTPException(422, f"{key} должен быть HTTP(S)-адресом")
     if "announce_enabled" in values and not isinstance(values["announce_enabled"], bool):
         raise HTTPException(422, "announce_enabled должен быть логическим значением")
+    if "hide_traffic_for_new_users" in values and not isinstance(values["hide_traffic_for_new_users"], bool):
+        raise HTTPException(422, "hide_traffic_for_new_users должен быть логическим значением")
     for key in ("quotes", "footers", "days"):
         if key in values and (not isinstance(values[key], list) or len(values[key]) > 100 or any(not isinstance(x, str) or len(x) > 500 for x in values[key])):
             raise HTTPException(422, f"Некорректное поле {key}")
@@ -965,7 +978,7 @@ async def settings_put(data: SettingsBody, request: Request):
             for key, value in values.items():
                 await conn.execute("INSERT INTO settings(key,value) VALUES($1,$2::jsonb) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", key, json.dumps(value, ensure_ascii=False))
     state.announce_cache = None
-    drive_sync = await state.push_drive_sync() if set(values) - {"default_traffic_limit_bytes"} else None
+    drive_sync = await state.push_drive_sync() if set(values) - {"default_traffic_limit_bytes", "hide_traffic_for_new_users"} else None
     return {"settings": values, "drive_sync": drive_sync}
 
 
