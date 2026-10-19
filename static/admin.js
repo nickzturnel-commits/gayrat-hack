@@ -202,7 +202,7 @@
       + (list.length ? `<div class="card-list">${list.map(user => {
         const [status, tone] = userStatus(user);
         return `<article class="surface-card user-card">
-          <div class="user-card-head"><div class="avatar-mark">${esc((user.name || '?').trim().slice(0, 1).toUpperCase())}</div><div class="user-main"><h2>${esc(user.name)}</h2><p>${esc(user.note || 'Без заметки')}</p></div><span class="badge ${tone}">${status}</span><span class="badge ${user.drive_file_id ? 'badge-good' : 'badge-muted'}">${user.drive_file_id ? 'Drive готов' : 'Ожидает Drive'}</span></div>
+          <div class="user-card-head"><div class="avatar-mark">${esc((user.name || '?').trim().slice(0, 1).toUpperCase())}</div><div class="user-main"><h2>${esc(user.name)}</h2><p>${esc(user.note || 'Без заметки')}</p></div><span class="badge ${tone}">${status}</span><span class="badge ${user.drive_file_id ? 'badge-good' : 'badge-muted'}">${user.drive_file_id ? 'Drive готов' : 'Ожидает Drive'}</span>${user.hide_traffic_usage && user.slug !== 'legacy' ? '<span class="badge badge-muted">Счётчик скрыт</span>' : ''}</div>
           <div class="user-meta"><span>Срок действия</span><strong>${esc(date(user.expires_at))}</strong></div>
           <div class="user-actions">
             <button class="button button-secondary" data-edit="${user.id}">${svg('edit')}<span>Изменить</span></button>
@@ -213,7 +213,9 @@
           </div>
         </article>`;
       }).join('')}</div>` : '<div class="empty-state"><div class="empty-orbit">'+svg('users')+'</div><h2>Пока нет пользователей</h2><p>Добавьте подписку, чтобы создать профиль в Google Drive.</p></div>');
-    $('#addUser').addEventListener('click', () => userForm(null));
+    $('#addUser').addEventListener('click', async () => {
+      try { await userForm(null); } catch (failure) { toast(failure.message); }
+    });
     root.onclick = event => handleUserAction(event, list);
   }
 
@@ -223,7 +225,7 @@
     try {
       if (button.dataset.edit) {
         const user = list.find(item => item.id === Number(button.dataset.edit));
-        if (user) userForm(user);
+        if (user) await userForm(user);
       } else if (button.dataset.servers) {
         await userServers(button.dataset.servers);
       } else if (button.dataset.preview) {
@@ -247,14 +249,21 @@
     return label;
   }
 
-  function userForm(user) {
+  async function userForm(user) {
+    let defaultHideTraffic = false;
+    if (!user) {
+      const data = await api('/api/admin/settings');
+      defaultHideTraffic = data.settings?.hide_traffic_for_new_users === true;
+    }
+    const isLegacy = user?.slug === 'legacy' || user?.drive_file_id === '160lsZ2nDrSXTzA09r9jeGHnd6QyFylw9';
+    const hideTraffic = isLegacy ? false : (user ? user.hide_traffic_usage === true : defaultHideTraffic);
     const expiry = user?.expires_at ? new Date(user.expires_at) : null;
     const localExpiry = expiry ? new Date(expiry.getTime() - expiry.getTimezoneOffset() * 60000).toISOString().slice(0, 16) : '';
     openModal(user ? 'Изменить пользователя' : 'Новая подписка', `<form id="userForm" class="form-grid">
       <label>Имя пользователя<input name="name" required maxlength="120" value="${esc(user?.name || '')}" placeholder="Например, Иван"></label>
       <label>Заметка<textarea name="note" maxlength="2000" rows="3" placeholder="Внутренняя заметка">${esc(user?.note || '')}</textarea></label>
-      <label>Дата окончания<input name="expires_at" type="datetime-local" value="${localExpiry}"><span class="field-hint">Оставьте пустым для подписки без срока.</span></label>
       <label class="switch-row"><input name="enabled" type="checkbox" ${user?.enabled === false ? '' : 'checked'}><span class="switch"></span><span><b>Подписка включена</b><small>Отключённый профиль получит одну нерабочую заглушку.</small></span></label>
+      ${isLegacy ? '<div class="setting-note"><b>Счётчик трафика всегда виден</b><span>Это ваша основная подписка; в Happ показывается общий расход аккаунта провайдера.</span></div>' : `<label class="switch-row"><input name="hide_traffic_usage" type="checkbox" ${hideTraffic ? 'checked' : ''}><span class="switch"></span><span><b>Скрывать счётчик трафика в Happ</b><small>Выключено — показываются общие данные провайдера. Включено — строка трафика скрыта.</small></span></label>`}
       <label>Заголовок профиля<input name="title_override" maxlength="200" value="${esc(user?.title_override || '')}" placeholder="Использовать название по умолчанию"></label>
       <label>Объявление<textarea name="announce_override" maxlength="4000" rows="3" placeholder="Оставьте пустым для общего объявления">${esc(user?.announce_override || '')}</textarea></label>
       <div class="form-actions"><button class="button button-primary" type="submit">Сохранить и обновить Drive</button></div>
@@ -274,8 +283,8 @@
           expires_at: expiryValue ? new Date(expiryValue).toISOString() : null,
           title_override: values.get('title_override') || null,
           announce_override: values.get('announce_override') || null,
-          // Keep a pre-existing database value for compatibility; traffic
-          // indicators are intentionally omitted from generated client profiles.
+          // The legacy account always keeps the provider counter visible.
+          hide_traffic_usage: isLegacy ? false : values.has('hide_traffic_usage'),
           traffic_limit_bytes: user?.traffic_limit_bytes ?? null
         };
         const result = await api(user ? `/api/admin/users/${user.id}` : '/api/admin/users', {
@@ -366,6 +375,10 @@
         <label class="switch-row"><input name="announce_enabled" type="checkbox" ${settings.announce_enabled ? 'checked' : ''}><span class="switch"></span><span><b>Объявления включены</b><small>Показываются в профиле подписки.</small></span></label>
         <label>Частота обновления объявления (минуты)<input name="announce_refresh_minutes" type="number" min="5" max="1440" value="${settings.announce_refresh_minutes || 5}"><span class="field-hint">При 10 и более пользователях рекомендуем 60 минут, чтобы не исчерпать квоту времени Apps Script. Минимум — 5 минут.</span></label>
       </div>
+      <div class="form-section"><p class="eyebrow">НОВЫЕ ПОДПИСКИ</p><h2>Счётчик трафика в клиенте</h2>
+        <label class="switch-row"><input name="hide_traffic_for_new_users" type="checkbox" ${settings.hide_traffic_for_new_users ? 'checked' : ''}><span class="switch"></span><span><b>Скрывать счётчик по умолчанию</b><small>Применяется только к новым пользователям. Переключатель можно изменить отдельно в каждой подписке. Основная подписка всегда показывает общий трафик аккаунта.</small></span></label>
+        <span class="field-hint">Если счётчик включён, VPN-клиент увидит общий трафик провайдера. Это не отдельный лимит или учёт расхода конкретного пользователя.</span>
+      </div>
       <div class="form-section"><p class="eyebrow">ТЕКСТЫ</p><h2>Дни, цитаты и подписи</h2>
         ${textarea('days', 'Дни недели — по одному на строку')}
         ${textarea('quotes', 'Цитаты — по одной на строку')}
@@ -385,6 +398,7 @@
         title: fields.get('title'), support_url: fields.get('support_url'), web_page_url: fields.get('web_page_url'),
         update_interval: Number(fields.get('update_interval')), timezone: fields.get('timezone'),
         announce_enabled: fields.has('announce_enabled'), announce_refresh_minutes: Number(fields.get('announce_refresh_minutes')),
+        hide_traffic_for_new_users: fields.has('hide_traffic_for_new_users'),
         days: fields.get('days').split('\n').map(line => line.trim()).filter(Boolean),
         quotes: fields.get('quotes').split('\n').map(line => line.trim()).filter(Boolean),
         footers: fields.get('footers').split('\n').map(line => line.trim()).filter(Boolean)
