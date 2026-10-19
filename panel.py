@@ -23,6 +23,7 @@ import asyncpg
 import httpx
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -62,8 +63,8 @@ QUOTE_DEFAULTS = ["🚀 Скорость — наш конёк", "🔒 Твои 
 DEFAULT_SETTINGS = {
     "title": "Secure X", "support_url": "https://t.me/moserrr1", "web_page_url": "", "update_interval": 1,
     "timezone": "Asia/Ashgabat", "announce_enabled": True, "announce_refresh_minutes": 5,
-    # None means inherit the upstream account limit. Per-user limits are metadata;
-    # provider usage counters remain account-wide because it does not expose per-user usage.
+    # Kept for database/API compatibility with older admin panels. Generated
+    # client profiles no longer publish a usage counter or per-user quota.
     "default_traffic_limit_bytes": None,
     "quotes": QUOTE_DEFAULTS, "footers": FOOTER_DEFAULTS, "days": DAY_DEFAULTS,
 }
@@ -604,14 +605,8 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
         title = f"Подписка истекла · {user.get('name', user.get('slug', 'Пользователь'))}"
     elif not user["enabled"] or user["status"] != "active":
         title = f"Подписка отключена · {user.get('name', user.get('slug', 'Пользователь'))}"
-    info = _userinfo(headers, user.get("traffic_limit_bytes"))
-    if user["expires_at"] is not None:
-        parts = dict(token.strip().split("=", 1) for token in info.split(";") if "=" in token)
-        parts["expire"] = str(int(user["expires_at"].timestamp()))
-        info = "; ".join(f"{key}={parts.get(key, '0')}" for key in ("upload", "download", "total", "expire"))
     lines = ["#profile-title: base64:" + base64.b64encode(title.encode()).decode(),
              f"#profile-update-interval: {int(settings.get('update_interval', 1))}",
-             f"#subscription-userinfo: {info}",
              "#announce: base64:" + base64.b64encode(announcement.encode()).decode(),
              "#support-url: " + str(settings.get("support_url", "https://t.me/moserrr1"))]
     web_url = str(settings.get("web_page_url", "")).strip()
@@ -657,14 +652,36 @@ def _secure_headers(response: Response):
 class PanelSecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
-        if request.url.path == "/admin" or request.url.path.startswith("/api/"):
+        if request.url.path.startswith("/admin") or request.url.path.startswith("/api/"):
             _secure_headers(response)
         return response
 
 
 @router.get("/admin", response_class=HTMLResponse, include_in_schema=False)
 async def admin_page():
-    return FileResponse(os.path.join(os.path.dirname(__file__), "static", "admin.html"))
+    # Select a purpose-built page before loading the admin app bundle. Use
+    # viewport and pointer capabilities so mobile browsers in desktop mode
+    # still receive the phone layout when their viewport is narrow.
+    return HTMLResponse("""<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
+<meta name=\"color-scheme\" content=\"dark\"><title>Secure X — панель</title></head>
+<body style=\"margin:0;background:#090a0c;color:#f5f6f8;font:16px system-ui;display:grid;min-height:100dvh;place-items:center\">
+<p>Открываем панель…</p><script>(()=>{const mobile=matchMedia('(max-width: 760px), (pointer: coarse)').matches;
+location.replace('/admin/'+(mobile?'mobile':'desktop')+location.search+location.hash)})()</script>
+<noscript><p><a href=\"/admin/mobile\">Телефон</a> · <a href=\"/admin/desktop\">Компьютер</a></p></noscript>
+</body></html>""")
+
+
+@router.get("/admin/desktop", response_class=HTMLResponse, include_in_schema=False)
+async def admin_desktop_page():
+    return FileResponse(os.path.join(os.path.dirname(__file__), "static", "admin_desktop.html"),
+                        headers={"Cache-Control": "no-store"})
+
+
+@router.get("/admin/mobile", response_class=HTMLResponse, include_in_schema=False)
+async def admin_mobile_page():
+    return FileResponse(os.path.join(os.path.dirname(__file__), "static", "admin_mobile.html"),
+                        headers={"Cache-Control": "no-store"})
 
 
 @router.post("/api/admin/auth/login")
@@ -1034,6 +1051,7 @@ async def sync_report(data: SyncReport, request: Request):
 
 def install(app: FastAPI):
     app.add_middleware(PanelSecurityMiddleware)
+    app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="panel-static")
     app.include_router(router)
     previous_lifespan = app.router.lifespan_context
 

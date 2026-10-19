@@ -229,7 +229,10 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["users"][1]["content"].count("vless://"), 1)
         self.assertIn("127.0.0.1:1", result["users"][1]["content"])
         self.assertIn("⛔ Подписка отключена", base64.b64decode(result["users"][1]["content"].split("#announce: base64:")[1].splitlines()[0]).decode())
-        self.assertIn("download=8", result["users"][0]["content"])
+        self.assertIn("vless://id@node.example", result["users"][0]["content"])
+        self.assertNotIn("#subscription-userinfo:", result["users"][0]["content"])
+        self.assertNotIn("upload=", result["users"][0]["content"])
+        self.assertNotIn("#subscription-userinfo:", result["users"][1]["content"])
 
     async def test_global_and_user_overrides_control_order_names_and_visibility(self):
         a_uri, b_uri = "vless://a@a.example#A", "trojan://b@b.example#B"
@@ -252,11 +255,36 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         content = await panel.build_manifest_content(conn, user, b"vless://id@host#name",
             {"subscription-userinfo": "upload=1; download=2; total=500; expire=1"},
             dict(panel.DEFAULT_SETTINGS, announce_enabled=False))
-        self.assertIn(f"expire={int(expires.timestamp())}", content)
+        self.assertNotIn("#subscription-userinfo:", content)
+        self.assertNotIn("expire=", content)
         self.assertEqual(content.count("vless://"), 1)
         self.assertIn("127.0.0.1:1", content)
         encoded_announce = content.split("#announce: base64:", 1)[1].splitlines()[0]
         self.assertIn("Подписка истекла", base64.b64decode(encoded_announce).decode())
+
+    async def test_admin_routes_choose_separate_desktop_and_mobile_pages(self):
+        transport = httpx.ASGITransport(app=app.app)
+        async with httpx.AsyncClient(transport=transport, base_url="https://testserver") as client:
+            selector = await client.get("/admin")
+            desktop = await client.get("/admin/desktop")
+            mobile = await client.get("/admin/mobile")
+            javascript = await client.get("/static/admin.js")
+            device_script = await client.get("/static/admin-device.js")
+            stylesheet = await client.get("/static/admin.css")
+        self.assertEqual(selector.status_code, 200)
+        self.assertIn("matchMedia", selector.text)
+        self.assertIn("/admin/mobile", selector.text)
+        self.assertIn("/admin/desktop", selector.text)
+        self.assertEqual(desktop.status_code, 200)
+        self.assertEqual(mobile.status_code, 200)
+        self.assertIn('class="desktop-ui"', desktop.text)
+        self.assertIn('class="mobile-ui"', mobile.text)
+        self.assertIn("/static/admin.js", desktop.text)
+        self.assertEqual(javascript.status_code, 200)
+        self.assertEqual(device_script.status_code, 200)
+        self.assertIn("matchMedia", device_script.text)
+        self.assertEqual(stylesheet.status_code, 200)
+        self.assertIn("prefers-reduced-motion", stylesheet.text)
 
     async def test_pending_delete_is_removed_only_after_success_report(self):
         conn = FakeConn(status="pending_delete")
