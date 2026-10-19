@@ -586,7 +586,9 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
         announcement = announce
     else:
         announcement = await _announce(settings)
-    title = user["title_override"] or settings.get("title", "Secure X")
+    # Give every generated Drive profile a distinct default name in Happ. The
+    # underlying server credentials remain those from the shared upstream.
+    title = user["title_override"] or f"{settings.get('title', 'Secure X')} · {user['name']}"
     info = _userinfo(headers, user.get("traffic_limit_bytes"))
     if user["expires_at"] is not None:
         parts = dict(token.strip().split("=", 1) for token in info.split(";") if "=" in token)
@@ -623,8 +625,9 @@ def _secure_headers(response: Response):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
-    if response.headers.get("content-type", "").startswith("application/json"):
-        response.headers["Cache-Control"] = "no-store"
+    # Admin HTML and API responses contain changing user/config data. Prevent
+    # browsers and intermediary caches from showing an older panel revision.
+    response.headers["Cache-Control"] = "no-store"
 
 
 class PanelSecurityMiddleware(BaseHTTPMiddleware):
