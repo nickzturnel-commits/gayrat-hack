@@ -591,7 +591,7 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
     expired = user["expires_at"] is not None and user["expires_at"] <= now
     active = bool(user["enabled"]) and not expired and user["status"] == "active"
     if not active:
-        announcement = "⛔ Подписка истекла, обратитесь в поддержку" if expired else "⛔ Подписка отключена, обратитесь в поддержку"
+        announcement = "⛔ Время подписки закончилось, обратитесь в поддержку" if expired else "⛔ Подписка отключена, обратитесь в поддержку"
     elif user["announce_override"] is not None:
         announcement = user["announce_override"]
     elif not settings.get("announce_enabled", True):
@@ -604,7 +604,7 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
     # underlying server credentials remain those from the shared upstream.
     title = user["title_override"] or f"{settings.get('title', 'Secure X')} · {user.get('name', user.get('slug', 'Пользователь'))}"
     if expired:
-        title = f"Подписка истекла · {user.get('name', user.get('slug', 'Пользователь'))}"
+        title = f"Время подписки закончилось · {user.get('name', user.get('slug', 'Пользователь'))}"
     elif not user["enabled"] or user["status"] != "active":
         title = f"Подписка отключена · {user.get('name', user.get('slug', 'Пользователь'))}"
     lines = ["#profile-title: base64:" + base64.b64encode(title.encode()).decode(),
@@ -640,7 +640,7 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
             raise HTTPException(502, "Для этой подписки нет доступных серверов. Обновите список серверов и проверьте, что они не скрыты.")
         lines.extend(server_lines)
     else:
-        reason = "Подписка истекла" if expired else "Подписка отключена"
+        reason = "Время подписки закончилось" if expired else "Подписка отключена"
         lines.append("vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?type=tcp&encryption=none#" + quote(reason, safe=""))
     return "\n".join(lines) + "\n"
 

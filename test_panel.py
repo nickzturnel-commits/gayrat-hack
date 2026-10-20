@@ -280,8 +280,24 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"#subscription-userinfo: upload=1; download=2; total=500; expire={int(expires.timestamp())}", content)
         self.assertEqual(content.count("vless://"), 1)
         self.assertIn("127.0.0.1:1", content)
+        self.assertIn(panel.quote("Время подписки закончилось", safe=""), content)
         encoded_announce = content.split("#announce: base64:", 1)[1].splitlines()[0]
-        self.assertIn("Подписка истекла", base64.b64decode(encoded_announce).decode())
+        self.assertIn("Время подписки закончилось", base64.b64decode(encoded_announce).decode())
+
+    async def test_future_expiry_keeps_real_servers_until_deadline(self):
+        expires = datetime.now(timezone.utc) + timedelta(days=1)
+        uri = "vless://id@node.example#Server"
+        server = panel.parse_server_uri(uri)
+        conn = FakeConn(server={"id": server["id"], "original_name": "Server", "custom_name": None,
+                               "hidden": False, "sort_order": 0})
+        user = {"id": 50, "slug": "timed", "name": "Timed", "enabled": True, "expires_at": expires,
+                "announce_override": None, "title_override": None, "status": "active"}
+        content = await panel.build_manifest_content(conn, user, uri.encode(),
+            {"subscription-userinfo": "upload=1; download=2; total=3; expire=0"},
+            dict(panel.DEFAULT_SETTINGS, announce_enabled=False), servers=[server])
+        self.assertIn(uri, content)
+        self.assertNotIn("127.0.0.1:1", content)
+        self.assertIn(f"expire={int(expires.timestamp())}", content)
 
     async def test_user_can_hide_shared_counter_but_legacy_always_shows_it(self):
         uri = "vless://id@node.example#Origin"
@@ -330,6 +346,8 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('class="mobile-ui"', mobile.text)
         self.assertIn("/static/admin.js", desktop.text)
         self.assertEqual(javascript.status_code, 200)
+        self.assertIn('name="expires_at" type="datetime-local"', javascript.text)
+        self.assertIn("его Drive-файл навсегда", javascript.text)
         self.assertEqual(device_script.status_code, 200)
         self.assertIn("matchMedia", device_script.text)
         self.assertEqual(stylesheet.status_code, 200)
@@ -345,6 +363,34 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
             result = await panel.sync_report(data, make_request({"X-Sync-Key": "sync"}))
         self.assertTrue(result["deleted"])
         self.assertTrue(conn.deleted)
+
+    async def test_expired_user_stays_in_manifest_with_only_expiry_placeholder(self):
+        uri = "vless://id@expired.example#Server"
+        parsed = panel.parse_server_uri(uri)
+        user = {"id": 91, "slug": "expired", "name": "Expired", "enabled": True,
+                "expires_at": datetime.now(timezone.utc) - timedelta(seconds=1), "note": "",
+                "title_override": None, "announce_override": None, "status": "active", "drive_file_id": "drive-id"}
+        conn = FakeConn(users=[user], server={"id": parsed["id"], "original_name": parsed["name"],
+                                             "custom_name": None, "hidden": False, "sort_order": 0})
+        with patch.dict(os.environ, {"SYNC_KEY": "sync"}, clear=False), \
+             patch.object(panel.state, "db", new=AsyncMock(return_value=FakePool(conn))), \
+             patch.object(panel.state, "fetch_upstream", new=AsyncMock(return_value=(uri.encode(), {}, False))), \
+             patch.object(panel, "_settings", new=AsyncMock(return_value=dict(panel.DEFAULT_SETTINGS, announce_enabled=False))):
+            result = await panel.sync_manifest(make_request({"X-Sync-Key": "sync"}))
+        manifest_user = result["users"][0]
+        self.assertEqual(manifest_user["status"], "active")
+        self.assertEqual(manifest_user["content"].count("vless://"), 1)
+        self.assertIn(panel.quote("Время подписки закончилось", safe=""), manifest_user["content"])
+        self.assertFalse(conn.deleted)
+
+    async def test_successful_report_does_not_delete_expired_active_user(self):
+        conn = FakeConn(status="active")
+        fake_pool = FakePool(conn)
+        data = panel.SyncReport(user_id=92, drive_file_id="drive-id", ok=True)
+        with patch.dict(os.environ, {"SYNC_KEY": "sync"}, clear=False), patch.object(panel.state, "db", new=AsyncMock(return_value=fake_pool)):
+            result = await panel.sync_report(data, make_request({"X-Sync-Key": "sync"}))
+        self.assertNotIn("deleted", result)
+        self.assertFalse(conn.deleted)
 
     async def test_manifest_fills_empty_cache_itself_before_returning_users(self):
         old_client = panel.state.upstream_client
