@@ -174,10 +174,10 @@ function processUser_(base, key, user) {
   const props = PropertiesService.getScriptProperties();
   let fileId = user.drive_file_id || props.getProperty('PENDING_FILE_' + user.id) || null;
   if (user.status === 'pending_delete') {
-    if (fileId) DriveApp.getFileById(fileId).setTrashed(true);
+    if (fileId) deleteDriveFilePermanently_(fileId);
     report_(base, key, user.id, fileId, true, null);
     props.deleteProperty('PENDING_FILE_' + user.id);
-    Logger.log('Запись пользователя id=' + user.id + ' перемещена в корзину.');
+    Logger.log('Подписка пользователя id=' + user.id + ' удалена из Drive окончательно.');
     return;
   }
   if (typeof user.content !== 'string' || !user.content.trim()) throw new Error('Манифест не содержит готовую подписку; файл оставлен без изменений.');
@@ -201,6 +201,25 @@ function processUser_(base, key, user) {
   report_(base, key, user.id, fileId, true, null);
   props.deleteProperty('PENDING_FILE_' + user.id);
   Logger.log('Пользователь id=' + user.id + ': файл синхронизирован.');
+}
+
+// The DriveApp File API only supports moving a file to Trash. Use Drive API v3
+// DELETE so a manual admin deletion permanently removes the file. Treat 404 as
+// success to make retries safe when Drive deletion succeeded but reporting did not.
+function deleteDriveFilePermanently_(fileId) {
+  const response = UrlFetchApp.fetch(
+    'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(String(fileId)),
+    {
+      method: 'delete',
+      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+      muteHttpExceptions: true,
+      followRedirects: true
+    }
+  );
+  const code = response.getResponseCode();
+  if ((code < 200 || code >= 300) && code !== 404) {
+    throw new Error('Drive API не смог окончательно удалить файл (HTTP ' + code + ').');
+  }
 }
 
 function report_(base, key, userId, fileId, ok, error) {
