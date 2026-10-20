@@ -234,10 +234,10 @@
       } else if (button.dataset.link) {
         const result = await api(`/api/admin/users/${button.dataset.link}/drive-link`);
         if (result.link) await copyText(result.link); else toast('Файл ещё не создан в Drive');
-      } else if (button.dataset.delete && confirm('Удалить пользователя и переместить его Drive-файл в корзину?')) {
+      } else if (button.dataset.delete && confirm('Удалить пользователя и его Drive-файл навсегда? Это действие нельзя отменить.')) {
         button.disabled = true;
         const result = await api(`/api/admin/users/${button.dataset.delete}`, { method: 'DELETE', body: {} });
-        toast(resultText(result, 'Пользователь помечен на удаление'));
+        toast(resultText(result, 'Пользователь и файл Drive удалены'));
         await render();
       }
     } catch (failure) { toast(failure.message); }
@@ -262,6 +262,7 @@
     openModal(user ? 'Изменить пользователя' : 'Новая подписка', `<form id="userForm" class="form-grid">
       <label>Имя пользователя<input name="name" required maxlength="120" value="${esc(user?.name || '')}" placeholder="Например, Иван"></label>
       <label>Заметка<textarea name="note" maxlength="2000" rows="3" placeholder="Внутренняя заметка">${esc(user?.note || '')}</textarea></label>
+      <label>Срок подписки<input name="expires_at" type="datetime-local" value="${localExpiry}"><span class="field-hint">Оставьте пустым для подписки без срока. После указанного времени профиль получит один нерабочий сервер-заглушку.</span></label>
       <label class="switch-row"><input name="enabled" type="checkbox" ${user?.enabled === false ? '' : 'checked'}><span class="switch"></span><span><b>Подписка включена</b><small>Отключённый профиль получит одну нерабочую заглушку.</small></span></label>
       ${isLegacy ? '<div class="setting-note"><b>Счётчик трафика всегда виден</b><span>Это ваша основная подписка; в Happ показывается общий расход аккаунта провайдера.</span></div>' : `<label class="switch-row"><input name="hide_traffic_usage" type="checkbox" ${hideTraffic ? 'checked' : ''}><span class="switch"></span><span><b>Скрывать счётчик трафика в Happ</b><small>Выключено — показываются общие данные провайдера. Включено — строка трафика скрыта.</small></span></label>`}
       <label>Заголовок профиля<input name="title_override" maxlength="200" value="${esc(user?.title_override || '')}" placeholder="Использовать название по умолчанию"></label>
