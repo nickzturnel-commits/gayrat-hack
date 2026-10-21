@@ -662,6 +662,11 @@ class PanelSecurityMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         if request.url.path.startswith("/admin") or request.url.path.startswith("/api/"):
             _secure_headers(response)
+        elif request.url.path.startswith("/static/"):
+            # The panel's JS/CSS changes independently from the Python worker.
+            # Revalidate assets so mobile browsers do not retain old controls.
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+            response.headers["X-Content-Type-Options"] = "nosniff"
         return response
 
 
