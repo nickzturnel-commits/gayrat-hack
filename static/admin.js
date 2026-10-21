@@ -179,44 +179,60 @@
     $('#modal').showModal();
   }
 
-  function copyText(value, visibleField = null) {
-    const fallback = () => {
-      const field = document.createElement('textarea');
-      field.value = value;
-      field.setAttribute('readonly', '');
-      Object.assign(field.style, { position: 'fixed', top: '0', left: '0', width: '2px', height: '2px', padding: '0', border: '0', opacity: '0.01', fontSize: '16px' });
-      document.body.append(field);
-      field.focus({ preventScroll: true });
-      field.select();
-      field.setSelectionRange(0, field.value.length);
-      let copied = false;
-      try { copied = document.execCommand('copy'); } catch { /* Older browsers may not implement copy. */ }
-      field.remove();
-      if (copied) toast('Ссылка скопирована');
-      else {
-        if (visibleField) {
-          visibleField.focus({ preventScroll: true });
-          visibleField.select();
-          visibleField.setSelectionRange(0, visibleField.value.length);
-        }
-        toast(visibleField
-          ? 'Не удалось скопировать автоматически — ссылка выделена, удерживайте её и выберите «Копировать»'
-          : 'Браузер запретил копирование — открываю ссылку для ручного копирования');
-      }
-      return copied;
-    };
+  function selectForCopy(field) {
+    if (!field) return;
+    try { field.focus({ preventScroll: true }); } catch { field.focus(); }
+    field.select();
+    if (typeof field.setSelectionRange === 'function') field.setSelectionRange(0, field.value.length);
+  }
 
-    // Invoke Clipboard API synchronously inside the button's user gesture.
-    // Waiting for another request first causes mobile Safari/Chrome to reject it.
+  function copyText(value, visibleField = null) {
+    // Safari on iPhone can reject the Async Clipboard API even on HTTPS. First
+    // try the synchronous copy command during this exact tap. In the share
+    // dialog this uses the visible URL field, which is more reliable in iOS
+    // than selecting a nearly invisible temporary textarea.
+    let temporaryField = null;
+    const field = visibleField || (temporaryField = document.createElement('textarea'));
+    if (temporaryField) {
+      temporaryField.value = value;
+      temporaryField.setAttribute('readonly', '');
+      temporaryField.setAttribute('aria-hidden', 'true');
+      Object.assign(temporaryField.style, {
+        position: 'fixed', top: '0', left: '0', width: '1px', height: '1px',
+        padding: '0', border: '0', opacity: '0.01', fontSize: '16px',
+        transform: 'scale(1)',
+      });
+      document.body.append(temporaryField);
+    }
+    selectForCopy(field);
+    let copied = false;
+    try { copied = document.execCommand('copy'); } catch { /* Clipboard command can be disabled by the browser. */ }
+    if (temporaryField) temporaryField.remove();
+    if (copied) {
+      toast('Ссылка скопирована');
+      return true;
+    }
+
+    // Start the asynchronous API call before this click's user activation ends.
     if (window.isSecureContext && navigator.clipboard?.writeText) {
       try {
         return navigator.clipboard.writeText(value).then(
           () => { toast('Ссылка скопирована'); return true; },
-          fallback
+          () => {
+            if (visibleField) selectForCopy(visibleField);
+            toast(visibleField
+              ? 'Ссылка выделена — удерживайте её и выберите «Копировать»'
+              : 'Автокопирование запрещено — открыл ссылку для копирования вручную');
+            return false;
+          }
         );
-      } catch { /* Fall back to the selected-text copy method. */ }
+      } catch { /* Fall through to the visible, selectable link. */ }
     }
-    return fallback();
+    if (visibleField) selectForCopy(visibleField);
+    toast(visibleField
+      ? 'Ссылка выделена — удерживайте её и выберите «Копировать»'
+      : 'Автокопирование запрещено — открыл ссылку для копирования вручную');
+    return false;
   }
 
   function driveShareContent(userId, link, includeQr) {
@@ -225,10 +241,14 @@
     return `<div class="drive-share">${qr}<p class="field-hint">${includeQr ? 'Отсканируйте код в Happ или другом VPN-клиенте.' : 'Ссылка скопируется после нажатия кнопки — это нужно для надёжной работы на телефонах.'}</p><label class="drive-link-field">Ссылка подписки<input data-drive-url readonly value="${esc(link)}" autocapitalize="off" autocomplete="off" spellcheck="false"></label><div class="drive-share-actions"><button class="button button-primary" type="button" data-copy-drive>${svg('copy')}<span>Скопировать ссылку</span></button>${qrAction}</div></div>`;
   }
 
-  async function showDriveShare(userId, includeQr = false) {
-    const result = await api(`/api/admin/users/${encodeURIComponent(userId)}/drive-link`);
-    if (!result.link) { toast('Файл ещё не создан в Drive'); return; }
-    openModal(includeQr ? 'QR-код подписки' : 'Ссылка Drive', driveShareContent(userId, result.link, includeQr));
+  async function showDriveShare(userId, includeQr = false, readyLink = null) {
+    let link = readyLink;
+    if (!link) {
+      const result = await api(`/api/admin/users/${encodeURIComponent(userId)}/drive-link`);
+      link = result.link;
+    }
+    if (!link) { toast('Файл ещё не создан в Drive'); return; }
+    openModal(includeQr ? 'QR-код подписки' : 'Ссылка Drive', driveShareContent(userId, link, includeQr));
     const body = $('#modalBody');
     body.onclick = event => {
       const copy = event.target.closest('[data-copy-drive]');
@@ -241,7 +261,7 @@
       if (qr) {
         qr.disabled = true;
         $('#modalTitle').textContent = 'QR-код подписки';
-        body.innerHTML = driveShareContent(userId, result.link, true);
+        body.innerHTML = driveShareContent(userId, link, true);
       }
     };
     const image = $('img', body);
@@ -269,7 +289,7 @@
             <button class="button button-secondary" data-servers="${user.id}">${svg('servers')}<span>Серверы</span></button>
             <button class="button button-secondary" data-preview="${user.id}">${svg('eye')}<span>Предпросмотр</span></button>
             <button class="button button-secondary" data-link="${esc(user.drive_link || '')}" data-user-id="${user.id}" ${user.drive_link ? '' : 'disabled'}>${svg('link')}<span>Ссылка Drive</span></button>
-            <button class="button button-secondary" data-qr="${user.id}" ${user.drive_link ? '' : 'disabled'}>${svg('qr')}<span>QR-код</span></button>
+            <button class="button button-secondary user-qr-action" data-qr="${user.id}" data-link="${esc(user.drive_link || '')}" ${user.drive_link ? '' : 'disabled'}>${svg('qr')}<span>QR-код</span></button>
             <button class="button button-danger" data-delete="${user.id}" ${user.status === 'pending_delete' ? 'disabled' : ''}>${svg('trash')}<span>Удалить</span></button>
           </div>
         </article>`;
@@ -293,14 +313,14 @@
         const result = await api(`/api/admin/users/${button.dataset.preview}/preview`);
         openModal('Предпросмотр профиля', `<pre class="preview">${esc(result)}</pre>`);
       } else if (button.dataset.link) {
-        // The link is preloaded with the card so this call stays inside the
-        // original tap gesture; mobile clipboard APIs reject post-fetch writes.
+        // Try copying synchronously on the tap. If Safari blocks both native
+        // mechanisms, show the visible/selectable URL without another request.
         const copied = copyText(button.dataset.link);
         Promise.resolve(copied).then(ok => {
-          if (!ok) return showDriveShare(button.dataset.userId).catch(failure => toast(failure.message));
+          if (!ok) return showDriveShare(button.dataset.userId, false, button.dataset.link).catch(failure => toast(failure.message));
         }).catch(failure => toast(failure.message));
       } else if (button.dataset.qr) {
-        await showDriveShare(button.dataset.qr, true);
+        await showDriveShare(button.dataset.qr, true, button.dataset.link);
       } else if (button.dataset.delete && confirm('Удалить пользователя и его Drive-файл навсегда? Это действие нельзя отменить.')) {
         button.disabled = true;
         const result = await api(`/api/admin/users/${button.dataset.delete}`, { method: 'DELETE', body: {} });
