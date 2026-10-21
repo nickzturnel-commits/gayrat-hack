@@ -9,6 +9,7 @@
   let csrf = '';
   let page = 'dashboard';
   let toastTimer;
+  let activeQrObjectUrl = '';
 
   function toast(message) {
     const node = $('#toast');
@@ -128,6 +129,7 @@
     if (button) setPage(button.dataset.page);
   });
   $('#closeModal').addEventListener('click', () => $('#modal').close());
+  $('#modal').addEventListener('close', releaseQrObjectUrl);
   $('#modal').addEventListener('click', event => {
     if (event.target === $('#modal')) $('#modal').close();
   });
@@ -173,10 +175,19 @@
       + (data.sync_errors?.length ? `<section class="section-block"><div class="section-heading"><div><p class="eyebrow">ТРЕБУЕТ ВНИМАНИЯ</p><h2>Ошибки синхронизации</h2></div></div><div class="card-list">${data.sync_errors.map(item => `<article class="surface-card"><h3>${esc(item.name)}</h3><p class="tone-bad">${esc(item.last_sync_error)}</p><small>${esc(date(item.last_synced_at))}</small></article>`).join('')}</div></section>` : '');
   }
 
+  function releaseQrObjectUrl() {
+    if (!activeQrObjectUrl) return;
+    URL.revokeObjectURL(activeQrObjectUrl);
+    activeQrObjectUrl = '';
+  }
+
   function openModal(title, content) {
+    const modal = $('#modal');
+    releaseQrObjectUrl();
+    if (modal.open) modal.close();
     $('#modalTitle').textContent = title;
     $('#modalBody').innerHTML = content;
-    $('#modal').showModal();
+    modal.showModal();
   }
 
   function selectForCopy(field) {
@@ -187,10 +198,14 @@
   }
 
   function copyText(value, visibleField = null) {
-    // Safari on iPhone can reject the Async Clipboard API even on HTTPS. First
-    // try the synchronous copy command during this exact tap. In the share
-    // dialog this uses the visible URL field, which is more reliable in iOS
-    // than selecting a nearly invisible temporary textarea.
+    // Start Clipboard API while the original tap is active. Keep the legacy
+    // synchronous fallback for browsers that do not expose it (or reject it).
+    let clipboardWrite = null;
+    if (window.isSecureContext && navigator.clipboard?.writeText) {
+      try { clipboardWrite = Promise.resolve(navigator.clipboard.writeText(value)); }
+      catch { /* Use the synchronous fallback below. */ }
+    }
+
     let temporaryField = null;
     const field = visibleField || (temporaryField = document.createElement('textarea'));
     if (temporaryField) {
@@ -210,23 +225,21 @@
     if (temporaryField) temporaryField.remove();
     if (copied) {
       toast('Ссылка скопирована');
+      if (clipboardWrite) clipboardWrite.catch(() => {});
       return true;
     }
 
-    // Start the asynchronous API call before this click's user activation ends.
-    if (window.isSecureContext && navigator.clipboard?.writeText) {
-      try {
-        return navigator.clipboard.writeText(value).then(
-          () => { toast('Ссылка скопирована'); return true; },
-          () => {
-            if (visibleField) selectForCopy(visibleField);
-            toast(visibleField
-              ? 'Ссылка выделена — удерживайте её и выберите «Копировать»'
-              : 'Автокопирование запрещено — открыл ссылку для копирования вручную');
-            return false;
-          }
-        );
-      } catch { /* Fall through to the visible, selectable link. */ }
+    if (clipboardWrite) {
+      return clipboardWrite.then(
+        () => { toast('Ссылка скопирована'); return true; },
+        () => {
+          if (visibleField) selectForCopy(visibleField);
+          toast(visibleField
+            ? 'Ссылка выделена — удерживайте её и выберите «Копировать»'
+            : 'Автокопирование запрещено — открыл ссылку для копирования вручную');
+          return false;
+        }
+      );
     }
     if (visibleField) selectForCopy(visibleField);
     toast(visibleField
@@ -235,37 +248,69 @@
     return false;
   }
 
-  function driveShareContent(userId, link, includeQr) {
-    const qr = includeQr ? `<div class="drive-qr-frame"><img src="/api/admin/users/${encodeURIComponent(userId)}/drive-qr.svg" alt="QR-код ссылки подписки" width="260" height="260"></div>` : '';
-    const qrAction = includeQr ? '' : `<button class="button button-secondary" type="button" data-show-drive-qr>${svg('qr')}<span>Показать QR-код</span></button>`;
-    return `<div class="drive-share">${qr}<p class="field-hint">${includeQr ? 'Отсканируйте код в Happ или другом VPN-клиенте.' : 'Ссылка скопируется после нажатия кнопки — это нужно для надёжной работы на телефонах.'}</p><label class="drive-link-field">Ссылка подписки<input data-drive-url readonly value="${esc(link)}" autocapitalize="off" autocomplete="off" spellcheck="false"></label><div class="drive-share-actions"><button class="button button-primary" type="button" data-copy-drive>${svg('copy')}<span>Скопировать ссылку</span></button>${qrAction}</div></div>`;
+  function driveLinkContent(link) {
+    return `<div class="drive-share"><p class="field-hint">Ссылка подписки</p><label class="drive-link-field"><input data-drive-url readonly value="${esc(link)}" autocapitalize="off" autocomplete="off" spellcheck="false" aria-label="Ссылка подписки"></label><div class="drive-share-actions"><button class="button button-primary" type="button" data-copy-drive>${svg('copy')}<span>Скопировать ссылку</span></button></div></div>`;
   }
 
-  async function showDriveShare(userId, includeQr = false, readyLink = null) {
+  async function showDriveShare(userId, readyLink = null) {
     let link = readyLink;
-    if (!link) {
-      const result = await api(`/api/admin/users/${encodeURIComponent(userId)}/drive-link`);
-      link = result.link;
-    }
+    if (!link) link = (await api(`/api/admin/users/${encodeURIComponent(userId)}/drive-link`)).link;
     if (!link) { toast('Файл ещё не создан в Drive'); return; }
-    openModal(includeQr ? 'QR-код подписки' : 'Ссылка Drive', driveShareContent(userId, link, includeQr));
+    openModal('Ссылка Drive', driveLinkContent(link));
     const body = $('#modalBody');
     body.onclick = event => {
       const copy = event.target.closest('[data-copy-drive]');
       if (copy) {
         const input = $('[data-drive-url]', body);
         copyText(input.value, input);
-        return;
-      }
-      const qr = event.target.closest('[data-show-drive-qr]');
-      if (qr) {
-        qr.disabled = true;
-        $('#modalTitle').textContent = 'QR-код подписки';
-        body.innerHTML = driveShareContent(userId, link, true);
       }
     };
-    const image = $('img', body);
-    if (image) image.addEventListener('error', () => toast('Не удалось создать QR-код. Проверьте DRIVE_API_KEY и повторите попытку.'), { once: true });
+  }
+
+  function driveQrLoadingContent() {
+    return '<div class="qr-only"><div class="drive-qr-frame qr-loading" aria-label="Загрузка QR-кода"><span class="spinner" aria-hidden="true"></span></div></div>';
+  }
+
+  async function showDriveQr(userId) {
+    openModal('QR-код подписки', driveQrLoadingContent());
+    const body = $('#modalBody');
+    try {
+      const response = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/drive-qr.svg`, {
+        method: 'GET', cache: 'no-store', credentials: 'same-origin',
+        headers: { Accept: 'image/svg+xml' },
+      });
+      const svgText = await response.text();
+      if (!response.ok) {
+        let message = 'Не удалось загрузить QR-код';
+        try { message = JSON.parse(svgText).detail || message; } catch { /* Use the safe generic message. */ }
+        throw new Error(response.status === 401 ? 'Сессия завершилась — войдите в панель снова' : message);
+      }
+      if (!(response.headers.get('content-type') || '').toLowerCase().includes('image/svg+xml') || !/<svg\b/i.test(svgText)) {
+        throw new Error('Сервер вернул некорректное изображение QR-кода');
+      }
+
+      const imageUrl = URL.createObjectURL(new Blob([svgText], { type: 'image/svg+xml' }));
+      activeQrObjectUrl = imageUrl;
+      const frame = document.createElement('div');
+      frame.className = 'drive-qr-frame';
+      const image = document.createElement('img');
+      image.alt = 'QR-код ссылки подписки';
+      image.width = 260;
+      image.height = 260;
+      image.onload = () => frame.classList.add('qr-ready');
+      image.onerror = () => {
+        frame.classList.add('qr-error');
+        frame.textContent = 'Не удалось отобразить QR-код. Попробуйте ещё раз.';
+      };
+      frame.append(image);
+      const qrOnly = document.createElement('div');
+      qrOnly.className = 'qr-only';
+      qrOnly.append(frame);
+      body.replaceChildren(qrOnly);
+      image.src = imageUrl;
+    } catch (failure) {
+      body.innerHTML = `<div class="qr-error-card" role="alert">${esc(failure.message || 'Не удалось загрузить QR-код')}</div>`;
+    }
   }
 
   function userStatus(user) {
@@ -288,8 +333,8 @@
             <button class="button button-secondary" data-edit="${user.id}">${svg('edit')}<span>Изменить</span></button>
             <button class="button button-secondary" data-servers="${user.id}">${svg('servers')}<span>Серверы</span></button>
             <button class="button button-secondary" data-preview="${user.id}">${svg('eye')}<span>Предпросмотр</span></button>
-            <button class="button button-secondary" data-link="${esc(user.drive_link || '')}" data-user-id="${user.id}" ${user.drive_link ? '' : 'disabled'}>${svg('link')}<span>Ссылка Drive</span></button>
-            <button class="button button-secondary user-qr-action" data-qr="${user.id}" data-link="${esc(user.drive_link || '')}" ${user.drive_link ? '' : 'disabled'}>${svg('qr')}<span>QR-код</span></button>
+            <button class="button button-secondary" data-action="copy-link" data-link="${esc(user.drive_link || '')}" data-user-id="${user.id}" ${user.drive_link ? '' : 'disabled'}>${svg('link')}<span>Ссылка Drive</span></button>
+            <button class="button button-secondary user-qr-action" data-action="qr" data-user-id="${user.id}" ${user.drive_link ? '' : 'disabled'}>${svg('qr')}<span>QR-код</span></button>
             <button class="button button-danger" data-delete="${user.id}" ${user.status === 'pending_delete' ? 'disabled' : ''}>${svg('trash')}<span>Удалить</span></button>
           </div>
         </article>`;
@@ -303,8 +348,16 @@
   async function handleUserAction(event, list) {
     const button = event.target.closest('button');
     if (!button) return;
+    const shareAction = window.PanelAdminActions.resolveUserAction(button);
     try {
-      if (button.dataset.edit) {
+      if (shareAction?.kind === 'qr') {
+        await showDriveQr(shareAction.userId);
+      } else if (shareAction?.kind === 'copy-link') {
+        const copied = copyText(shareAction.link);
+        Promise.resolve(copied).then(ok => {
+          if (!ok) return showDriveShare(shareAction.userId, shareAction.link).catch(failure => toast(failure.message));
+        }).catch(failure => toast(failure.message));
+      } else if (button.dataset.edit) {
         const user = list.find(item => item.id === Number(button.dataset.edit));
         if (user) await userForm(user);
       } else if (button.dataset.servers) {
@@ -312,15 +365,6 @@
       } else if (button.dataset.preview) {
         const result = await api(`/api/admin/users/${button.dataset.preview}/preview`);
         openModal('Предпросмотр профиля', `<pre class="preview">${esc(result)}</pre>`);
-      } else if (button.dataset.link) {
-        // Try copying synchronously on the tap. If Safari blocks both native
-        // mechanisms, show the visible/selectable URL without another request.
-        const copied = copyText(button.dataset.link);
-        Promise.resolve(copied).then(ok => {
-          if (!ok) return showDriveShare(button.dataset.userId, false, button.dataset.link).catch(failure => toast(failure.message));
-        }).catch(failure => toast(failure.message));
-      } else if (button.dataset.qr) {
-        await showDriveShare(button.dataset.qr, true, button.dataset.link);
       } else if (button.dataset.delete && confirm('Удалить пользователя и его Drive-файл навсегда? Это действие нельзя отменить.')) {
         button.disabled = true;
         const result = await api(`/api/admin/users/${button.dataset.delete}`, { method: 'DELETE', body: {} });
