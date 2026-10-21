@@ -21,10 +21,12 @@ from urllib.parse import quote, unquote, urlsplit
 
 import asyncpg
 import httpx
+import qrcode
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from qrcode.image.svg import SvgPathImage
 from starlette.middleware.base import BaseHTTPMiddleware
 
 log = logging.getLogger("vpn_panel")
@@ -764,7 +766,16 @@ async def users_list(request: Request):
     pool = await state.db()
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT * FROM users ORDER BY created_at,id")
-    return {"users": [_serialize(row) for row in rows]}
+    api_key_configured = bool(os.getenv("DRIVE_API_KEY", ""))
+    users = []
+    for row in rows:
+        user = _serialize(row)
+        # Preload the already-authorized download URL so mobile clipboard access
+        # can happen directly during the user's tap, without an awaited fetch.
+        user["drive_link"] = (_drive_subscription_link(user["drive_file_id"])
+                              if user.get("drive_file_id") and api_key_configured else None)
+        users.append(user)
+    return {"users": users}
 
 
 @router.post("/api/admin/users")
@@ -830,6 +841,23 @@ async def users_preview(user_id: int, request: Request):
     return PlainTextResponse(content, headers={"Cache-Control": "no-store"})
 
 
+def _drive_subscription_link(file_id: str) -> str:
+    api_key = os.getenv("DRIVE_API_KEY", "")
+    if not api_key:
+        raise HTTPException(503, "DRIVE_API_KEY не задан")
+    from urllib.parse import urlencode
+    query = urlencode({"key": api_key, "alt": "media"})
+    return f"https://www.googleapis.com/drive/v3/files/{file_id}?{query}"
+
+
+def _drive_qr_svg(link: str) -> str:
+    code = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=8, border=4)
+    code.add_data(link)
+    code.make(fit=True)
+    image = code.make_image(image_factory=SvgPathImage, fill_color="#111111", back_color="#ffffff")
+    return image.to_string(encoding="unicode")
+
+
 @router.get("/api/admin/users/{user_id}/drive-link")
 async def drive_link(user_id: int, request: Request):
     _auth(request)
@@ -838,11 +866,23 @@ async def drive_link(user_id: int, request: Request):
         user = await conn.fetchrow("SELECT drive_file_id FROM users WHERE id=$1", user_id)
     if not user: raise HTTPException(404, "Пользователь не найден")
     if not user["drive_file_id"]: return {"link": None, "pending": True}
-    api_key = os.getenv("DRIVE_API_KEY", "")
-    if not api_key: raise HTTPException(503, "DRIVE_API_KEY не задан")
-    from urllib.parse import urlencode
-    query = urlencode({"key": api_key, "alt": "media"})
-    return {"link": f"https://www.googleapis.com/drive/v3/files/{user['drive_file_id']}?{query}", "pending": False}
+    return {"link": _drive_subscription_link(user["drive_file_id"]), "pending": False}
+
+
+@router.get("/api/admin/users/{user_id}/drive-qr.svg")
+async def drive_qr(user_id: int, request: Request):
+    """Return an authenticated SVG QR code for this user's ready Drive subscription."""
+    _auth(request)
+    pool = await state.db()
+    async with pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT drive_file_id FROM users WHERE id=$1", user_id)
+    if not user:
+        raise HTTPException(404, "Пользователь не найден")
+    if not user["drive_file_id"]:
+        raise HTTPException(409, "Файл подписки ещё не создан в Drive")
+    svg = _drive_qr_svg(_drive_subscription_link(user["drive_file_id"]))
+    return Response(content=svg, media_type="image/svg+xml",
+                    headers={"Cache-Control": "no-store", "Content-Disposition": "inline; filename=subscription-qr.svg"})
 
 
 @router.post("/api/admin/drive/sync")

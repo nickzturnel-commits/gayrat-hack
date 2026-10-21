@@ -210,6 +210,66 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(yes_csrf.status_code, 200)
 
 
+class DriveQrTests(unittest.IsolatedAsyncioTestCase):
+    async def test_users_list_preloads_copyable_link_only_for_ready_drive_file(self):
+        conn = FakeConn(users=[{"id": 8, "drive_file_id": "ready-file"}, {"id": 9, "drive_file_id": None}])
+        with patch.object(panel, "_auth"), \
+             patch.object(panel.state, "db", new=AsyncMock(return_value=FakePool(conn))), \
+             patch.dict(os.environ, {"DRIVE_API_KEY": "list-key"}, clear=False):
+            result = await panel.users_list(make_request())
+
+        self.assertEqual(result["users"][0]["drive_link"],
+                         "https://www.googleapis.com/drive/v3/files/ready-file?key=list-key&alt=media")
+        self.assertIsNone(result["users"][1]["drive_link"])
+
+    async def test_drive_link_and_qr_use_same_private_download_url(self):
+        class DriveConn(FakeConn):
+            async def fetchrow(self, query, *args):
+                if "SELECT drive_file_id FROM users" in query:
+                    return {"drive_file_id": "drive-file-id"}
+                return await super().fetchrow(query, *args)
+
+        conn = DriveConn()
+        request = make_request()
+        expected = "https://www.googleapis.com/drive/v3/files/drive-file-id?key=test-key&alt=media"
+        with patch.object(panel, "_auth"), \
+             patch.object(panel.state, "db", new=AsyncMock(return_value=FakePool(conn))), \
+             patch.dict(os.environ, {"DRIVE_API_KEY": "test-key"}, clear=False), \
+             patch.object(panel, "_drive_qr_svg", return_value="<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>") as render_qr:
+            link_result = await panel.drive_link(7, request)
+            qr_result = await panel.drive_qr(7, request)
+
+        self.assertEqual(link_result["link"], expected)
+        render_qr.assert_called_once_with(expected)
+        self.assertEqual(qr_result.body, b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>")
+        self.assertTrue(qr_result.headers["content-type"].startswith("image/svg+xml"))
+        self.assertEqual(qr_result.headers["cache-control"], "no-store")
+
+    async def test_qr_route_is_mounted_and_returns_image_response(self):
+        class DriveConn(FakeConn):
+            async def fetchrow(self, query, *args):
+                if "SELECT drive_file_id FROM users" in query:
+                    return {"drive_file_id": "mounted-file"}
+                return await super().fetchrow(query, *args)
+
+        with patch.object(panel, "_auth"), \
+             patch.object(panel.state, "db", new=AsyncMock(return_value=FakePool(DriveConn()))), \
+             patch.dict(os.environ, {"DRIVE_API_KEY": "mounted-key"}, clear=False):
+            transport = httpx.ASGITransport(app=app.app)
+            async with httpx.AsyncClient(transport=transport, base_url="https://testserver") as client:
+                response = await client.get("/api/admin/users/13/drive-qr.svg")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers["content-type"].startswith("image/svg+xml"))
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertIn(b"<svg", response.content)
+
+    def test_qr_renderer_returns_standalone_svg(self):
+        svg = panel._drive_qr_svg("https://www.googleapis.com/drive/v3/files/example?key=secret&alt=media")
+        self.assertIn("<svg", svg)
+        self.assertIn("<path", svg)
+
+
 class ManifestTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_user_traffic_toggle_uses_explicit_choice_or_admin_default(self):
         class CreateConn(FakeConn):

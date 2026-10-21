@@ -59,7 +59,7 @@ Apps Script compares the current file text with generated content and skips `set
 ## Panel and subscription behavior
 
 - **Dashboard:** upstream cache and warning, provider account traffic, subscriber counts, instant Drive delivery status, database status and delivery errors.
-- **Users:** add/edit, enabled state, expiry, profile title and announcement overrides, generated preview, Drive link, and deletion. User changes are sent to Drive immediately.
+- **Users:** add/edit, enabled state, expiry, profile title and announcement overrides, generated preview, Drive link, QR code for each ready Drive profile, and deletion. The Drive URL is preloaded in the authenticated admin list so the mobile copy action runs directly in the tap gesture; if the browser blocks it, the panel opens a selectable link field. User changes are sent to Drive immediately.
 - **Servers:** global rename/hide/order and per-user rename/hide. Removed upstream servers remain visible in the panel marked as absent and are omitted from generated profiles.
 - **Settings:** profile title, support URL, update interval, timezone, announcements, refresh interval, weekday lines, quotes and footer templates.
 - `/api/sync/manifest` fetches the panel's upstream subscription itself whenever the separate 5-minute panel cache is empty or stale. It uses only configured `UPSTREAM_*` device headers and the fallback User-Agent `Happ`. The request timeout is 20 seconds. A good previous copy is served on refresh failure. HTML, device-limit responses and bodies without server URIs are rejected and never replace a good cache. If there is no good copy yet, manifest returns an error so Apps Script can retry without overwriting Drive.
