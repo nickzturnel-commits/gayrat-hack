@@ -32,21 +32,95 @@ class FakeConn:
     async def execute(self, query, *args):
         if query.startswith("DELETE FROM users"):
             self.deleted = True
+        elif query.startswith("DELETE FROM servers WHERE id=ANY"):
+            target_id, old_ids = args
+            self.servers[:] = [row for row in self.servers
+                               if row.get("id") == target_id or row.get("id") not in old_ids]
+            self.user_servers[:] = [row for row in self.user_servers if row.get("server_id") == target_id
+                                    or row.get("server_id") not in old_ids]
+        elif query.startswith("UPDATE servers SET present_upstream=FALSE"):
+            for row in self.servers:
+                row["present_upstream"] = False
+        elif query.startswith("INSERT INTO servers(id,original_name,source_key"):
+            server_id, original_name, source_key, sort_order = args
+            row = next((item for item in self.servers if item.get("id") == server_id), None)
+            if row is None:
+                row = {"id": server_id, "original_name": original_name, "source_key": source_key,
+                       "custom_name": None, "hidden": False, "sort_order": sort_order,
+                       "present_upstream": True}
+                self.servers.append(row)
+            else:
+                row.update(original_name=original_name, source_key=source_key, present_upstream=True)
+        elif query.startswith("UPDATE servers AS target SET"):
+            target_id, old_ids = args
+            target = next((item for item in self.servers if item.get("id") == target_id), None)
+            old_rows = [item for item in self.servers if item.get("id") in old_ids and item.get("id") != target_id]
+            if target:
+                target["custom_name"] = target.get("custom_name") or next(
+                    (item.get("custom_name") for item in sorted(old_rows, key=lambda x: x.get("last_seen_at") or datetime.min.replace(tzinfo=timezone.utc), reverse=True) if item.get("custom_name")), None)
+                target["hidden"] = bool(target.get("hidden")) or any(item.get("hidden") for item in old_rows)
+        elif query.startswith("INSERT INTO user_servers(user_id,server_id,hidden,custom_name)"):
+            target_id, old_ids = args
+            for item in list(self.user_servers):
+                if item.get("server_id") not in old_ids:
+                    continue
+                target = next((row for row in self.user_servers if row.get("user_id") == item.get("user_id")
+                               and row.get("server_id") == target_id), None)
+                if target is None:
+                    self.user_servers.append({**item, "server_id": target_id})
+                else:
+                    if target.get("hidden") is None:
+                        target["hidden"] = item.get("hidden")
+                    if target.get("custom_name") is None:
+                        target["custom_name"] = item.get("custom_name")
         return "UPDATE 1"
 
     async def fetch(self, query, *args):
         if "SELECT * FROM users" in query:
             return self.users
+        if "SELECT * FROM servers" in query:
+            if "WHERE present_upstream=TRUE" in query:
+                return [row for row in self.servers if row.get("present_upstream", True)]
+            return self.servers
+        if "SELECT id,original_name,source_key,custom_name,hidden,sort_order" in query:
+            return self.servers
+        if "SELECT server_id,COUNT(*) AS override_count FROM user_servers" in query:
+            counts = {}
+            for row in self.user_servers:
+                counts[row["server_id"]] = counts.get(row["server_id"], 0) + 1
+            return [{"server_id": key, "override_count": value} for key, value in counts.items()]
         if "SELECT id,original_name,custom_name,hidden,sort_order FROM servers" in query:
+            if "WHERE present_upstream=TRUE" in query:
+                return [row for row in self.servers if row.get("present_upstream", True)]
             return self.servers
         if "SELECT server_id,hidden,custom_name FROM user_servers" in query:
             return self.user_servers
+        if "FROM servers s LEFT JOIN user_servers" in query:
+            rows = []
+            for server in self.servers:
+                if "WHERE s.present_upstream=TRUE" in query and not server.get("present_upstream", True):
+                    continue
+                override = next((item for item in self.user_servers if item.get("server_id") == server["id"]
+                                 and item.get("user_id") == args[0]), {})
+                rows.append({"id": server["id"], "original_name": server["original_name"],
+                             "global_name": server.get("custom_name"), "global_hidden": server.get("hidden", False),
+                             "sort_order": server.get("sort_order", 0),
+                             "present_upstream": server.get("present_upstream", True),
+                             "user_hidden": override.get("hidden"), "user_name": override.get("custom_name")})
+            return rows
         return []
 
     async def fetchrow(self, query, *args):
         if "SELECT id,status FROM users" in query:
             return {"id": args[0], "status": self.status}
         return None
+
+    async def fetchval(self, query, *args):
+        if "FROM users WHERE id=$1" in query:
+            return any(user.get("id") == args[0] for user in self.users)
+        if "FROM servers WHERE id=$1" in query:
+            return any(row.get("id") == args[0] and row.get("present_upstream", True) for row in self.servers)
+        return False
 
     def transaction(self):
         return FakeAcquire(self)
@@ -108,6 +182,12 @@ class UriTests(unittest.TestCase):
         obj = json.loads(base64.b64decode(renamed[8:]))
         self.assertEqual(obj["ps"], "Renamed")
 
+    def test_source_name_key_is_stable_across_case_and_unicode_spacing(self):
+        first = panel.parse_server_uri("vless://old@old.example#  Ｓerver   North ")
+        second = panel.parse_server_uri("vless://new@new.example#server north")
+        self.assertEqual(first["source_key"], second["source_key"])
+        self.assertNotEqual(first["id"], second["id"])
+
     def test_subscription_base64_decodes_only_when_it_contains_uris(self):
         raw = "vless://user@host\n"
         self.assertEqual(panel._decode_subscription(base64.b64encode(raw.encode())), raw.strip())
@@ -117,6 +197,110 @@ class UriTests(unittest.TestCase):
         entries = "vless://id@host:443#First\nvless://id@host:443#Second\n"
         self.assertEqual(panel._extract_uris(entries), ["vless://id@host:443#First"])
 
+
+class ServerReconciliationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_changed_uri_keeps_global_and_per_user_customizations(self):
+        previous = panel.parse_server_uri("vless://old-id@old.example:443#Nord")
+        changed = panel.parse_server_uri("vless://new-id@new.example:8443#Nord")
+        stale = panel.parse_server_uri("trojan://gone@gone.example:443#Removed")
+        old_row = {"id": previous["id"], "original_name": "Nord", "source_key": previous["source_key"],
+                   "custom_name": "My Nord", "hidden": True, "sort_order": 7,
+                   "present_upstream": True}
+        stale_row = {"id": stale["id"], "original_name": "Removed", "source_key": stale["source_key"],
+                     "custom_name": None, "hidden": False, "sort_order": 8,
+                     "present_upstream": True}
+        personal = {"user_id": 5, "server_id": previous["id"], "hidden": False,
+                    "custom_name": "Personal Nord"}
+        conn = FakeConn(servers=[old_row, stale_row], user_servers=[personal])
+
+        synced = await panel._sync_servers(conn, f"{changed['uri']}\n".encode())
+
+        self.assertEqual(len(synced), 1)
+        self.assertEqual(synced[0]["id"], previous["id"])
+        self.assertEqual(synced[0]["uri"], changed["uri"])
+        active = [row for row in conn.servers if row.get("present_upstream")]
+        self.assertEqual([row["id"] for row in active], [previous["id"]])
+        self.assertEqual(active[0]["custom_name"], "My Nord")
+        self.assertTrue(active[0]["hidden"])
+        self.assertEqual(active[0]["sort_order"], 7)
+        self.assertEqual(personal["server_id"], previous["id"])
+        self.assertEqual(personal["custom_name"], "Personal Nord")
+        self.assertFalse(stale_row["present_upstream"])
+        user = {"id": 5, "slug": "person-5", "enabled": True, "expires_at": None,
+                "announce_override": "", "title_override": None, "status": "active",
+                "drive_file_id": None}
+        content = await panel.build_manifest_content(
+            conn, user, changed["uri"].encode(), {},
+            dict(panel.DEFAULT_SETTINGS, announce_enabled=False), servers=synced)
+        self.assertIn("vless://new-id@new.example:8443#Personal%20Nord", content)
+
+    async def test_historical_uri_rows_merge_personal_overrides_into_survivor(self):
+        first = panel.parse_server_uri("vless://first@one.example#North")
+        second = panel.parse_server_uri("vless://second@two.example#North")
+        current = panel.parse_server_uri("vless://current@three.example#North")
+        old_global = {"id": first["id"], "original_name": "North", "source_key": first["source_key"],
+                      "custom_name": "North Custom", "hidden": False, "sort_order": 2,
+                      "present_upstream": False}
+        old_personal = {"id": second["id"], "original_name": "North", "source_key": second["source_key"],
+                        "custom_name": None, "hidden": False, "sort_order": 3,
+                        "present_upstream": False}
+        override = {"user_id": 12, "server_id": second["id"], "hidden": True,
+                    "custom_name": "My North"}
+        conn = FakeConn(servers=[old_global, old_personal], user_servers=[override])
+
+        result = await panel._sync_servers(conn, current["uri"].encode())
+
+        self.assertEqual(result[0]["id"], second["id"])
+        self.assertEqual(len([row for row in conn.servers if row.get("present_upstream")]), 1)
+        survivor = next(row for row in conn.servers if row.get("id") == second["id"])
+        self.assertEqual(survivor["custom_name"], "North Custom")
+        migrated = next(row for row in conn.user_servers if row.get("server_id") == second["id"])
+        self.assertEqual(migrated["custom_name"], "My North")
+        self.assertTrue(migrated["hidden"])
+
+    async def test_server_list_refreshes_snapshot_and_hides_old_rows(self):
+        active = panel.parse_server_uri("vless://current@current.example#Current")
+        old = panel.parse_server_uri("vless://old@old.example#Old")
+        conn = FakeConn(servers=[
+            {"id": active["id"], "original_name": "Current", "source_key": active["source_key"],
+             "custom_name": None, "hidden": False, "sort_order": 0, "present_upstream": True},
+            {"id": old["id"], "original_name": "Old", "source_key": old["source_key"],
+             "custom_name": None, "hidden": False, "sort_order": 1, "present_upstream": True},
+        ])
+        with patch.object(panel, "_auth"), \
+             patch.object(panel.state, "fetch_upstream", new=AsyncMock(return_value=(active["uri"].encode(), {}, False))), \
+             patch.object(panel.state, "db", new=AsyncMock(return_value=FakePool(conn))):
+            result = await panel.servers_list(make_request())
+
+        self.assertEqual([row["original_name"] for row in result["servers"]], ["Current"])
+        self.assertFalse(next(row for row in conn.servers if row["id"] == old["id"])["present_upstream"])
+
+    async def test_user_server_list_only_returns_current_upstream_servers(self):
+        current = panel.parse_server_uri("vless://now@current.example#Current")
+        old = panel.parse_server_uri("vless://past@old.example#Old")
+        conn = FakeConn(users=[{"id": 24}], servers=[
+            {"id": current["id"], "original_name": "Current", "source_key": current["source_key"],
+             "custom_name": None, "hidden": False, "sort_order": 0, "present_upstream": True},
+            {"id": old["id"], "original_name": "Old", "source_key": old["source_key"],
+             "custom_name": None, "hidden": False, "sort_order": 1, "present_upstream": True},
+        ])
+        with patch.object(panel, "_auth"), \
+             patch.object(panel.state, "fetch_upstream", new=AsyncMock(return_value=(current["uri"].encode(), {}, False))), \
+             patch.object(panel.state, "db", new=AsyncMock(return_value=FakePool(conn))):
+            result = await panel.user_servers_list(24, make_request())
+
+        self.assertEqual([row["original_name"] for row in result["servers"]], ["Current"])
+
+    async def test_server_list_does_not_label_stale_fallback_as_current(self):
+        pool = AsyncMock()
+        db_mock = AsyncMock(return_value=pool)
+        with patch.object(panel, "_auth"), \
+             patch.object(panel.state, "fetch_upstream", new=AsyncMock(return_value=(b"old", {}, True))), \
+             patch.object(panel.state, "db", new=db_mock):
+            with self.assertRaises(HTTPException) as raised:
+                await panel.servers_list(make_request())
+            self.assertEqual(raised.exception.status_code, 503)
+            db_mock.assert_not_awaited()
 
 class UpstreamCacheTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

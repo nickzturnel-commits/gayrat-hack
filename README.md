@@ -2,7 +2,7 @@
 
 FastAPI service with the original raw subscription relay and an independent admin panel. The relay keeps its existing behavior at `/`, `/sub.txt`, and `/health`; its request profile and HWID header forwarding are separate from panel synchronization.
 
-The admin panel manages subscriber profiles and servers in Supabase. Changes made in the panel are pushed immediately to Google Drive through a protected Apps Script Web App. The existing five-minute Apps Script trigger remains as a recovery path. The established Drive file `160lsZ2nDrSXTzA09r9jeGHnd6QyFylw9` is seeded as **Основная (legacy)** so its existing URL remains the same.
+The admin panel manages subscriber profiles and servers in Supabase. Changes made in the panel are pushed immediately to Google Drive through a protected Apps Script Web App. The existing five-minute Apps Script trigger remains as a recovery path. The already-connected legacy Drive file is kept as **Основная (legacy)** so its existing URL remains unchanged. Its real file ID is stored by the application and is intentionally omitted from this documentation. Example only: `YOUR_EXISTING_DRIVE_FILE_ID`.
 
 ## Render environment
 
@@ -60,7 +60,7 @@ Apps Script compares the current file text with generated content and skips `set
 
 - **Dashboard:** upstream cache and warning, provider account traffic, subscriber counts, instant Drive delivery status, database status and delivery errors.
 - **Users:** add/edit, enabled state, expiry, profile title and announcement overrides, generated preview, Drive link, QR code for each ready Drive profile, and deletion. The Drive URL is preloaded in the authenticated admin list so the mobile copy action runs directly in the tap gesture; if the browser blocks it, the panel opens a selectable link field. User changes are sent to Drive immediately.
-- **Servers:** global rename/hide/order and per-user rename/hide. Removed upstream servers remain visible in the panel marked as absent and are omitted from generated profiles.
+- **Servers:** global rename/hide/order and per-user rename/hide. Only servers in the latest successful upstream snapshot are shown or offered for per-user overrides. If the provider changes a server URI but keeps its name, the existing server identity and global/per-user customizations are retained.
 - **Settings:** profile title, support URL, update interval, timezone, announcements, refresh interval, weekday lines, quotes and footer templates.
 - `/api/sync/manifest` fetches the panel's upstream subscription itself whenever the separate 5-minute panel cache is empty or stale. It uses only configured `UPSTREAM_*` device headers and the fallback User-Agent `Happ`. The request timeout is 20 seconds. A good previous copy is served on refresh failure. HTML, device-limit responses and bodies without server URIs are rejected and never replace a good cache. If there is no good copy yet, manifest returns an error so Apps Script can retry without overwriting Drive.
 - Relay cache and panel upstream cache are separate. The original relay continues to pass the upstream response body and selected headers through as before.
@@ -74,7 +74,7 @@ The admin UI has separate desktop and mobile pages. `/admin` selects a layout us
 1. Configure Render environment variables and deploy this version. Keep the current Apps Script running while Render builds; the public relay endpoints are unchanged.
 2. Confirm `/health` returns `ok`, then open `/admin` and confirm the database status is connected. If it is unavailable, use the Supabase Session Pooler URL.
 3. Confirm the dashboard reports a successful upstream snapshot and a nonzero server count. A failed/empty manifest is not sent to Apps Script as a valid user list, so it cannot overwrite the current Drive file.
-4. Replace the old Apps Script source, set the two Script Properties, run `setup()` and `updateSub()` once, then deploy it as a Web App and set its `/exec` URL in Render as `DRIVE_SYNC_URL`. The legacy subscriber writes to the already-existing Drive file ID; its Drive API URL does not change.
+4. Replace the old Apps Script source, set the two Script Properties, run `setup()` and `updateSub()` once, then deploy it as a Web App and set its `/exec` URL in Render as `DRIVE_SYNC_URL`. The legacy subscriber continues writing to its existing Drive file; its Drive API URL does not change.
 5. Confirm the old Happ link still loads, then create additional users in the panel. Their Drive files and links are created immediately by the Web App.
 
 The project has no dependency on an Apps Script trigger recreation: the existing five-minute trigger name remains `updateSub`.

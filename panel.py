@@ -141,6 +141,12 @@ def _vmess_obj(uri: str) -> tuple[dict, str]:
     return obj, unquote(str(obj.get("ps") or fragment))
 
 
+def _server_name_key(name: str) -> str:
+    """Normalize the provider's stable display name for server reconciliation."""
+    normalized = unicodedata.normalize("NFKC", str(name or ""))
+    return " ".join(normalized.split()).casefold()
+
+
 def parse_server_uri(uri: str) -> dict:
     value = uri.strip()
     scheme = value.split(":", 1)[0].lower()
@@ -162,7 +168,9 @@ def parse_server_uri(uri: str) -> dict:
         except ValueError:
             pass
     server_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
-    return {"id": server_id, "uri": value, "name": name or fallback_name, "scheme": scheme}
+    display_name = name or fallback_name
+    return {"id": server_id, "uri": value, "name": display_name,
+            "source_key": _server_name_key(display_name), "scheme": scheme}
 
 
 def rename_server_uri(uri: str, name: str) -> str:
@@ -570,6 +578,105 @@ def _userinfo(headers: dict, expire_override: int | None = None) -> str:
     return "; ".join(f"{k}={parts.get(k, '0')}" for k in ("upload", "download", "total", "expire"))
 
 
+def _server_row_value(row, key, default=None):
+    try:
+        return row.get(key, default)
+    except AttributeError:
+        try:
+            return row[key]
+        except (KeyError, TypeError):
+            return default
+
+
+def _server_rank(row, override_counts: dict[str, int]) -> tuple:
+    server_id = str(_server_row_value(row, "id", ""))
+    last_seen = _server_row_value(row, "last_seen_at")
+    try:
+        last_seen_rank = last_seen.timestamp()
+    except (AttributeError, OSError, OverflowError):
+        last_seen_rank = 0
+    return (
+        override_counts.get(server_id, 0),
+        bool(_server_row_value(row, "custom_name")),
+        bool(_server_row_value(row, "hidden", False)),
+        last_seen_rank,
+    )
+
+
+def _plan_server_reconciliation(parsed: list[dict], existing: list[dict],
+                                override_counts: dict[str, int] | None = None) -> tuple[list[dict], dict[str, list[str]]]:
+    """Keep stored IDs and overrides when a provider changes a URI but not its name.
+
+    Exact URI identities are matched first. Remaining entries match by normalized
+    provider name. When a name is unique in the incoming snapshot, historical rows
+    with that same name are treated as old configurations of the same server.
+    """
+    override_counts = override_counts or {}
+    rows = [dict(row) for row in existing]
+    by_id = {str(row["id"]): row for row in rows if row.get("id") is not None}
+    assigned: dict[int, str] = {}
+    reserved_ids: set[str] = set()
+
+    # An unchanged server configuration is the strongest identity signal, even if
+    # its provider label was edited.
+    for index, server in enumerate(parsed):
+        current_id = str(server["id"])
+        if current_id in by_id and current_id not in reserved_ids:
+            assigned[index] = current_id
+            reserved_ids.add(current_id)
+
+    incoming_name_counts: dict[str, int] = {}
+    for server in parsed:
+        key = server.get("source_key") or _server_name_key(server.get("name", ""))
+        incoming_name_counts[key] = incoming_name_counts.get(key, 0) + 1
+
+    def row_key(row: dict) -> str:
+        return (_server_row_value(row, "source_key") or
+                _server_name_key(_server_row_value(row, "original_name", "")))
+
+    for index, server in enumerate(parsed):
+        if index in assigned:
+            continue
+        key = server.get("source_key") or _server_name_key(server.get("name", ""))
+        candidates = [row for row in rows
+                      if str(row.get("id")) not in reserved_ids and row_key(row) == key]
+        if candidates:
+            candidates.sort(key=lambda row: _server_rank(row, override_counts), reverse=True)
+            selected_id = str(candidates[0]["id"])
+            assigned[index] = selected_id
+            reserved_ids.add(selected_id)
+
+    # Don't merge ambiguous same-name servers. For a single current server with
+    # that provider name, merge its accumulated overrides from earlier URI hashes.
+    assigned_name: dict[str, set[str]] = {}
+    for index, server in enumerate(parsed):
+        key = server.get("source_key") or _server_name_key(server.get("name", ""))
+        assigned_name.setdefault(key, set()).add(assigned.get(index, str(server["id"])))
+
+    merge_ids: dict[str, list[str]] = {}
+    reconciled = []
+    for index, server in enumerate(parsed):
+        item = dict(server)
+        target_id = assigned.get(index, str(server["id"]))
+        item["id"] = target_id
+        reconciled.append(item)
+        key = item.get("source_key") or _server_name_key(item.get("name", ""))
+        if incoming_name_counts.get(key) != 1:
+            continue
+        protected = assigned_name.get(key, set())
+        matching_ids = [str(row["id"]) for row in rows
+                        if row_key(row) == key and str(row["id"]) not in
+                        {str(other["id"]) for other in rows
+                         if str(other["id"]) in reserved_ids and row_key(other) != key}]
+        # Never fold a row which is currently serving a different provider name
+        # just because its old label happens to match this server's name.
+        matching_ids = [value for value in matching_ids
+                        if value == target_id or value not in reserved_ids or value in protected]
+        if len(set(matching_ids)) > 1:
+            merge_ids[target_id] = sorted(set(matching_ids))
+    return reconciled, merge_ids
+
+
 async def _sync_servers(conn, body: bytes):
     text = _decode_subscription(body)
     uris = _extract_uris(text)
@@ -577,11 +684,42 @@ async def _sync_servers(conn, body: bytes):
         raise HTTPException(502, "В списке апстрима нет VPN-серверов")
     parsed = [parse_server_uri(uri) for uri in uris]
     async with conn.transaction():
+        existing = await conn.fetch("""SELECT id,original_name,source_key,custom_name,hidden,sort_order,
+            present_upstream,first_seen_at,last_seen_at FROM servers""")
+        counts = await conn.fetch("SELECT server_id,COUNT(*) AS override_count FROM user_servers GROUP BY server_id")
+        override_counts = {str(row["server_id"]): int(row["override_count"]) for row in counts}
+        parsed, merge_ids = _plan_server_reconciliation(parsed, existing, override_counts)
         await conn.execute("UPDATE servers SET present_upstream=FALSE")
         for index, server in enumerate(parsed):
-            await conn.execute("""INSERT INTO servers(id,original_name,sort_order,present_upstream,last_seen_at)
-                VALUES($1,$2,$3,TRUE,now()) ON CONFLICT(id) DO UPDATE SET original_name=EXCLUDED.original_name,
-                present_upstream=TRUE,last_seen_at=now()""", server["id"], server["name"], index)
+            old_ids = merge_ids.get(server["id"], [])
+            if len(old_ids) > 1:
+                await conn.execute("""UPDATE servers AS target SET
+                    custom_name=COALESCE(target.custom_name,(
+                        SELECT old.custom_name FROM servers AS old WHERE old.id=ANY($2::text[])
+                          AND old.id<>target.id AND old.custom_name IS NOT NULL
+                        ORDER BY old.last_seen_at DESC LIMIT 1)),
+                    hidden=target.hidden OR EXISTS(SELECT 1 FROM servers AS old
+                        WHERE old.id=ANY($2::text[]) AND old.id<>target.id AND old.hidden=TRUE)
+                    WHERE target.id=$1""", server["id"], old_ids)
+                await conn.execute("""INSERT INTO user_servers(user_id,server_id,hidden,custom_name)
+                    SELECT DISTINCT ON (us.user_id) us.user_id,$1,us.hidden,us.custom_name
+                    FROM user_servers AS us JOIN servers AS old ON old.id=us.server_id
+                    WHERE us.server_id=ANY($2::text[])
+                    ORDER BY us.user_id,(us.server_id=$1) DESC,
+                        (us.hidden IS NOT NULL OR us.custom_name IS NOT NULL) DESC,old.last_seen_at DESC
+                    ON CONFLICT(user_id,server_id) DO UPDATE SET
+                        hidden=COALESCE(user_servers.hidden,EXCLUDED.hidden),
+                        custom_name=COALESCE(user_servers.custom_name,EXCLUDED.custom_name)""",
+                    server["id"], old_ids)
+                # After overrides have been copied, discard obsolete URI-hash rows
+                # for this stable provider name. This prevents old aliases from
+                # resurfacing if an admin later clears or changes a current name.
+                await conn.execute("DELETE FROM servers WHERE id=ANY($2::text[]) AND id<>$1",
+                                   server["id"], old_ids)
+            await conn.execute("""INSERT INTO servers(id,original_name,source_key,sort_order,present_upstream,last_seen_at)
+                VALUES($1,$2,$3,$4,TRUE,now()) ON CONFLICT(id) DO UPDATE SET original_name=EXCLUDED.original_name,
+                source_key=EXCLUDED.source_key,present_upstream=TRUE,last_seen_at=now()""",
+                server["id"], server["name"], server["source_key"], index)
     return parsed
 
 
@@ -899,9 +1037,13 @@ async def drive_sync_now(request: Request):
 @router.get("/api/admin/servers")
 async def servers_list(request: Request):
     _auth(request)
+    body, _, stale = await state.fetch_upstream()
+    if stale:
+        raise HTTPException(503, "Не удалось обновить список серверов из апстрима. Повторите позже.")
     pool = await state.db()
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM servers ORDER BY sort_order,id")
+        await _sync_servers(conn, body)
+        rows = await conn.fetch("SELECT * FROM servers WHERE present_upstream=TRUE ORDER BY sort_order,id")
     return {"servers": [_serialize(r) for r in rows]}
 
 
@@ -910,7 +1052,7 @@ async def servers_update(server_id: str, data: ServerBody, request: Request):
     _auth(request, csrf=True)
     pool = await state.db()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("UPDATE servers SET custom_name=$2,hidden=$3,sort_order=$4 WHERE id=$1 RETURNING *", server_id, data.custom_name, data.hidden, data.sort_order)
+        row = await conn.fetchrow("UPDATE servers SET custom_name=$2,hidden=$3,sort_order=$4 WHERE id=$1 AND present_upstream=TRUE RETURNING *", server_id, data.custom_name, data.hidden, data.sort_order)
     if not row: raise HTTPException(404, "Сервер не найден")
     return {"server": _serialize(row), "drive_sync": await state.push_drive_sync()}
 
@@ -925,7 +1067,7 @@ async def servers_bulk(data: BulkServerBody, request: Request):
     _auth(request, csrf=True)
     pool = await state.db()
     async with pool.acquire() as conn:
-        result = await conn.execute("UPDATE servers SET hidden=$1 WHERE id=ANY($2::text[])", data.hidden, data.server_ids)
+        result = await conn.execute("UPDATE servers SET hidden=$1 WHERE id=ANY($2::text[]) AND present_upstream=TRUE", data.hidden, data.server_ids)
     return {"ok": True, "updated": int(result.rsplit(" ", 1)[-1]), "drive_sync": await state.push_drive_sync()}
 
 
@@ -946,6 +1088,8 @@ async def user_server_update(user_id: int, server_id: str, data: UserServerBody,
     async with pool.acquire() as conn:
         exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)", user_id)
         if not exists: raise HTTPException(404, "Пользователь не найден")
+        server_exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM servers WHERE id=$1 AND present_upstream=TRUE)", server_id)
+        if not server_exists: raise HTTPException(404, "Сервер больше не находится в апстриме")
         await conn.execute("""INSERT INTO user_servers(user_id,server_id,hidden,custom_name) VALUES($1,$2,$3,$4)
             ON CONFLICT(user_id,server_id) DO UPDATE SET hidden=EXCLUDED.hidden,custom_name=EXCLUDED.custom_name""", user_id, server_id, data.hidden, data.custom_name)
     return {"ok": True, "drive_sync": await state.push_drive_sync([user_id])}
@@ -954,14 +1098,18 @@ async def user_server_update(user_id: int, server_id: str, data: UserServerBody,
 @router.get("/api/admin/users/{user_id}/servers")
 async def user_servers_list(user_id: int, request: Request):
     _auth(request)
+    body, _, stale = await state.fetch_upstream()
+    if stale:
+        raise HTTPException(503, "Не удалось обновить список серверов из апстрима. Повторите позже.")
     pool = await state.db()
     async with pool.acquire() as conn:
         if not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)", user_id):
             raise HTTPException(404, "Пользователь не найден")
+        await _sync_servers(conn, body)
         rows = await conn.fetch("""SELECT s.id,s.original_name,s.custom_name AS global_name,s.hidden AS global_hidden,
             s.sort_order,s.present_upstream,us.hidden AS user_hidden,us.custom_name AS user_name
             FROM servers s LEFT JOIN user_servers us ON us.server_id=s.id AND us.user_id=$1
-            ORDER BY s.sort_order,s.id""", user_id)
+            WHERE s.present_upstream=TRUE ORDER BY s.sort_order,s.id""", user_id)
     return {"servers": [_serialize(row) for row in rows]}
 
 

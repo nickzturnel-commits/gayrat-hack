@@ -23,6 +23,7 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS hide_traffic_usage BOOLEAN NOT NULL D
 CREATE TABLE IF NOT EXISTS servers (
     id TEXT PRIMARY KEY,
     original_name TEXT NOT NULL,
+    source_key TEXT,
     custom_name TEXT,
     hidden BOOLEAN NOT NULL DEFAULT FALSE,
     sort_order INTEGER NOT NULL DEFAULT 0,
@@ -30,6 +31,10 @@ CREATE TABLE IF NOT EXISTS servers (
     first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Existing databases may have been created before provider-name identity was added.
+ALTER TABLE servers ADD COLUMN IF NOT EXISTS source_key TEXT;
+CREATE INDEX IF NOT EXISTS servers_source_key_idx ON servers(source_key);
 
 CREATE TABLE IF NOT EXISTS user_servers (
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
