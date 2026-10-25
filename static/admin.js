@@ -75,11 +75,13 @@
 
   function setPage(next) {
     page = next;
-    $$('#nav [data-page]').forEach(button => {
+    const navButtons = $$('#nav [data-page]');
+    navButtons.forEach((button, index) => {
       const active = button.dataset.page === page;
       button.classList.toggle('active', active);
       if (active) button.setAttribute('aria-current', 'page');
       else button.removeAttribute('aria-current');
+      if (active) $('#nav').dataset.activeIndex = String(index);
     });
     render();
   }
@@ -365,13 +367,16 @@
       } else if (button.dataset.preview) {
         const result = await api(`/api/admin/users/${button.dataset.preview}/preview`);
         openModal('Предпросмотр профиля', `<pre class="preview">${esc(result)}</pre>`);
-      } else if (button.dataset.delete && confirm('Удалить пользователя и его Drive-файл навсегда? Это действие нельзя отменить.')) {
+      } else if (button.dataset.delete && confirm('Отключить подписку и убрать пользователя из панели? Ссылка Drive останется, но при обновлении покажет один нерабочий сервер. Уже загруженные в клиент серверы могут работать до обновления подписки.')) {
         button.disabled = true;
         const result = await api(`/api/admin/users/${button.dataset.delete}`, { method: 'DELETE', body: {} });
-        toast(resultText(result, 'Пользователь и файл Drive удалены'));
+        toast(resultText(result, 'Подписка отключена, ссылка заменена заглушкой'));
         await render();
       }
-    } catch (failure) { toast(failure.message); }
+    } catch (failure) {
+      if (button.dataset.delete && button.isConnected) button.disabled = false;
+      toast(failure.message);
+    }
   }
 
   function resultText(result, label) {
