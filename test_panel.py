@@ -13,9 +13,9 @@ import panel
 from starlette.requests import Request
 
 
-def make_request(headers=None):
+def make_request(headers=None, query_string=b""):
     return Request({"type": "http", "http_version": "1.1", "method": "GET", "scheme": "https",
-                    "path": "/api/sync/manifest", "raw_path": b"/api/sync/manifest", "query_string": b"",
+                    "path": "/api/sync/manifest", "raw_path": b"/api/sync/manifest", "query_string": query_string,
                     "headers": [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()],
                     "client": ("testclient", 1234), "server": ("testserver", 443), "root_path": ""})
 
@@ -77,7 +77,13 @@ class FakeConn:
 
     async def fetch(self, query, *args):
         if "SELECT * FROM users" in query:
-            return self.users
+            rows = self.users
+            if "status='pending_delete'" in query:
+                rows = [row for row in rows if row.get("status") == "pending_delete"]
+            if "id=ANY" in query and args:
+                ids = set(args[0])
+                rows = [row for row in rows if row.get("id") in ids]
+            return rows
         if "SELECT * FROM servers" in query:
             if "WHERE present_upstream=TRUE" in query:
                 return [row for row in self.servers if row.get("present_upstream", True)]
@@ -454,7 +460,59 @@ class DriveQrTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<path", svg)
 
 
+class DriveSyncPushTests(unittest.IsolatedAsyncioTestCase):
+    async def test_partial_apps_script_response_is_reported_as_a_delivery_failure(self):
+        class FakeResponse:
+            status_code = 200
+            def json(self): return {"ok": False, "processed": 1, "failed": 1}
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): return False
+            async def post(self, *args, **kwargs): return FakeResponse()
+
+        state = panel.PanelState()
+        with patch.dict(os.environ, {"DRIVE_SYNC_URL": "https://script.example/exec", "SYNC_KEY": "sync"}, clear=False), \
+             patch.object(panel.httpx, "AsyncClient", FakeClient):
+            result = await state.push_drive_sync([7])
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["pending"])
+        self.assertEqual(result["failed"], 1)
+        self.assertIn("ошибок: 1", result["message"])
+        self.assertIsNotNone(state.drive_push_last)
+
+
 class ManifestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pending_delete_manifest_does_not_require_provider(self):
+        pending = {"id": 53, "slug": "revoked", "name": "Revoked", "enabled": False,
+                   "status": "pending_delete", "drive_file_id": "drive-id"}
+        pool = FakePool(FakeConn(users=[pending]))
+        with patch.dict(os.environ, {"SYNC_KEY": "sync"}, clear=False), \
+             patch.object(panel.state, "db", new=AsyncMock(return_value=pool)), \
+             patch.object(panel.state, "fetch_upstream", new=AsyncMock(side_effect=HTTPException(503, "upstream offline"))) as fetch:
+            result = await panel.sync_manifest(make_request({"X-Sync-Key": "sync"}, b"user_ids=53"))
+        self.assertEqual(len(result["users"]), 1)
+        self.assertEqual(result["users"][0]["status"], "pending_delete")
+        self.assertEqual(result["users"][0]["content"], "")
+        self.assertNotIn("partial", result)
+        fetch.assert_not_awaited()
+
+    async def test_provider_failure_returns_only_pending_deletions_for_retry(self):
+        active = {"id": 54, "slug": "active", "name": "Active", "enabled": True,
+                  "status": "active", "drive_file_id": "active-file"}
+        pending = {"id": 55, "slug": "revoked", "name": "Revoked", "enabled": False,
+                   "status": "pending_delete", "drive_file_id": "revoked-file"}
+        pool = FakePool(FakeConn(users=[active, pending]))
+        with patch.dict(os.environ, {"SYNC_KEY": "sync"}, clear=False), \
+             patch.object(panel.state, "db", new=AsyncMock(return_value=pool)), \
+             patch.object(panel.state, "fetch_upstream", new=AsyncMock(side_effect=HTTPException(503, "upstream offline"))):
+            result = await panel.sync_manifest(make_request({"X-Sync-Key": "sync"}))
+        self.assertTrue(result["partial"])
+        self.assertEqual([user["id"] for user in result["users"]], [55])
+        self.assertEqual(result["users"][0]["content"], "")
+
     async def test_new_user_traffic_toggle_uses_explicit_choice_or_admin_default(self):
         class CreateConn(FakeConn):
             async def fetchval(self, query, *args):
@@ -590,14 +648,17 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mobile.status_code, 200)
         self.assertIn('class="desktop-ui"', desktop.text)
         self.assertIn('class="mobile-ui"', mobile.text)
-        self.assertIn("/static/admin.js?v=20261021-4", desktop.text)
-        self.assertIn("/static/admin.js?v=20261021-4", mobile.text)
-        self.assertIn("/static/admin-actions.js?v=20261021-4", desktop.text)
-        self.assertIn("/static/admin-actions.js?v=20261021-4", mobile.text)
-        self.assertIn("/static/admin.css?v=20261021-4", mobile.text)
+        self.assertIn("/static/admin.js?v=20261025-1", desktop.text)
+        self.assertIn("/static/admin.js?v=20261025-1", mobile.text)
+        self.assertIn("/static/admin-actions.js?v=20261025-1", desktop.text)
+        self.assertIn("/static/admin-actions.js?v=20261025-1", mobile.text)
+        self.assertIn("/static/admin.css?v=20261025-1", mobile.text)
+        self.assertIn('class="mobile-nav-glider"', mobile.text)
+        self.assertIn('data-active-index="0"', mobile.text)
         self.assertEqual(javascript.status_code, 200)
         self.assertIn('name="expires_at" type="datetime-local"', javascript.text)
-        self.assertIn("его Drive-файл навсегда", javascript.text)
+        self.assertIn("Подписка отключена, ссылка заменена заглушкой", javascript.text)
+        self.assertIn("dataset.activeIndex = String(index)", javascript.text)
         self.assertIn('class="button button-secondary user-qr-action" data-action="qr" data-user-id=', javascript.text)
         self.assertIn('data-action="copy-link" data-link=', javascript.text)
         self.assertNotIn('data-action="qr" data-link=', javascript.text)
@@ -624,6 +685,8 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(".mobile-content .user-actions .user-qr-action", stylesheet.text)
         self.assertIn("Liquid glass pass", stylesheet.text)
         self.assertIn("blur(52px) saturate(190%)", stylesheet.text)
+        self.assertIn("mobile-nav-glider", stylesheet.text)
+        self.assertIn("cubic-bezier(.2, 1.22, .32, 1)", stylesheet.text)
         self.assertNotIn(".mobile-shell { display: block !important; }", stylesheet.text)
 
     async def test_pending_delete_is_removed_only_after_success_report(self):
@@ -634,6 +697,15 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
             result = await panel.sync_report(data, make_request({"X-Sync-Key": "sync"}))
         self.assertTrue(result["deleted"])
         self.assertTrue(conn.deleted)
+
+    async def test_failed_revocation_report_keeps_user_pending_delete(self):
+        conn = FakeConn(status="pending_delete")
+        fake_pool = FakePool(conn)
+        data = panel.SyncReport(user_id=10, drive_file_id="drive-id", ok=False, error="Drive update failed")
+        with patch.dict(os.environ, {"SYNC_KEY": "sync"}, clear=False), patch.object(panel.state, "db", new=AsyncMock(return_value=fake_pool)):
+            result = await panel.sync_report(data, make_request({"X-Sync-Key": "sync"}))
+        self.assertNotIn("deleted", result)
+        self.assertFalse(conn.deleted)
 
     async def test_expired_user_stays_in_manifest_with_only_expiry_placeholder(self):
         uri = "vless://id@expired.example#Server"

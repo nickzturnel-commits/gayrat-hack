@@ -332,14 +332,21 @@ class PanelState:
                 result = response.json()
             except Exception as exc:
                 raise ValueError("Apps Script вернул некорректный ответ") from exc
-            if not isinstance(result, dict) or not result.get("ok"):
+            if not isinstance(result, dict):
                 raise ValueError("Apps Script не подтвердил доставку")
-            self.drive_push_last = time.time()
             failed = int(result.get("failed", 0) or 0)
-            self.drive_push_error = f"Не удалось обновить файлов: {failed}" if failed else None
-            return {"ok": failed == 0, "pending": False,
+            processed = int(result.get("processed", 0) or 0)
+            self.drive_push_last = time.time()
+            if failed:
+                self.drive_push_error = f"Apps Script обработал {processed} записей, ошибок: {failed}"
+                return {"ok": False, "pending": False, "message": self.drive_push_error,
+                        "processed": processed, "failed": failed}
+            if not result.get("ok"):
+                raise ValueError("Apps Script не подтвердил доставку")
+            self.drive_push_error = None
+            return {"ok": True, "pending": False,
                     "message": self.drive_push_error or "Изменения сразу отправлены в Google Drive",
-                    "processed": int(result.get("processed", 0) or 0), "failed": failed}
+                    "processed": processed, "failed": 0}
         except Exception as exc:
             self.drive_push_error = "Не удалось сразу обновить Google Drive; автоматическая попытка повторится позже"
             log.warning("Immediate Drive update failed (%s)", type(exc).__name__)
@@ -1200,9 +1207,6 @@ def _safe_sync_error(message: str | None) -> str | None:
 @router.get("/api/sync/manifest")
 async def sync_manifest(request: Request):
     _check_sync(request)
-    # Fetch before touching DB/output. Cold starts and expired cache trigger this request directly.
-    body, headers, _stale = await state.fetch_upstream()
-    pool = await state.db()
     selected_ids = None
     selected = request.query_params.get("user_ids", "").strip()
     if selected:
@@ -1212,8 +1216,42 @@ async def sync_manifest(request: Request):
             raise HTTPException(422, "Некорректный список пользователей")
         if not selected_ids or len(selected_ids) > 30 or any(value <= 0 for value in selected_ids):
             raise HTTPException(422, "Некорректный список пользователей")
+
+    pool = await state.db()
+    query = "SELECT * FROM users WHERE id=ANY($1::bigint[]) ORDER BY id" if selected_ids else "SELECT * FROM users ORDER BY id"
     async with pool.acquire() as conn:
+        rows_before_fetch = await conn.fetch(query, selected_ids) if selected_ids else await conn.fetch(query)
         await conn.execute("INSERT INTO app_state(key,value) VALUES('last_script_request',to_jsonb(now())) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value")
+
+    # Revocation does not depend on the provider. In particular, a provider
+    # outage must not leave a deleted user's old Drive profile alive.
+    if not any(user["status"] != "pending_delete" for user in rows_before_fetch):
+        manifest = [{"id": user["id"], "slug": user["slug"], "status": user["status"],
+                     "enabled": user["enabled"], "drive_file_id": user["drive_file_id"],
+                     "name": user["name"], "content": ""} for user in rows_before_fetch]
+        log.info("Apps Script revocation manifest generated without upstream: users=%d", len(manifest))
+        return {"users": manifest, "generated_at": datetime.now(timezone.utc).isoformat()}
+
+    # A cold start or expired cache makes this request fetch the upstream itself.
+    # If that fails, return only pending deletions so they can still be revoked;
+    # active profiles remain untouched and the regular retry will refresh them.
+    try:
+        body, headers, _stale = await state.fetch_upstream()
+    except HTTPException:
+        async with pool.acquire() as conn:
+            if selected_ids:
+                rows = await conn.fetch("SELECT * FROM users WHERE id=ANY($1::bigint[]) AND status='pending_delete' ORDER BY id", selected_ids)
+            else:
+                rows = await conn.fetch("SELECT * FROM users WHERE status='pending_delete' ORDER BY id")
+        if not rows:
+            raise
+        manifest = [{"id": user["id"], "slug": user["slug"], "status": user["status"],
+                     "enabled": user["enabled"], "drive_file_id": user["drive_file_id"],
+                     "name": user["name"], "content": ""} for user in rows]
+        log.warning("Upstream unavailable; returning deletion-only manifest: users=%d", len(manifest))
+        return {"users": manifest, "partial": True, "generated_at": datetime.now(timezone.utc).isoformat()}
+
+    async with pool.acquire() as conn:
         settings = await _settings(conn)
         servers = await _sync_servers(conn, body)
         if selected_ids:
