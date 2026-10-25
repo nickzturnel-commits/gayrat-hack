@@ -37,10 +37,11 @@ function doPost(e) {
     if (!manifest || !Array.isArray(manifest.users) || !manifest.users.length) {
       return json_({ ok: false, error: 'Манифест пуст или недоступен.' });
     }
+    if (manifest.partial) Logger.log('Апстрим недоступен; выполняются только отзываемые подписки. Остальные профили не меняются.');
     const wanted = Array.isArray(data.user_ids) ? new Set(data.user_ids.map(String)) : null;
     const users = wanted ? manifest.users.filter(user => wanted.has(String(user.id))) : manifest.users;
     let processed = 0;
-    let failed = 0;
+    let failed = manifest.partial ? 1 : 0;
     users.forEach(user => {
       try {
         processUser_(base, key, user);
@@ -60,7 +61,7 @@ function doPost(e) {
       }
     });
     Logger.log('Немедленная доставка: обработано ' + processed + ', ошибок ' + failed + '.');
-    return json_({ ok: true, processed: processed, failed: failed });
+    return json_({ ok: failed === 0, processed: processed, failed: failed });
   } catch (err) {
     Logger.log('Немедленная доставка не выполнена (' + safeError_(err) + ').');
     return json_({ ok: false, error: 'Не удалось выполнить доставку.' });
@@ -103,6 +104,7 @@ function updateSub() {
     Logger.log('Манифест пустой или некорректный; файлы Drive не изменены.');
     return;
   }
+  if (manifest.partial) Logger.log('Апстрим недоступен; обрабатываются только отзываемые подписки, остальные файлы не меняются.');
 
   const users = manifest.users;
   let cursor = Math.max(0, parseInt(props.getProperty(SX.CURSOR) || '0', 10) || 0) % users.length;
@@ -174,10 +176,13 @@ function processUser_(base, key, user) {
   const props = PropertiesService.getScriptProperties();
   let fileId = user.drive_file_id || props.getProperty('PENDING_FILE_' + user.id) || null;
   if (user.status === 'pending_delete') {
-    if (fileId) deleteDriveFilePermanently_(fileId);
+    // Keep the public Drive URL alive and replace its content with a valid
+    // one-node profile. Deleting the file makes Happ retain its last imported
+    // servers when its next refresh gets a 404.
+    if (fileId) replaceDriveFileWithRevocation_(fileId);
     report_(base, key, user.id, fileId, true, null);
     props.deleteProperty('PENDING_FILE_' + user.id);
-    Logger.log('Подписка пользователя id=' + user.id + ' удалена из Drive окончательно.');
+    Logger.log('Подписка пользователя id=' + user.id + ' отозвана: Drive-ссылка обновлена заглушкой.');
     return;
   }
   if (typeof user.content !== 'string' || !user.content.trim()) throw new Error('Манифест не содержит готовую подписку; файл оставлен без изменений.');
@@ -203,14 +208,41 @@ function processUser_(base, key, user) {
   Logger.log('Пользователь id=' + user.id + ': файл синхронизирован.');
 }
 
-// The DriveApp File API only supports moving a file to Trash. Use Drive API v3
-// DELETE so a manual admin deletion permanently removes the file. Treat 404 as
-// success to make retries safe when Drive deletion succeeded but reporting did not.
-function deleteDriveFilePermanently_(fileId) {
+function base64Utf8_(value) {
+  return Utilities.base64Encode(String(value), Utilities.Charset.UTF_8);
+}
+
+function revokedProfile_() {
+  const title = 'Подписка отключена';
+  const announce = '⛔ Подписка отключена администратором. Обратитесь в поддержку.';
+  return [
+    '#profile-title: base64:' + base64Utf8_(title),
+    '#profile-update-interval: 1',
+    '#subscription-userinfo: upload=0; download=0; total=0; expire=0',
+    '#announce: base64:' + base64Utf8_(announce),
+    '#support-url: https://t.me/moserrr1',
+    'vless://00000000-0000-4000-8000-000000000000@127.0.0.1:1?encryption=none&type=tcp#' + encodeURIComponent(title),
+    ''
+  ].join('\n');
+}
+
+// Replace the file's media while preserving its ID and public link. A 404
+// means the link is already unusable, so the pending deletion can be completed.
+function replaceDriveFileWithRevocation_(fileId) {
+  const content = revokedProfile_();
+  try {
+    const existing = DriveApp.getFileById(String(fileId));
+    if (existing.getBlob().getDataAsString('UTF-8') === content) return;
+  } catch (err) {
+    // Try the API update below: it distinguishes an already-missing file (404)
+    // from a real update failure without exposing Drive's error details.
+  }
   const response = UrlFetchApp.fetch(
-    'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(String(fileId)),
+    'https://www.googleapis.com/upload/drive/v3/files/' + encodeURIComponent(String(fileId)) + '?uploadType=media',
     {
-      method: 'delete',
+      method: 'patch',
+      contentType: 'text/plain; charset=utf-8',
+      payload: content,
       headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
       muteHttpExceptions: true,
       followRedirects: true
@@ -218,7 +250,7 @@ function deleteDriveFilePermanently_(fileId) {
   );
   const code = response.getResponseCode();
   if ((code < 200 || code >= 300) && code !== 404) {
-    throw new Error('Drive API не смог окончательно удалить файл (HTTP ' + code + ').');
+    throw new Error('Drive API не смог заменить содержимое файла (HTTP ' + code + ').');
   }
 }
 
@@ -235,6 +267,10 @@ function report_(base, key, userId, fileId, ok, error) {
   });
   const code = response.getResponseCode();
   if (code < 200 || code >= 300) throw new Error('Отчёт синхронизации вернул HTTP ' + code + '.');
+  let result;
+  try { result = JSON.parse(response.getContentText() || '{}'); }
+  catch (err) { throw new Error('Отчёт синхронизации вернул некорректный ответ.'); }
+  if (!result || result.ok !== true) throw new Error('Render не подтвердил отчёт синхронизации.');
 }
 
 function safeError_(err) {
