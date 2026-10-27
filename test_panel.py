@@ -424,6 +424,19 @@ class AnnouncementWeatherTests(unittest.IsolatedAsyncioTestCase):
                 "current": {"temperature_2m": 24, "weather_code": 0, "time": stale_time},
             })
 
+    async def test_temperature_only_response_is_valid_without_guessing_weather_condition(self):
+        now = datetime.now(timezone(timedelta(hours=5)))
+        result = panel._format_ashgabat_weather({
+            "utc_offset_seconds": 18000,
+            "timezone": "Asia/Ashgabat",
+            "current": {
+                "time": now.strftime("%Y-%m-%dT%H:%M"),
+                "interval": 900,
+                "temperature_2m": 16.2,
+            },
+        })
+        self.assertEqual(result, f"🌡 Ашхабад сейчас: 16.2°C · данные на {now:%H:%M}")
+
     async def test_weather_fetch_uses_current_ashgabat_fields_without_relay_client(self):
         seen = {}
         client_options = {}
@@ -437,7 +450,6 @@ class AnnouncementWeatherTests(unittest.IsolatedAsyncioTestCase):
                 "utc_offset_seconds": 18000,
                 "current": {
                     "temperature_2m": 26,
-                    "weather_code": 0,
                     "time": datetime.now(timezone(timedelta(hours=5))).strftime("%Y-%m-%dT%H:%M"),
                 },
             })
@@ -450,9 +462,11 @@ class AnnouncementWeatherTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(panel.httpx, "AsyncClient", new=make_weather_client):
             result = await panel._current_ashgabat_weather()
 
-        self.assertTrue(result.startswith("☀️ Ашхабад сейчас: ясно, 26°C · данные на "))
+        self.assertTrue(result.startswith("🌡 Ашхабад сейчас: 26°C · данные на "))
         self.assertEqual(seen["url"].host, "api.open-meteo.com")
-        self.assertEqual(seen["url"].params.get("current"), "temperature_2m,weather_code")
+        self.assertEqual(seen["url"].params.get("latitude"), "37.9601")
+        self.assertEqual(seen["url"].params.get("longitude"), "58.3261")
+        self.assertEqual(seen["url"].params.get("current"), "temperature_2m")
         self.assertEqual(seen["url"].params.get("timezone"), "Asia/Ashgabat")
         self.assertEqual(seen["user_agent"], "SecureX-Weather/1.0")
         self.assertEqual(seen["cache_control"], "no-cache")

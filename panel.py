@@ -35,6 +35,8 @@ router = APIRouter()
 LEGACY_DRIVE_FILE_ID = "160lsZ2nDrSXTzA09r9jeGHnd6QyFylw9"
 PANEL_UPSTREAM_DEFAULT_USER_AGENT = "Happ"
 ASHGABAT_WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+ASHGABAT_LATITUDE = 37.9601
+ASHGABAT_LONGITUDE = 58.3261
 ASHGABAT_WEATHER_UNAVAILABLE = "🌡 Ашхабад: текущая погода временно недоступна"
 UPSTREAM_TIMEOUT_SECONDS = 20.0
 PANEL_CACHE_TTL_SECONDS = 300
@@ -550,14 +552,14 @@ def _format_ashgabat_weather(data: dict) -> str:
     weather_time = current.get("time")
     if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
         raise ValueError("weather temperature is missing")
-    if isinstance(weather_code, bool) or not isinstance(weather_code, (int, float)):
-        raise ValueError("weather code is missing")
+    if weather_code is not None and (
+            isinstance(weather_code, bool) or not isinstance(weather_code, (int, float))):
+        raise ValueError("weather code is invalid")
     if not isinstance(weather_time, str):
         raise ValueError("weather valid time is missing")
 
     temperature = float(temperature)
-    code = int(weather_code)
-    if not -100 <= temperature <= 100 or not 0 <= code <= 99:
+    if not -100 <= temperature <= 100:
         raise ValueError("weather values are outside valid ranges")
 
     conditions = {
@@ -591,9 +593,14 @@ def _format_ashgabat_weather(data: dict) -> str:
         97: ("⛈", "сильная гроза"),
         99: ("⛈", "гроза с сильным градом"),
     }
-    condition = conditions.get(code)
-    if condition is None:
-        raise ValueError("weather code is not recognized")
+    condition = None
+    if weather_code is not None:
+        code = int(weather_code)
+        if not 0 <= code <= 99:
+            raise ValueError("weather code is outside valid range")
+        condition = conditions.get(code)
+        if condition is None:
+            raise ValueError("weather code is not recognized")
 
     offset_seconds = data.get("utc_offset_seconds")
     if isinstance(offset_seconds, float) and offset_seconds.is_integer():
@@ -627,8 +634,12 @@ def _format_ashgabat_weather(data: dict) -> str:
         raise ValueError("weather valid time is stale or in the future")
 
     shown_temperature = f"{temperature:g}"
-    emoji, description = condition
-    return f"{emoji} Ашхабад сейчас: {description}, {shown_temperature}°C · данные на {observed_at:%H:%M}"
+    if condition is None:
+        description = f"🌡 Ашхабад сейчас: {shown_temperature}°C"
+    else:
+        emoji, text = condition
+        description = f"{emoji} Ашхабад сейчас: {text}, {shown_temperature}°C"
+    return f"{description} · данные на {observed_at:%H:%M}"
 
 
 async def _current_ashgabat_weather() -> str:
@@ -645,9 +656,9 @@ async def _current_ashgabat_weather() -> str:
             response = await client.get(
                 ASHGABAT_WEATHER_URL,
                 params={
-                    "latitude": 37.95,
-                    "longitude": 58.38,
-                    "current": "temperature_2m,weather_code",
+                    "latitude": ASHGABAT_LATITUDE,
+                    "longitude": ASHGABAT_LONGITUDE,
+                    "current": "temperature_2m",
                     "timezone": "Asia/Ashgabat",
                 },
             )
