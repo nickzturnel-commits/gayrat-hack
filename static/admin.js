@@ -510,7 +510,7 @@
       </div>
       <div class="form-section"><p class="eyebrow">ОБЪЯВЛЕНИЯ</p><h2>Сообщения пользователям</h2>
         <label class="switch-row"><input name="announce_enabled" type="checkbox" ${settings.announce_enabled ? 'checked' : ''}><span class="switch"></span><span><b>Объявления включены</b><small>Показываются в профиле подписки.</small></span></label>
-        <label>Частота обновления объявления (минуты)<input name="announce_refresh_minutes" type="number" min="5" max="1440" value="${settings.announce_refresh_minutes || 5}"><span class="field-hint">При 10 и более пользователях рекомендуем 60 минут, чтобы не исчерпать квоту времени Apps Script. Минимум — 5 минут.</span></label>
+        <label>Частота обновления объявления (минуты)<input name="announce_refresh_minutes" type="number" min="5" max="1440" value="${settings.announce_refresh_minutes || 5}"><span class="field-hint">День/приветствие, цитата и подпись меняются с этим интервалом; погода запрашивается при каждой синхронизации. Happ получает новый текст после записи в Drive. Для 10+ пользователей рекомендуем 60 минут, чтобы беречь квоту Apps Script. Минимум — 5 минут.</span></label>
       </div>
       <div class="form-section"><p class="eyebrow">НОВЫЕ ПОДПИСКИ</p><h2>Счётчик трафика в клиенте</h2>
         <label class="switch-row"><input name="hide_traffic_for_new_users" type="checkbox" ${settings.hide_traffic_for_new_users ? 'checked' : ''}><span class="switch"></span><span><b>Скрывать счётчик по умолчанию</b><small>Применяется только к новым пользователям. Переключатель можно изменить отдельно в каждой подписке. Основная подписка всегда показывает общий трафик аккаунта.</small></span></label>
