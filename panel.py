@@ -43,7 +43,7 @@ PANEL_CACHE_TTL_SECONDS = 300
 SESSION_SECONDS = 12 * 60 * 60
 DB_HINT = ("Не удалось подключиться к базе. Если используется прямой хост db.*.supabase.co, "
            "возьмите в Supabase (Connect → Session pooler) строку подключения и поставьте её в DATABASE_URL")
-URI_LINE = re.compile(r"(?im)^\s*(?:vless|vmess|trojan|ss|hysteria2?|tuic)://\S+\s*$")
+URI_LINE = re.compile(r"(?i)^\s*(?:vless|vmess|trojan|ss|hysteria2?|tuic)://")
 URI_ANY = re.compile(r"(?i)(?:vless|vmess|trojan|ss|hysteria2?|tuic)://")
 DEVICE_MARKERS = (b"device limit full", b"remove a device first")
 SKIP_UPSTREAM_HEADERS = {"host", "content-length", "connection", "accept-encoding"}
@@ -190,17 +190,28 @@ def rename_server_uri(uri: str, name: str) -> str:
 
 def _extract_uris(text: str) -> list[str]:
     # Upstream supports one URI per line. Ignore human-readable metadata lines.
+    # Provider labels are not always percent-encoded: a fragment such as
+    # `#Germany West` is valid input for clients even though it contains spaces.
+    # Only allow those spaces after `#`; whitespace in the connection part
+    # would make the URI ambiguous and is treated as malformed.
     uris = []
     seen = set()
     for line in text.splitlines():
-        match = URI_LINE.match(line)
-        if not match:
+        candidate = line.strip().lstrip("\ufeff")
+        if not URI_LINE.match(candidate):
             continue
-        uri = match.group(0).strip()
-        server_id = parse_server_uri(uri)["id"]
+        connection, separator, _label = candidate.partition("#")
+        if any(char.isspace() for char in connection):
+            continue
+        if not separator and any(char.isspace() for char in candidate):
+            continue
+        try:
+            server_id = parse_server_uri(candidate)["id"]
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
         if server_id not in seen:
             seen.add(server_id)
-            uris.append(uri)
+            uris.append(candidate)
     return uris
 
 
@@ -949,7 +960,11 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
             if override and override["hidden"] is None and global_row["hidden"]: continue
             if not override and global_row["hidden"]: continue
             name = (override["custom_name"] if override and override["custom_name"] else None) or global_row["custom_name"] or server["name"]
-            server_lines.append(rename_server_uri(server["uri"], name) if name != server["name"] else server["uri"])
+            # Always rebuild the fragment, even when the provider's display
+            # name is unchanged. Some providers send raw spaces in `#name`;
+            # emitting those as-is makes otherwise valid nodes disappear in
+            # clients that expect a URL-encoded fragment.
+            server_lines.append(rename_server_uri(server["uri"], name))
         if not server_lines:
             # Do not let Apps Script replace a working Drive profile with a
             # metadata-only file that Happ rejects as having no server links.

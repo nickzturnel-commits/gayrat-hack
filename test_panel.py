@@ -203,8 +203,45 @@ class UriTests(unittest.TestCase):
         entries = "vless://id@host:443#First\nvless://id@host:443#Second\n"
         self.assertEqual(panel._extract_uris(entries), ["vless://id@host:443#First"])
 
+    def test_subscription_extracts_new_nodes_with_unescaped_spaces_in_names(self):
+        raw = "\n".join([
+            "# subscription metadata",
+            "vless://uuid@de.example:443?security=tls#Germany West 01",
+            "trojan://secret@jp.example:443#Japan Tokyo",
+            "vless://bad path@invalid.example:443#Malformed connection",
+        ])
+        encoded = base64.b64encode(raw.encode("utf-8"))
+
+        uris = panel._extract_uris(panel._decode_subscription(encoded))
+
+        self.assertEqual(uris, [
+            "vless://uuid@de.example:443?security=tls#Germany West 01",
+            "trojan://secret@jp.example:443#Japan Tokyo",
+        ])
+        self.assertEqual(panel.parse_server_uri(uris[0])["name"], "Germany West 01")
+
 
 class ServerReconciliationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_base64_nodes_with_spaced_labels_reach_generated_manifest(self):
+        provider_text = "\n".join([
+            "vless://uuid@de.example:443?security=tls#Germany West 01",
+            "trojan://secret@jp.example:443#Japan Tokyo",
+        ])
+        body = base64.b64encode(provider_text.encode("utf-8"))
+        conn = FakeConn()
+        user = {"id": 42, "slug": "new-nodes", "name": "New nodes", "enabled": True,
+                "expires_at": None, "announce_override": "", "title_override": None,
+                "status": "active", "drive_file_id": None}
+
+        servers = await panel._sync_servers(conn, body)
+        content = await panel.build_manifest_content(
+            conn, user, body, {}, dict(panel.DEFAULT_SETTINGS, announce_enabled=False), servers=servers)
+
+        self.assertEqual(len(servers), 2)
+        self.assertEqual(len({server["id"] for server in servers}), 2)
+        self.assertIn("vless://uuid@de.example:443?security=tls#Germany%20West%2001", content)
+        self.assertIn("trojan://secret@jp.example:443#Japan%20Tokyo", content)
+
     async def test_changed_uri_keeps_global_and_per_user_customizations(self):
         previous = panel.parse_server_uri("vless://old-id@old.example:443#Nord")
         changed = panel.parse_server_uri("vless://new-id@new.example:8443#Nord")
@@ -637,6 +674,28 @@ class DriveSyncPushTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ManifestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sync_manifest_delivers_all_new_nodes_from_base64_with_spaced_names(self):
+        provider_text = "\n".join([
+            "vless://uuid@de.example:443?security=tls#Germany West 01",
+            "trojan://secret@jp.example:443#Japan Tokyo",
+        ])
+        body = base64.b64encode(provider_text.encode("utf-8"))
+        user = {"id": 43, "slug": "manifest-nodes", "name": "Manifest nodes", "note": "",
+                "enabled": True, "expires_at": None, "title_override": None,
+                "announce_override": "", "status": "active", "drive_file_id": None}
+        conn = FakeConn(users=[user])
+
+        with patch.dict(os.environ, {"SYNC_KEY": "sync"}, clear=False), \
+             patch.object(panel.state, "db", new=AsyncMock(return_value=FakePool(conn))), \
+             patch.object(panel.state, "fetch_upstream", new=AsyncMock(return_value=(body, {}, False))), \
+             patch.object(panel, "_settings", new=AsyncMock(return_value=dict(
+                 panel.DEFAULT_SETTINGS, announce_enabled=False))):
+            result = await panel.sync_manifest(make_request({"X-Sync-Key": "sync"}))
+
+        content = result["users"][0]["content"]
+        self.assertIn("vless://uuid@de.example:443?security=tls#Germany%20West%2001", content)
+        self.assertIn("trojan://secret@jp.example:443#Japan%20Tokyo", content)
+
     async def test_pending_delete_manifest_does_not_require_provider(self):
         pending = {"id": 53, "slug": "revoked", "name": "Revoked", "enabled": False,
                    "status": "pending_delete", "drive_file_id": "drive-id"}
