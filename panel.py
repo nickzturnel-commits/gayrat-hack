@@ -121,6 +121,63 @@ def _slugify(name: str) -> str:
     return f"{base}-{secrets.token_hex(3)}"
 
 
+def _xray_json_ss_uris(text: str) -> list[str] | None:
+    """Convert Xray Shadowsocks outbounds to standard SIP002 links.
+
+    Xray client exports are not subscription text files: they wrap each proxy
+    in `outbounds[].settings.servers[]`. Returning None means the input was not
+    an Xray-style JSON profile; an empty list means it was JSON but contained
+    no supported Shadowsocks outbound.
+    """
+    try:
+        document = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(document, dict) or not isinstance(document.get("outbounds"), list):
+        return None
+
+    links: list[str] = []
+    for outbound in document["outbounds"]:
+        if not isinstance(outbound, dict) or str(outbound.get("protocol", "")).lower() not in {"ss", "shadowsocks"}:
+            continue
+        settings = outbound.get("settings")
+        servers = settings.get("servers") if isinstance(settings, dict) else None
+        if not isinstance(servers, list):
+            continue
+        for index, server in enumerate(servers, 1):
+            if not isinstance(server, dict):
+                continue
+            address_value = server.get("address")
+            method_value = server.get("method")
+            password = server.get("password")
+            port_value = server.get("port")
+            if (not isinstance(address_value, str) or not isinstance(method_value, str)
+                    or not isinstance(password, str) or not password
+                    or isinstance(port_value, bool)):
+                continue
+            address = address_value.strip()
+            method = method_value.strip()
+            if not address or not method:
+                continue
+            try:
+                port = int(port_value)
+            except (TypeError, ValueError):
+                continue
+            if not 1 <= port <= 65535 or any(char.isspace() for char in address):
+                continue
+
+            # SIP002 uses URL-safe Base64 for method:password. Bracket IPv6
+            # literals so the endpoint remains unambiguous to URI parsers.
+            endpoint = f"[{address}]" if ":" in address and not address.startswith("[") else address
+            userinfo = base64.urlsafe_b64encode(f"{method}:{password}".encode("utf-8")).decode("ascii").rstrip("=")
+            remark = (document.get("remarks") or outbound.get("remarks") or outbound.get("tag") or "")
+            if len(servers) > 1 and remark:
+                remark = f"{remark} {index}"
+            label = str(remark).strip() or f"{address}:{port}"
+            links.append(f"ss://{userinfo}@{endpoint}:{port}#{quote(label, safe='')}")
+    return links
+
+
 def _decode_subscription(body: bytes) -> str:
     text = body.decode("utf-8-sig", errors="replace").strip()
     if not text:
@@ -133,6 +190,9 @@ def _decode_subscription(body: bytes) -> str:
         decoded_text = decoded.decode("utf-8-sig").strip()
         if URI_ANY.search(decoded_text):
             return decoded_text
+        converted = _xray_json_ss_uris(decoded_text)
+        if converted:
+            return "\n".join(converted)
     except (ValueError, UnicodeDecodeError):
         pass
     return text
@@ -194,6 +254,9 @@ def _extract_uris(text: str) -> list[str]:
     # `#Germany West` is valid input for clients even though it contains spaces.
     # Only allow those spaces after `#`; whitespace in the connection part
     # would make the URI ambiguous and is treated as malformed.
+    converted = _xray_json_ss_uris(text)
+    if converted is not None:
+        text = "\n".join(converted)
     uris = []
     seen = set()
     for line in text.splitlines():
@@ -234,13 +297,11 @@ def _invalid_payload(body: bytes, content_type: str) -> str | None:
             pass
     if any(any(marker in item.lower() for marker in DEVICE_MARKERS) for item in candidates):
         return "Апстрим сообщил о лимите устройств"
-    if not any(URI_ANY.search(item.decode("utf-8", "ignore")) for item in candidates):
-        return "Апстрим не содержит VPN-серверов"
     try:
         decoded = _decode_subscription(body)
         uris = _extract_uris(decoded)
         if not uris:
-            return "Апстрим не содержит серверов по одному URI на строку"
+            return "Апстрим не содержит поддерживаемых VPN-серверов"
         for uri in uris:
             parse_server_uri(uri)
     except Exception:

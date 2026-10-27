@@ -220,6 +220,36 @@ class UriTests(unittest.TestCase):
         ])
         self.assertEqual(panel.parse_server_uri(uris[0])["name"], "Germany West 01")
 
+    def test_xray_json_shadowsocks_outbound_converts_from_plain_and_base64_json(self):
+        xray_json = json.dumps({
+            "remarks": "🇩🇪DE, Frankfurt",
+            "outbounds": [{
+                "protocol": "shadowsocks",
+                "settings": {"servers": [{
+                    "address": "203.0.113.46", "port": 869,
+                    "method": "chacha20-ietf-poly1305", "password": "fixture-password",
+                }]},
+            }],
+        })
+        expected_userinfo = base64.urlsafe_b64encode(
+            b"chacha20-ietf-poly1305:fixture-password").decode().rstrip("=")
+        expected = (f"ss://{expected_userinfo}@203.0.113.46:869#"
+                    f"{panel.quote('🇩🇪DE, Frankfurt', safe='')}")
+
+        for body in (xray_json.encode(), base64.b64encode(xray_json.encode())):
+            with self.subTest(encoded=body != xray_json.encode()):
+                decoded = panel._decode_subscription(body)
+                uris = panel._extract_uris(decoded)
+                self.assertEqual(uris, [expected])
+                self.assertIsNone(panel._invalid_payload(body, "application/json"))
+
+    def test_ss_uri_without_fragment_is_a_valid_server_line(self):
+        userinfo = base64.urlsafe_b64encode(b"chacha20-ietf-poly1305:fixture-password").decode().rstrip("=")
+        uri = f"ss://{userinfo}@203.0.113.46:869"
+
+        self.assertEqual(panel._extract_uris(uri), [uri])
+        self.assertEqual(panel.parse_server_uri(uri)["scheme"], "ss")
+
 
 class ServerReconciliationTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_base64_nodes_with_spaced_labels_reach_generated_manifest(self):
@@ -695,6 +725,35 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         content = result["users"][0]["content"]
         self.assertIn("vless://uuid@de.example:443?security=tls#Germany%20West%2001", content)
         self.assertIn("trojan://secret@jp.example:443#Japan%20Tokyo", content)
+
+    async def test_sync_manifest_converts_xray_shadowsocks_json_to_happ_server_uri(self):
+        xray_json = json.dumps({
+            "remarks": "🇩🇪DE, Frankfurt",
+            "outbounds": [{
+                "protocol": "shadowsocks",
+                "settings": {"servers": [{
+                    "address": "203.0.113.46", "port": 869,
+                    "method": "chacha20-ietf-poly1305", "password": "fixture-password",
+                }]},
+            }],
+        })
+        user = {"id": 44, "slug": "xray-json", "name": "Xray JSON", "note": "",
+                "enabled": True, "expires_at": None, "title_override": None,
+                "announce_override": "", "status": "active", "drive_file_id": None}
+        conn = FakeConn(users=[user])
+        expected_userinfo = base64.urlsafe_b64encode(
+            b"chacha20-ietf-poly1305:fixture-password").decode().rstrip("=")
+        expected = (f"ss://{expected_userinfo}@203.0.113.46:869#"
+                    f"{panel.quote('🇩🇪DE, Frankfurt', safe='')}")
+
+        with patch.dict(os.environ, {"SYNC_KEY": "sync"}, clear=False), \
+             patch.object(panel.state, "db", new=AsyncMock(return_value=FakePool(conn))), \
+             patch.object(panel.state, "fetch_upstream", new=AsyncMock(return_value=(xray_json.encode(), {}, False))), \
+             patch.object(panel, "_settings", new=AsyncMock(return_value=dict(
+                 panel.DEFAULT_SETTINGS, announce_enabled=False))):
+            result = await panel.sync_manifest(make_request({"X-Sync-Key": "sync"}))
+
+        self.assertIn(expected, result["users"][0]["content"])
 
     async def test_pending_delete_manifest_does_not_require_provider(self):
         pending = {"id": 53, "slug": "revoked", "name": "Revoked", "enabled": False,
