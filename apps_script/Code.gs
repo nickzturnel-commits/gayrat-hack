@@ -3,6 +3,9 @@ const SX = {
   PROP_URL: 'RENDER_URL',
   PROP_KEY: 'SYNC_KEY',
   CURSOR: 'SYNC_CURSOR',
+  WEATHER_CACHE: 'ASHGABAT_WEATHER_V1',
+  WEATHER_CACHE_SECONDS: 240,
+  WEATHER_URL: 'https://api.open-meteo.com/v1/forecast?latitude=37.9601&longitude=58.3261&current=temperature_2m&timezone=Asia%2FAshgabat',
   START_BUDGET_MS: 4 * 60 * 1000 + 45 * 1000,
   RETRY_PAUSE_MS: 12000
 };
@@ -146,12 +149,13 @@ function updateSub() {
 function fetchManifest_(base, key, userIds) {
   const suffix = userIds && userIds.length ? '?user_ids=' + encodeURIComponent(userIds.map(String).join(',')) : '';
   const url = base + '/api/sync/manifest' + suffix;
+  const weatherHeader = Utilities.base64EncodeWebSafe(JSON.stringify(fetchAshgabatWeather_()));
   let lastStatus = 0;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const response = UrlFetchApp.fetch(url, {
         method: 'get',
-        headers: { 'X-Sync-Key': key, 'Accept': 'application/json' },
+        headers: { 'X-Sync-Key': key, 'X-Weather-Data': weatherHeader, 'Accept': 'application/json' },
         muteHttpExceptions: true,
         followRedirects: true
       });
@@ -169,6 +173,66 @@ function fetchManifest_(base, key, userIds) {
   }
   Logger.log('Manifest недоступен после повторной попытки (HTTP ' + lastStatus + '); Drive не изменён.');
   return null;
+}
+
+function fetchAshgabatWeather_() {
+  const unavailable = { weather_unavailable: true };
+  try {
+    const cache = CacheService.getScriptCache();
+    const cached = cache.get(SX.WEATHER_CACHE);
+    if (cached) {
+      try {
+        const parsedCache = JSON.parse(cached);
+        if (parsedCache && parsedCache.current) return parsedCache;
+      } catch (ignored) {}
+    }
+
+    const response = UrlFetchApp.fetch(SX.WEATHER_URL, {
+      method: 'get',
+      headers: { 'Accept': 'application/json', 'Cache-Control': 'no-cache' },
+      muteHttpExceptions: true,
+      followRedirects: true
+    });
+    const status = response.getResponseCode();
+    if (status < 200 || status >= 300) {
+      let reason = '';
+      try {
+        const errorBody = JSON.parse(response.getContentText());
+        if (errorBody && typeof errorBody.reason === 'string') {
+          reason = errorBody.reason.replace(/[\x00-\x1f\x7f]+/g, ' ').slice(0, 180);
+        }
+      } catch (ignored) {}
+      Logger.log('Open-Meteo weather HTTP ' + status + (reason ? ': ' + reason : '.'));
+      return unavailable;
+    }
+
+    const body = JSON.parse(response.getContentText());
+    const current = body && body.current;
+    const temperature = current && current.temperature_2m;
+    const validTime = current && current.time;
+    const offset = body && body.utc_offset_seconds;
+    if (typeof temperature !== 'number' || !isFinite(temperature) || temperature < -100 || temperature > 100 ||
+        typeof validTime !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(validTime) ||
+        typeof offset !== 'number' || !isFinite(offset) || Math.abs(offset) > 14 * 60 * 60) {
+      Logger.log('Open-Meteo вернул неполные или некорректные текущие данные.');
+      return unavailable;
+    }
+
+    const payload = {
+      utc_offset_seconds: offset,
+      timezone: 'Asia/Ashgabat',
+      current: {
+        time: validTime,
+        interval: Number(current.interval) || 0,
+        temperature_2m: temperature
+      }
+    };
+    cache.put(SX.WEATHER_CACHE, JSON.stringify(payload), SX.WEATHER_CACHE_SECONDS);
+    return payload;
+  } catch (err) {
+    Logger.log('Запрос погоды из Apps Script не выполнен (' + String(err && err.name || 'Error') + ').');
+    return unavailable;
+  }
 }
 
 function processUser_(base, key, user) {
