@@ -664,17 +664,57 @@ async def _current_ashgabat_weather() -> str:
             )
             response.raise_for_status()
             return _format_ashgabat_weather(response.json())
+    except httpx.HTTPStatusError as exc:
+        response = exc.response
+        reason = ""
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                candidate = payload.get("reason")
+                if isinstance(candidate, str):
+                    # Open-Meteo's error JSON may explain 400/429/5xx responses.
+                    # Keep only this bounded diagnostic; never log the URL/body.
+                    reason = re.sub(r"[\x00-\x1f\x7f]+", " ", candidate).strip()[:180]
+        except Exception:
+            pass
+        log.warning(
+            "Ashgabat weather request failed (Open-Meteo HTTP %d%s)",
+            response.status_code,
+            f": {reason}" if reason else "",
+        )
+        return ASHGABAT_WEATHER_UNAVAILABLE
     except Exception as exc:
         # Keep diagnostics useful without logging response bodies or request data.
         log.warning("Ashgabat weather request failed (%s)", type(exc).__name__)
         return ASHGABAT_WEATHER_UNAVAILABLE
 
 
-async def _announce(settings: dict) -> str:
+def _weather_payload_from_sync_request(request: Request) -> dict | None:
+    """Decode the small weather snapshot supplied by the trusted Apps Script."""
+    encoded = request.headers.get("x-weather-data")
+    if not encoded:
+        return None
+    if len(encoded) > 4096:
+        return {}
+    try:
+        padded = encoded + "=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+async def _announce(settings: dict, weather_payload: dict | None = None) -> str:
     # Weather is deliberately fetched for every generated manifest. Other
     # announcement elements rotate on stable time slots, so a five-minute
     # trigger gets a fresh quote/footer even if its execution time drifts.
-    weather_line = await _current_ashgabat_weather()
+    if weather_payload is None:
+        weather_line = await _current_ashgabat_weather()
+    else:
+        try:
+            weather_line = _format_ashgabat_weather(weather_payload)
+        except Exception:
+            weather_line = ASHGABAT_WEATHER_UNAVAILABLE
     refresh = max(5, int(settings.get("announce_refresh_minutes", 5))) * 60
     refresh_slot = int(time.time() // refresh)
     if state.announce_cache and refresh_slot == state.announce_cache[0]:
@@ -1388,7 +1428,8 @@ async def sync_manifest(request: Request):
         else:
             rows = await conn.fetch("SELECT * FROM users ORDER BY id")
         # Same announcement text shared across every user in this manifest response.
-        announce = await _announce(settings) if settings.get("announce_enabled", True) else ""
+        weather_payload = _weather_payload_from_sync_request(request)
+        announce = await _announce(settings, weather_payload) if settings.get("announce_enabled", True) else ""
         manifest = []
         for user in rows:
             content = "" if user["status"] == "pending_delete" else await build_manifest_content(conn, user, body, headers, settings, announce, servers)

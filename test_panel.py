@@ -473,6 +473,27 @@ class AnnouncementWeatherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client_options["timeout"], 5.0)
         self.assertIs(panel.state.upstream_client, relay_client)
 
+    async def test_weather_http_error_logs_status_and_safe_provider_reason(self):
+        real_async_client = httpx.AsyncClient
+
+        def handler(request):
+            return httpx.Response(
+                429,
+                json={"error": True, "reason": "API request limit exceeded"},
+            )
+
+        def make_weather_client(**kwargs):
+            return real_async_client(transport=httpx.MockTransport(handler), **kwargs)
+
+        with patch.object(panel.httpx, "AsyncClient", new=make_weather_client), \
+             self.assertLogs("vpn_panel", level="WARNING") as captured:
+            result = await panel._current_ashgabat_weather()
+
+        self.assertEqual(result, panel.ASHGABAT_WEATHER_UNAVAILABLE)
+        self.assertTrue(any("Open-Meteo HTTP 429" in line for line in captured.output))
+        self.assertTrue(any("API request limit exceeded" in line for line in captured.output))
+        self.assertFalse(any("api.open-meteo.com" in line for line in captured.output))
+
     async def test_announcement_rotates_once_per_configured_wall_clock_slot(self):
         weather = AsyncMock(side_effect=[
             "☀️ Ашхабад сейчас: ясно, 24°C",
@@ -730,6 +751,38 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🌧 Ашхабад сейчас: умеренный дождь, 19°C", second_announcement)
         self.assertNotEqual(first_announcement.splitlines()[3], second_announcement.splitlines()[3])
         self.assertEqual(weather.await_count, 2)
+
+    async def test_sync_manifest_uses_apps_script_weather_header_without_render_request(self):
+        server_uri = "vless://id@weather-header.example#Weather"
+        parsed = panel.parse_server_uri(server_uri)
+        user = {"id": 31, "slug": "weather-header", "name": "Weather", "note": "", "enabled": True,
+                "expires_at": None, "title_override": None, "announce_override": None,
+                "status": "active", "drive_file_id": "drive-id"}
+        conn = FakeConn(users=[user], server={"id": parsed["id"], "original_name": parsed["name"],
+                                             "custom_name": None, "hidden": False, "sort_order": 0})
+        payload = {
+            "utc_offset_seconds": 18000,
+            "current": {"time": datetime.now(timezone(timedelta(hours=5))).strftime("%Y-%m-%dT%H:%M"),
+                        "interval": 900, "temperature_2m": 16.2},
+        }
+        encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+        weather_fetch = AsyncMock(side_effect=AssertionError("Render should not fetch Open-Meteo"))
+        with patch.dict(os.environ, {"SYNC_KEY": "sync"}, clear=False), \
+             patch.object(panel.state, "db", new=AsyncMock(return_value=FakePool(conn))), \
+             patch.object(panel.state, "fetch_upstream", new=AsyncMock(
+                 return_value=(server_uri.encode(), {}, False))), \
+             patch.object(panel, "_settings", new=AsyncMock(return_value=dict(
+                 panel.DEFAULT_SETTINGS, announce_enabled=True))), \
+             patch.object(panel, "_current_ashgabat_weather", new=weather_fetch):
+            result = await panel.sync_manifest(make_request({
+                "X-Sync-Key": "sync",
+                "X-Weather-Data": encoded,
+            }))
+
+        encoded_announce = result["users"][0]["content"].split("#announce: base64:", 1)[1].splitlines()[0]
+        announcement = base64.b64decode(encoded_announce).decode()
+        self.assertIn("🌡 Ашхабад сейчас: 16.2°C", announcement)
+        weather_fetch.assert_not_awaited()
 
     async def test_global_and_user_overrides_control_order_names_and_visibility(self):
         a_uri, b_uri = "vless://a@a.example#A", "trojan://b@b.example#B"
