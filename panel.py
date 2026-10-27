@@ -34,6 +34,8 @@ router = APIRouter()
 
 LEGACY_DRIVE_FILE_ID = "160lsZ2nDrSXTzA09r9jeGHnd6QyFylw9"
 PANEL_UPSTREAM_DEFAULT_USER_AGENT = "Happ"
+ASHGABAT_WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+ASHGABAT_WEATHER_UNAVAILABLE = "🌡 Ашхабад: текущая погода временно недоступна"
 UPSTREAM_TIMEOUT_SECONDS = 20.0
 PANEL_CACHE_TTL_SECONDS = 300
 SESSION_SECONDS = 12 * 60 * 60
@@ -245,7 +247,7 @@ class PanelState:
         self.upstream_attempt_at = 0.0
         self.upstream_warning: str | None = None
         self.upstream_lock = asyncio.Lock()
-        self.announce_cache: tuple[float, str] | None = None
+        self.announce_cache: tuple[int, str] | None = None
         self.announce_quote: str | None = None
         self.login_fails: dict[str, tuple[int, float]] = {}
         self.drive_push_last: float = 0.0
@@ -535,11 +537,137 @@ def _now_for_tz(name):
         return datetime.now(timezone.utc)
 
 
+def _format_ashgabat_weather(data: dict) -> str:
+    """Format Open-Meteo current weather; accepts its current and legacy fields."""
+    if not isinstance(data, dict):
+        raise ValueError("weather response is not an object")
+    current = data.get("current") or data.get("current_weather")
+    if not isinstance(current, dict):
+        raise ValueError("weather response has no current conditions")
+
+    temperature = current.get("temperature_2m", current.get("temperature"))
+    weather_code = current.get("weather_code", current.get("weathercode"))
+    weather_time = current.get("time")
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+        raise ValueError("weather temperature is missing")
+    if isinstance(weather_code, bool) or not isinstance(weather_code, (int, float)):
+        raise ValueError("weather code is missing")
+    if not isinstance(weather_time, str):
+        raise ValueError("weather valid time is missing")
+
+    temperature = float(temperature)
+    code = int(weather_code)
+    if not -100 <= temperature <= 100 or not 0 <= code <= 99:
+        raise ValueError("weather values are outside valid ranges")
+
+    conditions = {
+        0: ("☀️", "ясно"),
+        1: ("🌤", "преимущественно ясно"),
+        2: ("⛅", "переменная облачность"),
+        3: ("☁️", "пасмурно"),
+        45: ("🌫", "туман"),
+        48: ("🌫", "туман с изморозью"),
+        51: ("🌦", "слабая морось"),
+        53: ("🌦", "умеренная морось"),
+        55: ("🌧", "сильная морось"),
+        56: ("🌧", "слабая ледяная морось"),
+        57: ("🌧", "сильная ледяная морось"),
+        61: ("🌧", "небольшой дождь"),
+        63: ("🌧", "умеренный дождь"),
+        65: ("🌧", "сильный дождь"),
+        66: ("🌧", "слабый ледяной дождь"),
+        67: ("🌧", "сильный ледяной дождь"),
+        71: ("❄️", "небольшой снегопад"),
+        73: ("❄️", "умеренный снегопад"),
+        75: ("❄️", "сильный снегопад"),
+        77: ("❄️", "снежная крупа"),
+        80: ("🌧", "небольшие ливни"),
+        81: ("🌧", "умеренные ливни"),
+        82: ("🌧", "сильные ливни"),
+        85: ("❄️", "слабый снег с перерывами"),
+        86: ("❄️", "сильный снег с перерывами"),
+        95: ("⛈", "гроза"),
+        96: ("⛈", "гроза с небольшим градом"),
+        97: ("⛈", "сильная гроза"),
+        99: ("⛈", "гроза с сильным градом"),
+    }
+    condition = conditions.get(code)
+    if condition is None:
+        raise ValueError("weather code is not recognized")
+
+    offset_seconds = data.get("utc_offset_seconds")
+    if isinstance(offset_seconds, float) and offset_seconds.is_integer():
+        offset_seconds = int(offset_seconds)
+    if (isinstance(offset_seconds, int) and not isinstance(offset_seconds, bool)
+            and abs(offset_seconds) <= 14 * 60 * 60):
+        ashgabat_timezone = timezone(timedelta(seconds=offset_seconds))
+    else:
+        try:
+            from zoneinfo import ZoneInfo
+            ashgabat_timezone = ZoneInfo("Asia/Ashgabat")
+        except Exception:
+            # Open-Meteo normally includes utc_offset_seconds. This fixed
+            # offset fallback also lets local Windows runs validate the data.
+            ashgabat_timezone = timezone(timedelta(hours=5))
+
+    try:
+        observed_at = datetime.fromisoformat(weather_time)
+    except ValueError as exc:
+        raise ValueError("weather valid time is invalid") from exc
+    local_now = datetime.now(ashgabat_timezone)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=ashgabat_timezone)
+    else:
+        observed_at = observed_at.astimezone(ashgabat_timezone)
+    age_seconds = (local_now - observed_at).total_seconds()
+    # Open-Meteo's current fields are model-based and may be hourly in this
+    # region. Allow one model interval plus margin, but never present an older
+    # response as current.
+    if age_seconds > 2 * 60 * 60 or age_seconds < -15 * 60:
+        raise ValueError("weather valid time is stale or in the future")
+
+    shown_temperature = f"{temperature:g}"
+    emoji, description = condition
+    return f"{emoji} Ашхабад сейчас: {description}, {shown_temperature}°C · данные на {observed_at:%H:%M}"
+
+
+async def _current_ashgabat_weather() -> str:
+    """Fetch fresh city weather independently from the VPN upstream client/cache."""
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=5.0,
+            headers={
+                "User-Agent": "SecureX-Weather/1.0",
+                "Cache-Control": "no-cache",
+            },
+        ) as client:
+            response = await client.get(
+                ASHGABAT_WEATHER_URL,
+                params={
+                    "latitude": 37.95,
+                    "longitude": 58.38,
+                    "current": "temperature_2m,weather_code",
+                    "timezone": "Asia/Ashgabat",
+                },
+            )
+            response.raise_for_status()
+            return _format_ashgabat_weather(response.json())
+    except Exception as exc:
+        # Keep diagnostics useful without logging response bodies or request data.
+        log.warning("Ashgabat weather request failed (%s)", type(exc).__name__)
+        return ASHGABAT_WEATHER_UNAVAILABLE
+
+
 async def _announce(settings: dict) -> str:
+    # Weather is deliberately fetched for every generated manifest. Other
+    # announcement elements rotate on stable time slots, so a five-minute
+    # trigger gets a fresh quote/footer even if its execution time drifts.
+    weather_line = await _current_ashgabat_weather()
     refresh = max(5, int(settings.get("announce_refresh_minutes", 5))) * 60
-    now = time.monotonic()
-    if state.announce_cache and now - state.announce_cache[0] < refresh:
-        return state.announce_cache[1]
+    refresh_slot = int(time.time() // refresh)
+    if state.announce_cache and refresh_slot == state.announce_cache[0]:
+        return state.announce_cache[1].replace("__CURRENT_ASHGABAT_WEATHER__", weather_line)
     local = _now_for_tz(settings.get("timezone", "Asia/Ashgabat"))
     lines = []
     days = settings.get("days") or DAY_DEFAULTS
@@ -547,19 +675,9 @@ async def _announce(settings: dict) -> str:
     footers = settings.get("footers") or FOOTER_DEFAULTS
     day_line = str(days[local.isoweekday() - 1]) if len(days) >= 7 else ""
     greeting = "🌙 Доброй ночи!" if local.hour < 5 else "🌅 Доброе утро!" if local.hour < 12 else "☀️ Добрый день!" if local.hour < 18 else "🌆 Добрый вечер!"
-    weather = ""
-    try:
-        if state.upstream_client is None:
-            state.upstream_client = httpx.AsyncClient(follow_redirects=True, timeout=UPSTREAM_TIMEOUT_SECONDS)
-        w = await state.upstream_client.get("https://api.open-meteo.com/v1/forecast?latitude=37.95&longitude=58.38&current_weather=true", headers={"User-Agent": PANEL_UPSTREAM_DEFAULT_USER_AGENT}, timeout=5.0)
-        data = w.json().get("current_weather", {})
-        code = int(data.get("weathercode", -1)); temp = data.get("temperature")
-        emoji = "☀️" if code == 0 else "⛅" if 1 <= code <= 3 else "🌫" if code in (45, 48) else "🌧" if 51 <= code <= 67 or 80 <= code <= 82 else "❄️" if 71 <= code <= 77 else "⛈" if code >= 95 else ""
-        if emoji and temp is not None: weather = f"{emoji} Ашхабад сейчас: {temp}°C"
-    except Exception:
-        pass
-    top_lines = [line for line in (day_line, greeting, weather) if line]
+    top_lines = [line for line in (day_line, greeting) if line]
     lines.append(secrets.choice(top_lines) if top_lines else greeting)
+    lines.append("__CURRENT_ASHGABAT_WEATHER__")
     candidates = [str(q) for q in quotes if str(q)]
     quote_text = secrets.choice(candidates) if candidates else ""
     if len(candidates) > 1 and quote_text == state.announce_quote:
@@ -567,9 +685,9 @@ async def _announce(settings: dict) -> str:
     state.announce_quote = quote_text
     footer_tpl = secrets.choice([str(x) for x in footers if str(x)]) if footers else ""
     lines.extend(["", quote_text, "", footer_tpl.replace("{t}", local.strftime("%H:%M:%S"))])
-    value = "\n".join(lines).strip()
-    state.announce_cache = (now, value)
-    return value
+    template = "\n".join(lines).strip()
+    state.announce_cache = (refresh_slot, template)
+    return template.replace("__CURRENT_ASHGABAT_WEATHER__", weather_line)
 
 
 def _userinfo(headers: dict, expire_override: int | None = None) -> str:

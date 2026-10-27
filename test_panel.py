@@ -371,6 +371,123 @@ class UpstreamCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(stale)
 
 
+class AnnouncementWeatherTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.previous_cache = panel.state.announce_cache
+        self.previous_quote = panel.state.announce_quote
+        panel.state.announce_cache = None
+        panel.state.announce_quote = None
+
+    async def asyncTearDown(self):
+        panel.state.announce_cache = self.previous_cache
+        panel.state.announce_quote = self.previous_quote
+
+    async def test_weather_is_refetched_and_always_included_when_announcement_is_cached(self):
+        weather = AsyncMock(side_effect=[
+            "☀️ Ашхабад сейчас: 24°C",
+            "🌧 Ашхабад сейчас: 19°C",
+        ])
+        settings = dict(panel.DEFAULT_SETTINGS, announce_refresh_minutes=60)
+        with patch.object(panel, "_current_ashgabat_weather", new=weather), \
+             patch.object(panel.secrets, "choice", side_effect=lambda choices: choices[0]):
+            first = await panel._announce(settings)
+            second = await panel._announce(settings)
+
+        self.assertIn("☀️ Ашхабад сейчас: 24°C", first)
+        self.assertIn("🌧 Ашхабад сейчас: 19°C", second)
+        self.assertEqual(first.count("Ашхабад сейчас:"), 1)
+        self.assertEqual(second.count("Ашхабад сейчас:"), 1)
+        self.assertEqual(weather.await_count, 2)
+        self.assertNotIn("__CURRENT_ASHGABAT_WEATHER__", second)
+        # Quote/footer template remains cached within its configured refresh window.
+        self.assertEqual(first.splitlines()[3], second.splitlines()[3])
+
+    async def test_weather_formatter_handles_current_and_legacy_open_meteo_fields(self):
+        ashgabat_now = datetime.now(timezone(timedelta(hours=5)))
+        valid_time = ashgabat_now.strftime("%Y-%m-%dT%H:%M")
+        modern = panel._format_ashgabat_weather({
+            "utc_offset_seconds": 18000,
+            "current": {"temperature_2m": 24.5, "weather_code": 2, "time": valid_time},
+        })
+        legacy = panel._format_ashgabat_weather({
+            "utc_offset_seconds": 18000,
+            "current_weather": {"temperature": 7, "weathercode": 71, "time": valid_time},
+        })
+        self.assertEqual(modern, f"⛅ Ашхабад сейчас: переменная облачность, 24.5°C · данные на {valid_time[-5:]}")
+        self.assertEqual(legacy, f"❄️ Ашхабад сейчас: небольшой снегопад, 7°C · данные на {valid_time[-5:]}")
+
+    async def test_stale_weather_response_is_rejected(self):
+        stale_time = (datetime.now(timezone(timedelta(hours=5))) - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M")
+        with self.assertRaises(ValueError):
+            panel._format_ashgabat_weather({
+                "utc_offset_seconds": 18000,
+                "current": {"temperature_2m": 24, "weather_code": 0, "time": stale_time},
+            })
+
+    async def test_weather_fetch_uses_current_ashgabat_fields_without_relay_client(self):
+        seen = {}
+        client_options = {}
+        real_async_client = httpx.AsyncClient
+
+        def handler(request):
+            seen["url"] = request.url
+            seen["user_agent"] = request.headers.get("user-agent")
+            seen["cache_control"] = request.headers.get("cache-control")
+            return httpx.Response(200, json={
+                "utc_offset_seconds": 18000,
+                "current": {
+                    "temperature_2m": 26,
+                    "weather_code": 0,
+                    "time": datetime.now(timezone(timedelta(hours=5))).strftime("%Y-%m-%dT%H:%M"),
+                },
+            })
+
+        def make_weather_client(**kwargs):
+            client_options.update(kwargs)
+            return real_async_client(transport=httpx.MockTransport(handler), **kwargs)
+
+        relay_client = panel.state.upstream_client
+        with patch.object(panel.httpx, "AsyncClient", new=make_weather_client):
+            result = await panel._current_ashgabat_weather()
+
+        self.assertTrue(result.startswith("☀️ Ашхабад сейчас: ясно, 26°C · данные на "))
+        self.assertEqual(seen["url"].host, "api.open-meteo.com")
+        self.assertEqual(seen["url"].params.get("current"), "temperature_2m,weather_code")
+        self.assertEqual(seen["url"].params.get("timezone"), "Asia/Ashgabat")
+        self.assertEqual(seen["user_agent"], "SecureX-Weather/1.0")
+        self.assertEqual(seen["cache_control"], "no-cache")
+        self.assertEqual(client_options["timeout"], 5.0)
+        self.assertIs(panel.state.upstream_client, relay_client)
+
+    async def test_announcement_rotates_once_per_configured_wall_clock_slot(self):
+        weather = AsyncMock(side_effect=[
+            "☀️ Ашхабад сейчас: ясно, 24°C",
+            "☀️ Ашхабад сейчас: ясно, 24°C",
+            "🌧 Ашхабад сейчас: умеренный дождь, 19°C",
+        ])
+        clock = [300.1, 301.0, 600.1]
+        settings = dict(panel.DEFAULT_SETTINGS, announce_refresh_minutes=5,
+                        quotes=["Цитата один", "Цитата два"],
+                        footers=["Обновлено {t}"], days=["День"] * 7)
+        with patch.object(panel, "_current_ashgabat_weather", new=weather), \
+             patch.object(panel.time, "time", side_effect=clock), \
+             patch.object(panel.secrets, "choice", side_effect=lambda choices: choices[0]):
+            first = await panel._announce(settings)
+            same_slot = await panel._announce(settings)
+            next_slot = await panel._announce(settings)
+
+        self.assertEqual(first.splitlines()[3], same_slot.splitlines()[3])
+        self.assertNotEqual(first.splitlines()[3], next_slot.splitlines()[3])
+        self.assertIn("🌧 Ашхабад сейчас: умеренный дождь, 19°C", next_slot)
+        self.assertEqual(weather.await_count, 3)
+
+    async def test_unavailable_weather_is_explicitly_shown_instead_of_stale_or_fake_data(self):
+        with patch.object(panel, "_current_ashgabat_weather", new=AsyncMock(
+                return_value=panel.ASHGABAT_WEATHER_UNAVAILABLE)):
+            text = await panel._announce(dict(panel.DEFAULT_SETTINGS))
+        self.assertIn(panel.ASHGABAT_WEATHER_UNAVAILABLE, text)
+
+
 class SecurityTests(unittest.IsolatedAsyncioTestCase):
     async def test_sync_key_and_csrf_are_enforced(self):
         transport = httpx.ASGITransport(app=app.app)
@@ -558,6 +675,48 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("#subscription-userinfo: upload=3; download=8; total=100; expire=0", result["users"][0]["content"])
         self.assertIn("#subscription-userinfo: upload=3; download=8; total=100; expire=0", result["users"][1]["content"])
 
+    async def test_each_sync_manifest_contains_fresh_weather_and_rotated_announcement(self):
+        server_uri = "vless://id@weather.example#Weather"
+        parsed = panel.parse_server_uri(server_uri)
+        user = {"id": 30, "slug": "weather", "name": "Weather", "note": "", "enabled": True,
+                "expires_at": None, "title_override": None, "announce_override": None,
+                "status": "active", "drive_file_id": "drive-id"}
+        conn = FakeConn(users=[user], server={"id": parsed["id"], "original_name": parsed["name"],
+                                             "custom_name": None, "hidden": False, "sort_order": 0})
+        pool = FakePool(conn)
+        old_cache, old_quote = panel.state.announce_cache, panel.state.announce_quote
+        panel.state.announce_cache = None
+        panel.state.announce_quote = None
+        weather = AsyncMock(side_effect=[
+            "☀️ Ашхабад сейчас: ясно, 24°C · данные на 10:00",
+            "🌧 Ашхабад сейчас: умеренный дождь, 19°C · данные на 10:00",
+        ])
+        try:
+            with patch.dict(os.environ, {"SYNC_KEY": "sync"}, clear=False), \
+                 patch.object(panel.state, "db", new=AsyncMock(return_value=pool)), \
+                 patch.object(panel.state, "fetch_upstream", new=AsyncMock(
+                     return_value=(server_uri.encode(), {}, False))), \
+                 patch.object(panel, "_settings", new=AsyncMock(return_value=dict(
+                     panel.DEFAULT_SETTINGS, announce_refresh_minutes=5))), \
+                 patch.object(panel, "_current_ashgabat_weather", new=weather), \
+                 patch.object(panel.time, "time", side_effect=[300.1, 600.1]), \
+                 patch.object(panel.secrets, "choice", side_effect=lambda choices: choices[0]):
+                first = await panel.sync_manifest(make_request({"X-Sync-Key": "sync"}))
+                second = await panel.sync_manifest(make_request({"X-Sync-Key": "sync"}))
+        finally:
+            panel.state.announce_cache, panel.state.announce_quote = old_cache, old_quote
+
+        def decoded_announce(manifest):
+            encoded = manifest["users"][0]["content"].split("#announce: base64:", 1)[1].splitlines()[0]
+            return base64.b64decode(encoded).decode()
+
+        first_announcement = decoded_announce(first)
+        second_announcement = decoded_announce(second)
+        self.assertIn("☀️ Ашхабад сейчас: ясно, 24°C", first_announcement)
+        self.assertIn("🌧 Ашхабад сейчас: умеренный дождь, 19°C", second_announcement)
+        self.assertNotEqual(first_announcement.splitlines()[3], second_announcement.splitlines()[3])
+        self.assertEqual(weather.await_count, 2)
+
     async def test_global_and_user_overrides_control_order_names_and_visibility(self):
         a_uri, b_uri = "vless://a@a.example#A", "trojan://b@b.example#B"
         a, b = panel.parse_server_uri(a_uri), panel.parse_server_uri(b_uri)
@@ -648,8 +807,8 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mobile.status_code, 200)
         self.assertIn('class="desktop-ui"', desktop.text)
         self.assertIn('class="mobile-ui"', mobile.text)
-        self.assertIn("/static/admin.js?v=20261025-1", desktop.text)
-        self.assertIn("/static/admin.js?v=20261025-1", mobile.text)
+        self.assertIn("/static/admin.js?v=20261027-1", desktop.text)
+        self.assertIn("/static/admin.js?v=20261027-1", mobile.text)
         self.assertIn("/static/admin-actions.js?v=20261025-1", desktop.text)
         self.assertIn("/static/admin-actions.js?v=20261025-1", mobile.text)
         self.assertIn("/static/admin.css?v=20261025-1", mobile.text)
@@ -665,6 +824,7 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("showDriveQr(shareAction.userId)", javascript.text)
         self.assertIn("driveQrLoadingContent()", javascript.text)
         self.assertIn("credentials: 'same-origin'", javascript.text)
+        self.assertIn("День/приветствие, цитата и подпись меняются с этим интервалом", javascript.text)
         self.assertNotIn("function driveShareContent(userId, link, includeQr)", javascript.text)
         self.assertIn("document.execCommand('copy')", javascript.text)
         self.assertIn("navigator.clipboard.writeText(value)", javascript.text)
