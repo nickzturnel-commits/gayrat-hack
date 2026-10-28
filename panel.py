@@ -73,6 +73,7 @@ DEFAULT_SETTINGS = {
     # new user profiles, while the legacy account profile stays visible.
     "default_traffic_limit_bytes": None,
     "hide_traffic_for_new_users": False,
+    "include_sas_for_new_users": True,
     "quotes": QUOTE_DEFAULTS, "footers": FOOTER_DEFAULTS, "days": DAY_DEFAULTS,
 }
 
@@ -486,11 +487,24 @@ def merge_subscription_bodies(primary_body: bytes, secondary_body: bytes,
         uris = _extract_uris(_decode_subscription(body))
         if not uris:
             raise ValueError(f"Источник {source} не содержит поддерживаемых VPN-серверов")
+        if source == "SAS":
+            uris = [uri for uri in uris if not is_excluded_sas_server(uri)]
         for uri in uris:
             if uri not in seen:
                 seen.add(uri)
                 merged.append(uri)
     return ("\n".join(merged) + "\n").encode("utf-8")
+
+
+def is_excluded_sas_server(uri: str) -> bool:
+    """Exclude every numbered or unnumbered LTE bypass node from the SAS feed."""
+    try:
+        name = _server_name_key(parse_server_uri(uri)["name"])
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if "lte" not in name or not re.search(r"обход\s+глушилок", name):
+        return False
+    return True
 
 
 class PanelState:
@@ -506,6 +520,7 @@ class PanelState:
         self.upstream_warning: str | None = None
         self.sas_body: bytes | None = None
         self.sas_fetched_at = 0.0
+        self.sas_success_at: float | None = None
         self.sas_attempt_at = 0.0
         self.sas_warning: str | None = None
         self.combined_body: bytes | None = None
@@ -674,6 +689,7 @@ class PanelState:
                 raise ValueError(invalid)
             self.sas_body = response.content
             self.sas_fetched_at = time.monotonic()
+            self.sas_success_at = time.time()
             self.sas_warning = None
             log.info("SAS subscription cache updated: bytes=%d; servers=%d", len(response.content), len(_extract_uris(_decode_subscription(response.content))))
             return self.sas_body, False
@@ -685,7 +701,7 @@ class PanelState:
             self.sas_warning = "Не удалось получить подписку SAS; объединённый профиль пока не готов"
             raise HTTPException(502, self.sas_warning) from exc
 
-    async def fetch_upstream(self, force=False, force_sas=False):
+    async def fetch_upstream(self, force=False, force_sas=False, allow_sas_failure=False):
         async with self.upstream_lock:
             primary_url = os.getenv("SUBSCRIPTION_URL", "").strip()
             if self.upstream_client is None:
@@ -703,21 +719,32 @@ class PanelState:
             sas_url = os.getenv("SAS_SUBSCRIPTION_URL", "").strip()
             sas_stale = False
             if sas_url:
-                sas_body, sas_stale = await self._fetch_sas_locked(sas_url, headers, force or force_sas)
                 try:
-                    combined_body = merge_subscription_bodies(
-                        primary_body,
-                        sas_body,
-                        self.upstream_headers.get("content-type", ""),
-                        "text/plain",
-                    )
-                except ValueError as exc:
-                    self.sas_warning = "Не удалось сформировать объединённый профиль SAS"
-                    log.warning("Combined subscription rejected (%s)", type(exc).__name__)
-                    if self.combined_body is None:
-                        raise HTTPException(502, self.sas_warning) from exc
-                    combined_body = self.combined_body
+                    sas_body, sas_stale = await self._fetch_sas_locked(sas_url, headers, force or force_sas)
+                except HTTPException:
+                    if not allow_sas_failure:
+                        raise
+                    sas_body = None
                     sas_stale = True
+                if sas_body is None:
+                    # A subscriber that opted out of SAS can keep receiving the
+                    # primary profile during a cold SAS outage.
+                    combined_body = primary_body
+                else:
+                    try:
+                        combined_body = merge_subscription_bodies(
+                            primary_body,
+                            sas_body,
+                            self.upstream_headers.get("content-type", ""),
+                            "text/plain",
+                        )
+                    except ValueError as exc:
+                        self.sas_warning = "Не удалось сформировать объединённый профиль SAS"
+                        log.warning("Combined subscription rejected (%s)", type(exc).__name__)
+                        if self.combined_body is None:
+                            raise HTTPException(502, self.sas_warning) from exc
+                        combined_body = self.combined_body
+                        sas_stale = True
             else:
                 combined_body = primary_body
                 self.sas_warning = None
@@ -809,6 +836,7 @@ class UserBody(BaseModel):
     announce_override: str | None = Field(default=None, max_length=4000)
     traffic_limit_bytes: int | None = Field(default=None, ge=1_000_000, le=1_000_000_000_000)
     hide_traffic_usage: bool | None = None
+    include_sas: bool | None = None
 
 
 class ServerBody(BaseModel):
@@ -1118,21 +1146,29 @@ def _plan_server_reconciliation(parsed: list[dict], existing: list[dict],
             assigned[index] = current_id
             reserved_ids.add(current_id)
 
-    incoming_name_counts: dict[str, int] = {}
+    incoming_name_counts: dict[tuple[str, str], int] = {}
     for server in parsed:
         key = server.get("source_key") or _server_name_key(server.get("name", ""))
-        incoming_name_counts[key] = incoming_name_counts.get(key, 0) + 1
+        scope = (str(server.get("source", "primary")), key)
+        incoming_name_counts[scope] = incoming_name_counts.get(scope, 0) + 1
 
     def row_key(row: dict) -> str:
         return (_server_row_value(row, "source_key") or
                 _server_name_key(_server_row_value(row, "original_name", "")))
 
+    def row_belongs_to_source(row: dict, source: str) -> bool:
+        # `unknown` rows are from databases created before source labels existed.
+        # Reconcile them once by name, then persist their source on the upsert.
+        return _server_row_value(row, "source", "unknown") in {source, "unknown", None}
+
     for index, server in enumerate(parsed):
         if index in assigned:
             continue
         key = server.get("source_key") or _server_name_key(server.get("name", ""))
+        source = str(server.get("source", "primary"))
         candidates = [row for row in rows
-                      if str(row.get("id")) not in reserved_ids and row_key(row) == key]
+                      if str(row.get("id")) not in reserved_ids and row_key(row) == key
+                      and row_belongs_to_source(row, source)]
         if candidates:
             candidates.sort(key=lambda row: _server_rank(row, override_counts), reverse=True)
             selected_id = str(candidates[0]["id"])
@@ -1144,7 +1180,8 @@ def _plan_server_reconciliation(parsed: list[dict], existing: list[dict],
     assigned_name: dict[str, set[str]] = {}
     for index, server in enumerate(parsed):
         key = server.get("source_key") or _server_name_key(server.get("name", ""))
-        assigned_name.setdefault(key, set()).add(assigned.get(index, str(server["id"])))
+        scope = (str(server.get("source", "primary")), key)
+        assigned_name.setdefault(scope, set()).add(assigned.get(index, str(server["id"])))
 
     merge_ids: dict[str, list[str]] = {}
     reconciled = []
@@ -1154,13 +1191,16 @@ def _plan_server_reconciliation(parsed: list[dict], existing: list[dict],
         item["id"] = target_id
         reconciled.append(item)
         key = item.get("source_key") or _server_name_key(item.get("name", ""))
-        if incoming_name_counts.get(key) != 1:
+        source = str(item.get("source", "primary"))
+        scope = (source, key)
+        if incoming_name_counts.get(scope) != 1:
             continue
-        protected = assigned_name.get(key, set())
+        protected = assigned_name.get(scope, set())
         matching_ids = [str(row["id"]) for row in rows
-                        if row_key(row) == key and str(row["id"]) not in
+                        if row_key(row) == key and row_belongs_to_source(row, source) and str(row["id"]) not in
                         {str(other["id"]) for other in rows
-                         if str(other["id"]) in reserved_ids and row_key(other) != key}]
+                         if str(other["id"]) in reserved_ids and
+                         (row_key(other) != key or not row_belongs_to_source(other, source))}]
         # Never fold a row which is currently serving a different provider name
         # just because its old label happens to match this server's name.
         matching_ids = [value for value in matching_ids
@@ -1170,14 +1210,27 @@ def _plan_server_reconciliation(parsed: list[dict], existing: list[dict],
     return reconciled, merge_ids
 
 
-async def _sync_servers(conn, body: bytes):
+async def _sync_servers(conn, body: bytes, *, primary_body: bytes | None = None,
+                        sas_body: bytes | None = None):
     text = _decode_subscription(body)
     uris = _extract_uris(text)
     if not uris:
         raise HTTPException(502, "В списке апстрима нет VPN-серверов")
     parsed = [parse_server_uri(uri) for uri in uris]
+    primary_ids: set[str] = set()
+    sas_ids: set[str] = set()
+    if primary_body is not None:
+        primary_ids = {parse_server_uri(uri)["id"] for uri in
+                       _extract_uris(_decode_subscription(primary_body))}
+    if sas_body is not None:
+        sas_ids = {parse_server_uri(uri)["id"] for uri in
+                   _extract_uris(_decode_subscription(sas_body))
+                   if not is_excluded_sas_server(uri)}
+    for server in parsed:
+        server["source"] = ("sas" if server["id"] in sas_ids and server["id"] not in primary_ids
+                            else "primary")
     async with conn.transaction():
-        existing = await conn.fetch("""SELECT id,original_name,source_key,custom_name,hidden,sort_order,
+        existing = await conn.fetch("""SELECT id,original_name,source_key,source,custom_name,hidden,sort_order,
             present_upstream,first_seen_at,last_seen_at FROM servers""")
         counts = await conn.fetch("SELECT server_id,COUNT(*) AS override_count FROM user_servers GROUP BY server_id")
         override_counts = {str(row["server_id"]): int(row["override_count"]) for row in counts}
@@ -1209,10 +1262,10 @@ async def _sync_servers(conn, body: bytes):
                 # resurfacing if an admin later clears or changes a current name.
                 await conn.execute("DELETE FROM servers WHERE id=ANY($2::text[]) AND id<>$1",
                                    server["id"], old_ids)
-            await conn.execute("""INSERT INTO servers(id,original_name,source_key,sort_order,present_upstream,last_seen_at)
-                VALUES($1,$2,$3,$4,TRUE,now()) ON CONFLICT(id) DO UPDATE SET original_name=EXCLUDED.original_name,
-                source_key=EXCLUDED.source_key,present_upstream=TRUE,last_seen_at=now()""",
-                server["id"], server["name"], server["source_key"], index)
+            await conn.execute("""INSERT INTO servers(id,original_name,source_key,source,sort_order,present_upstream,last_seen_at)
+                VALUES($1,$2,$3,$4,$5,TRUE,now()) ON CONFLICT(id) DO UPDATE SET original_name=EXCLUDED.original_name,
+                source_key=EXCLUDED.source_key,source=EXCLUDED.source,present_upstream=TRUE,last_seen_at=now()""",
+                server["id"], server["name"], server["source_key"], server["source"], index)
     return parsed
 
 
@@ -1252,7 +1305,7 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
     if web_url:
         lines.append("#profile-web-page-url: " + web_url)
     if active:
-        global_rows = await conn.fetch("SELECT id,original_name,custom_name,hidden,sort_order FROM servers WHERE present_upstream=TRUE ORDER BY sort_order,id")
+        global_rows = await conn.fetch("SELECT id,original_name,custom_name,hidden,sort_order,source FROM servers WHERE present_upstream=TRUE ORDER BY sort_order,id")
         upstream_by_id = {server["id"]: server for server in servers}
         overrides = await conn.fetch("SELECT server_id,hidden,custom_name FROM user_servers WHERE user_id=$1", user["id"])
         overrides_by_id = {row["server_id"]: row for row in overrides}
@@ -1260,6 +1313,9 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
         for global_row in global_rows:
             server = upstream_by_id.get(global_row["id"])
             if not server:
+                continue
+            source = server.get("source", global_row.get("source", "primary"))
+            if source == "sas" and not bool(user.get("include_sas", True)):
                 continue
             override = overrides_by_id.get(server["id"])
             if override and override["hidden"] is True: continue
@@ -1280,6 +1336,15 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
         reason = "Время подписки закончилось" if expired else "Подписка отключена"
         lines.append("vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?type=tcp&encryption=none#" + quote(reason, safe=""))
     return "\n".join(lines) + "\n"
+
+
+def _user_needs_sas(user, now: datetime | None = None) -> bool:
+    now = now or datetime.now(timezone.utc)
+    expiry = _server_row_value(user, "expires_at")
+    active = (_server_row_value(user, "status", "active") == "active"
+              and bool(_server_row_value(user, "enabled", True))
+              and (expiry is None or expiry > now))
+    return active and bool(_server_row_value(user, "include_sas", True))
 
 
 def _secure_headers(response: Response):
@@ -1433,9 +1498,11 @@ async def users_create(data: UserBody, request: Request):
         settings = await _settings(conn)
         hide_traffic = (data.hide_traffic_usage if data.hide_traffic_usage is not None
                         else bool(settings.get("hide_traffic_for_new_users", False)))
-        row = await conn.fetchrow("""INSERT INTO users(name,slug,note,enabled,expires_at,title_override,announce_override,traffic_limit_bytes,hide_traffic_usage)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *""", data.name.strip(), slug, data.note, data.enabled,
-            _expiry_utc(data.expires_at), data.title_override, data.announce_override, data.traffic_limit_bytes, hide_traffic)
+        include_sas = bool(data.include_sas if data.include_sas is not None
+                           else settings.get("include_sas_for_new_users", True))
+        row = await conn.fetchrow("""INSERT INTO users(name,slug,note,enabled,expires_at,title_override,announce_override,traffic_limit_bytes,hide_traffic_usage,include_sas)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *""", data.name.strip(), slug, data.note, data.enabled,
+            _expiry_utc(data.expires_at), data.title_override, data.announce_override, data.traffic_limit_bytes, hide_traffic, include_sas)
     drive_sync = await state.push_drive_sync([row["id"]])
     return {"user": _serialize(row), "drive_sync": drive_sync}
 
@@ -1450,9 +1517,9 @@ async def users_update(user_id: int, data: UserBody, request: Request):
         row = await conn.fetchrow("""UPDATE users SET name=$2,note=$3,enabled=$4,expires_at=$5,title_override=$6,
             announce_override=$7,traffic_limit_bytes=$8,
             hide_traffic_usage=CASE WHEN slug='legacy' OR drive_file_id=$10 THEN FALSE ELSE COALESCE($9,hide_traffic_usage) END,
-            updated_at=now() WHERE id=$1 AND status='active' RETURNING *""", user_id,
+            include_sas=COALESCE($11,include_sas),updated_at=now() WHERE id=$1 AND status='active' RETURNING *""", user_id,
             data.name.strip(), data.note, data.enabled, _expiry_utc(data.expires_at), data.title_override, data.announce_override,
-            data.traffic_limit_bytes, data.hide_traffic_usage, LEGACY_DRIVE_FILE_ID)
+            data.traffic_limit_bytes, data.hide_traffic_usage, LEGACY_DRIVE_FILE_ID, data.include_sas)
     if not row: raise HTTPException(404, "Пользователь не найден")
     drive_sync = await state.push_drive_sync([user_id])
     return {"user": _serialize(row), "drive_sync": drive_sync}
@@ -1473,12 +1540,14 @@ async def users_delete(user_id: int, request: Request):
 async def users_preview(user_id: int, request: Request):
     _auth(request)
     pool = await state.db()
-    body, headers, _ = await state.fetch_upstream()
     async with pool.acquire() as conn:
         settings = await _settings(conn)
         user = await conn.fetchrow("SELECT * FROM users WHERE id=$1", user_id)
         if not user: raise HTTPException(404, "Пользователь не найден")
-        content = await build_manifest_content(conn, user, body, headers, settings)
+    body, headers, _ = await state.fetch_upstream(allow_sas_failure=not _user_needs_sas(user))
+    async with pool.acquire() as conn:
+        servers = await _sync_servers(conn, body, primary_body=state.upstream_body, sas_body=state.sas_body)
+        content = await build_manifest_content(conn, user, body, headers, settings, servers=servers)
     return PlainTextResponse(content, headers={"Cache-Control": "no-store"})
 
 
@@ -1540,7 +1609,7 @@ async def servers_list(request: Request):
         raise HTTPException(503, "Не удалось обновить список серверов из апстрима. Повторите позже.")
     pool = await state.db()
     async with pool.acquire() as conn:
-        await _sync_servers(conn, body)
+        await _sync_servers(conn, body, primary_body=state.upstream_body, sas_body=state.sas_body)
         rows = await conn.fetch("SELECT * FROM servers WHERE present_upstream=TRUE ORDER BY sort_order,id")
     return {"servers": [_serialize(r) for r in rows]}
 
@@ -1575,7 +1644,7 @@ async def servers_refresh(request: Request):
     body, _, _ = await state.fetch_upstream(force=True)
     pool = await state.db()
     async with pool.acquire() as conn:
-        servers = await _sync_servers(conn, body)
+        servers = await _sync_servers(conn, body, primary_body=state.upstream_body, sas_body=state.sas_body)
     return {"count": len(servers), "drive_sync": await state.push_drive_sync()}
 
 
@@ -1603,9 +1672,9 @@ async def user_servers_list(user_id: int, request: Request):
     async with pool.acquire() as conn:
         if not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)", user_id):
             raise HTTPException(404, "Пользователь не найден")
-        await _sync_servers(conn, body)
+        await _sync_servers(conn, body, primary_body=state.upstream_body, sas_body=state.sas_body)
         rows = await conn.fetch("""SELECT s.id,s.original_name,s.custom_name AS global_name,s.hidden AS global_hidden,
-            s.sort_order,s.present_upstream,us.hidden AS user_hidden,us.custom_name AS user_name
+            s.source,s.sort_order,s.present_upstream,us.hidden AS user_hidden,us.custom_name AS user_name
             FROM servers s LEFT JOIN user_servers us ON us.server_id=s.id AND us.user_id=$1
             WHERE s.present_upstream=TRUE ORDER BY s.sort_order,s.id""", user_id)
     return {"servers": [_serialize(row) for row in rows]}
@@ -1614,9 +1683,26 @@ async def user_servers_list(user_id: int, request: Request):
 @router.get("/api/admin/settings")
 async def settings_get(request: Request):
     _auth(request)
+    try:
+        await state.fetch_upstream()
+    except HTTPException:
+        # Keep all admin controls available during a temporary source outage.
+        pass
     pool = await state.db()
     async with pool.acquire() as conn:
-        return {"settings": await _settings(conn)}
+        sas_uris = []
+        if state.sas_body is not None:
+            try:
+                sas_uris = [uri for uri in _extract_uris(_decode_subscription(state.sas_body))
+                            if not is_excluded_sas_server(uri)]
+            except (ValueError, UnicodeDecodeError):
+                sas_uris = []
+        return {"settings": await _settings(conn), "sas": {
+            "configured": bool(os.getenv("SAS_SUBSCRIPTION_URL", "").strip()),
+            "server_count": len(sas_uris),
+            "last_success_at": state.sas_success_at,
+            "warning": state.sas_warning,
+        }}
 
 
 @router.put("/api/admin/settings")
@@ -1660,6 +1746,8 @@ async def settings_put(data: SettingsBody, request: Request):
         raise HTTPException(422, "announce_enabled должен быть логическим значением")
     if "hide_traffic_for_new_users" in values and not isinstance(values["hide_traffic_for_new_users"], bool):
         raise HTTPException(422, "hide_traffic_for_new_users должен быть логическим значением")
+    if "include_sas_for_new_users" in values and not isinstance(values["include_sas_for_new_users"], bool):
+        raise HTTPException(422, "include_sas_for_new_users должен быть логическим значением")
     for key in ("quotes", "footers", "days"):
         if key in values and (not isinstance(values[key], list) or len(values[key]) > 100 or any(not isinstance(x, str) or len(x) > 500 for x in values[key])):
             raise HTTPException(422, f"Некорректное поле {key}")
@@ -1669,7 +1757,9 @@ async def settings_put(data: SettingsBody, request: Request):
             for key, value in values.items():
                 await conn.execute("INSERT INTO settings(key,value) VALUES($1,$2::jsonb) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", key, json.dumps(value, ensure_ascii=False))
     state.announce_cache = None
-    drive_sync = await state.push_drive_sync() if set(values) - {"default_traffic_limit_bytes", "hide_traffic_for_new_users"} else None
+    drive_sync = await state.push_drive_sync() if set(values) - {
+        "default_traffic_limit_bytes", "hide_traffic_for_new_users", "include_sas_for_new_users"
+    } else None
     return {"settings": values, "drive_sync": drive_sync}
 
 
@@ -1730,7 +1820,9 @@ async def sync_manifest(request: Request):
     try:
         # The five-minute Apps Script poll bypasses the SAS cache so every
         # scheduled manifest request checks for newly posted Telegram servers.
-        body, headers, _stale = await state.fetch_upstream(force_sas=True)
+        needs_sas = any(_user_needs_sas(user) for user in rows_before_fetch)
+        body, headers, _stale = await state.fetch_upstream(
+            force_sas=True, allow_sas_failure=not needs_sas)
     except HTTPException:
         async with pool.acquire() as conn:
             if selected_ids:
@@ -1747,7 +1839,7 @@ async def sync_manifest(request: Request):
 
     async with pool.acquire() as conn:
         settings = await _settings(conn)
-        servers = await _sync_servers(conn, body)
+        servers = await _sync_servers(conn, body, primary_body=state.upstream_body, sas_body=state.sas_body)
         if selected_ids:
             rows = await conn.fetch("SELECT * FROM users WHERE id=ANY($1::bigint[]) ORDER BY id", selected_ids)
         else:

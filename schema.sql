@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS users (
     announce_override TEXT,
     traffic_limit_bytes BIGINT CHECK (traffic_limit_bytes IS NULL OR traffic_limit_bytes BETWEEN 1000000 AND 1000000000000),
     hide_traffic_usage BOOLEAN NOT NULL DEFAULT FALSE,
+    include_sas BOOLEAN NOT NULL DEFAULT TRUE,
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'pending_delete')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -19,11 +20,13 @@ CREATE TABLE IF NOT EXISTS users (
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS traffic_limit_bytes BIGINT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS hide_traffic_usage BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS include_sas BOOLEAN NOT NULL DEFAULT TRUE;
 
 CREATE TABLE IF NOT EXISTS servers (
     id TEXT PRIMARY KEY,
     original_name TEXT NOT NULL,
     source_key TEXT,
+    source TEXT NOT NULL DEFAULT 'unknown',
     custom_name TEXT,
     hidden BOOLEAN NOT NULL DEFAULT FALSE,
     sort_order INTEGER NOT NULL DEFAULT 0,
@@ -34,6 +37,7 @@ CREATE TABLE IF NOT EXISTS servers (
 
 -- Existing databases may have been created before provider-name identity was added.
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS source_key TEXT;
+ALTER TABLE servers ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'unknown';
 CREATE INDEX IF NOT EXISTS servers_source_key_idx ON servers(source_key);
 
 CREATE TABLE IF NOT EXISTS user_servers (
