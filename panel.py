@@ -619,20 +619,30 @@ class PanelState:
                 raise ValueError("Apps Script не подтвердил доставку")
             failed = int(result.get("failed", 0) or 0)
             processed = int(result.get("processed", 0) or 0)
-            self.drive_push_last = time.time()
+            if result.get("pending") and result.get("ok"):
+                self.drive_push_error = None
+                return {"ok": True, "pending": True,
+                        "message": "Изменения приняты; Google Drive обновится при ближайшей автоматической синхронизации.",
+                        "processed": processed, "failed": 0}
             if failed:
+                detail = _safe_sync_error(result.get("error"))
                 self.drive_push_error = f"Apps Script обработал {processed} записей, ошибок: {failed}"
-                return {"ok": False, "pending": False, "message": self.drive_push_error,
+                if detail:
+                    self.drive_push_error += f" ({detail})"
+                return {"ok": False, "pending": bool(result.get("pending")), "message": self.drive_push_error,
                         "processed": processed, "failed": failed}
             if not result.get("ok"):
-                raise ValueError("Apps Script не подтвердил доставку")
+                raise ValueError(_safe_sync_error(result.get("error")) or "Apps Script не подтвердил доставку")
+            self.drive_push_last = time.time()
             self.drive_push_error = None
             return {"ok": True, "pending": False,
                     "message": self.drive_push_error or "Изменения сразу отправлены в Google Drive",
                     "processed": processed, "failed": 0}
         except Exception as exc:
             self.drive_push_error = "Не удалось сразу обновить Google Drive; автоматическая попытка повторится позже"
-            log.warning("Immediate Drive update failed (%s)", type(exc).__name__)
+            safe_detail = _safe_sync_error(str(exc))
+            log.warning("Immediate Drive update failed (%s%s)", type(exc).__name__,
+                        f": {safe_detail}" if safe_detail else "")
             return {"ok": False, "pending": True, "message": self.drive_push_error}
 
     def _upstream_headers_for_panel(self) -> dict[str, str]:
