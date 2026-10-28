@@ -439,6 +439,7 @@
   }
 
   function resultText(result, label) {
+    if (result?.drive_sync?.ok && result.drive_sync.pending) return `${label} · ${result.drive_sync.message}`;
     if (result?.drive_sync?.ok) return `${label} · Drive обновлён`;
     if (result?.drive_sync) return `${label} · ${result.drive_sync.message}`;
     return label;
