@@ -516,6 +516,7 @@ class PanelState:
         self.upstream_body: bytes | None = None
         self.upstream_headers: dict[str, str] = {}
         self.upstream_fetched_at = 0.0
+        self.upstream_success_at: float | None = None
         self.upstream_attempt_at = 0.0
         self.upstream_warning: str | None = None
         self.sas_body: bytes | None = None
@@ -525,6 +526,7 @@ class PanelState:
         self.sas_warning: str | None = None
         self.combined_body: bytes | None = None
         self.combined_fetched_at = 0.0
+        self.combined_success_at: float | None = None
         self.upstream_lock = asyncio.Lock()
         self.announce_cache: tuple[int, str] | None = None
         self.announce_quote: str | None = None
@@ -662,6 +664,7 @@ class PanelState:
             self.upstream_body = response.content
             self.upstream_headers = {k.lower(): v for k, v in response.headers.items()}
             self.upstream_fetched_at = time.monotonic()
+            self.upstream_success_at = time.time()
             self.upstream_warning = None
             log.info("Panel upstream cache updated: bytes=%d; servers=%d", len(response.content), len(_extract_uris(_decode_subscription(response.content))))
             return self.upstream_body, False
@@ -751,6 +754,7 @@ class PanelState:
 
             self.combined_body = combined_body
             self.combined_fetched_at = time.monotonic()
+            self.combined_success_at = time.time()
             warnings = [warning for warning in (self.upstream_warning, self.sas_warning) if warning]
             self.upstream_warning = " · ".join(warnings) or None
             return combined_body, self.upstream_headers, primary_stale or sas_stale
@@ -1435,6 +1439,11 @@ async def me(request: Request):
 @router.get("/api/admin/dashboard")
 async def dashboard(request: Request):
     _auth(request)
+    try:
+        await state.fetch_upstream()
+    except HTTPException:
+        # The overview should remain accessible even while a source is down.
+        pass
     pool = await state.db(required=False)
     db_info = {"connected": pool is not None, "error": state.db_error if pool is None else None}
     user_count = {"active": 0, "disabled": 0, "total": 0}
@@ -1455,11 +1464,30 @@ async def dashboard(request: Request):
         info = _userinfo(state.upstream_headers)
     parts = dict(token.strip().split("=", 1) for token in info.split(";") if "=" in token)
     data = {k: int(v) if str(v).isdigit() else 0 for k, v in parts.items()}
+    primary_server_count = 0
+    if state.upstream_body is not None:
+        try:
+            primary_server_count = len(_extract_uris(_decode_subscription(state.upstream_body)))
+        except (ValueError, UnicodeDecodeError):
+            primary_server_count = 0
+    sas_server_count = 0
+    if state.sas_body is not None:
+        try:
+            sas_server_count = sum(not is_excluded_sas_server(uri)
+                                   for uri in _extract_uris(_decode_subscription(state.sas_body)))
+        except (ValueError, UnicodeDecodeError):
+            sas_server_count = 0
     return {"database": db_info, "upstream": {"cached": state.upstream_body is not None,
-            "last_success_at": state.combined_fetched_at or state.upstream_fetched_at or None,
+            "last_success_at": state.combined_success_at or state.upstream_success_at,
             "server_count": len(_extract_uris(_decode_subscription(state.combined_body or state.upstream_body))) if (state.combined_body or state.upstream_body) else 0,
             "warning": state.upstream_warning}, "traffic": {"upload": data.get("upload", 0), "download": data.get("download", 0),
             "total": data.get("total", 0), "expire": data.get("expire", 0)}, "users": user_count,
+            "sources": {"primary": {"configured": bool(os.getenv("SUBSCRIPTION_URL", "").strip()),
+                                     "server_count": primary_server_count},
+                        "sas": {"configured": bool(os.getenv("SAS_SUBSCRIPTION_URL", "").strip()),
+                                "server_count": sas_server_count,
+                                "last_success_at": state.sas_success_at,
+                                "warning": state.sas_warning}},
             "last_script_request": last_script, "sync_errors": errors, "sync_enabled": state.sync_configured,
             "drive_delivery": {"configured": state.drive_push_configured,
                                "last_success_at": state.drive_push_last or None,
