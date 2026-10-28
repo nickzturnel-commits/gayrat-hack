@@ -27,8 +27,8 @@
 /* Hide decorative browser scrollbars, while keeping touch, wheel and trackpad scrolling. */
 html, body, * { scrollbar-width: none; -ms-overflow-style: none; }
 *::-webkit-scrollbar { display: none; width: 0; height: 0; }
-html { min-width: 320px; min-height: 100%; background: var(--bg); }
-body { min-width: 320px; min-height: 100vh; margin: 0; overflow-x: hidden; background: radial-gradient(ellipse at 52% -22%, #ffffff0b, transparent 54%), var(--bg); color: var(--text); }
+html { min-width: 320px; min-height: 100%; overflow-x: clip; background: var(--bg); }
+body { min-width: 320px; min-height: 100vh; margin: 0; overflow-x: clip; background: radial-gradient(ellipse at 52% -22%, #ffffff0b, transparent 54%), var(--bg); color: var(--text); }
 body::before { position: fixed; z-index: -2; inset: 0; pointer-events: none; content: ""; opacity: .24; background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.12'/%3E%3C/svg%3E"); }
 button, input, textarea, select { font: inherit; }
 button { color: inherit; }
@@ -90,8 +90,8 @@ input:hover, textarea:hover, select:hover { border-color: #ffffff22; }
 input:focus, textarea:focus, select:focus { border-color: #ffffff60; background: #0a0b0de8; box-shadow: 0 0 0 3px #ffffff0b; }
 textarea { min-height: 100px; resize: vertical; }
 .error-card { margin-top: 17px; padding: 13px 14px; border: 1px solid #784c4c66; border-radius: 12px; background: #321c1c55; color: #efb5b5; font-size: 13px; }
-.desktop-shell { width: min(1500px, 100%); min-height: calc(100vh - 86px); margin: 0 auto; padding: 0 38px 38px; display: grid; grid-template-columns: 256px minmax(0, 1fr); align-items: start; gap: 22px; }
-.sidebar { position: sticky; top: 20px; min-height: calc(100vh - 120px); display: flex; flex-direction: column; padding: 20px 13px 13px; border-radius: 20px; }
+.desktop-shell { width: min(1500px, 100%); min-height: calc(100vh - 86px); margin: 0 auto; padding: 0 38px 38px; display: grid; grid-template-columns: 256px minmax(0, 1fr); align-items: start; gap: 22px; overflow: visible; }
+.sidebar { position: sticky; align-self: start; top: 18px; max-height: calc(100dvh - 36px); min-height: calc(100vh - 120px); display: flex; flex-direction: column; overflow-y: auto; overscroll-behavior: contain; padding: 20px 13px 13px; border-radius: 20px; }
 .sidebar-label { padding: 5px 12px 14px; }
 .nav-list { display: grid; gap: 5px; }
 .nav-item { width: 100%; min-height: 48px; display: grid; grid-template-columns: 24px 1fr 15px; align-items: center; gap: 11px; padding: 0 12px; border: 1px solid transparent; border-radius: 13px; background: transparent; color: #a6a6ad; text-align: left; cursor: pointer; transition: color .18s, background .18s, border-color .18s; }
@@ -706,9 +706,6 @@ input:focus, textarea:focus, select:focus { background: rgba(17,20,28,.5); }
 .mobile-content .bulk-actions .button { flex: 1; }
 .mobile-content .server-card-actions { flex-wrap: wrap; }
 .mobile-content .server-card-actions .button { flex: 1 1 auto; justify-content: center; }
-.mobile-content .subscription-fields, .mobile-content .source-choice-grid { grid-template-columns: 1fr; }
-.mobile-content .subscription-form .form-section { padding: 18px 15px; }
-.mobile-content .subscription-form .form-actions { bottom: -22px; padding: 12px 15px; }
 .mobile-content .rename-row { grid-template-columns: 1fr; }
 .mobile-content .rename-row > .button { justify-content: center; }
 .mobile-content .source-health-grid { grid-template-columns: 1fr; }
@@ -719,7 +716,81 @@ input:focus, textarea:focus, select:focus { background: rgba(17,20,28,.5); }
   .mobile-content .collection-overview { justify-content: space-between; gap: 7px; }
   .mobile-content .overview-divider { height: 26px; }
   .mobile-content .collection-overview strong { font-size: 13px; }
-  .mobile-content .source-choice { grid-template-columns: 18px minmax(0,1fr); }
-  .mobile-content .choice-count { grid-column: 2; justify-self: start; }
   .mobile-content .server-id { max-width: 130px; overflow: hidden; text-overflow: ellipsis; }
+}
+
+/* The subscription dialog lives directly under <body>, outside .mobile-content. */
+@media (max-width: 760px) {
+  .mobile-ui .modal-shell {
+    width: min(560px, calc(100vw - 20px));
+    max-height: calc(100dvh - 28px);
+    padding: 17px 15px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    scroll-padding-bottom: 24px;
+    border-radius: 21px;
+    background: linear-gradient(145deg, rgba(255,255,255,.09), rgba(255,255,255,.015) 38%), rgba(15,16,17,.985);
+    backdrop-filter: blur(18px) saturate(120%);
+    -webkit-backdrop-filter: blur(18px) saturate(120%);
+  }
+  .mobile-ui .modal-shell .modal-top {
+    background: #111213;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+  .mobile-ui .modal-shell .subscription-form {
+    margin: 0 -15px -17px;
+  }
+  .mobile-ui .modal-shell .subscription-form .form-section {
+    gap: 13px;
+    padding: 18px 15px;
+  }
+  .mobile-ui .modal-shell .subscription-form .form-section h3 {
+    font-size: 17px;
+    line-height: 1.3;
+  }
+  .mobile-ui .modal-shell .subscription-fields,
+  .mobile-ui .modal-shell .source-choice-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .mobile-ui .modal-shell .source-choice {
+    min-height: 0;
+    grid-template-columns: 18px minmax(0, 1fr);
+    align-items: start;
+    gap: 8px 10px;
+    padding: 14px;
+  }
+  .mobile-ui .modal-shell .choice-copy b { font-size: 13px; line-height: 1.35; }
+  .mobile-ui .modal-shell .choice-copy small { font-size: 12px; line-height: 1.45; }
+  .mobile-ui .modal-shell .choice-count {
+    grid-column: 2;
+    justify-self: start;
+    white-space: normal;
+  }
+  .mobile-ui .modal-shell .subscription-fields > label { min-width: 0; }
+  .mobile-ui .modal-shell .subscription-fields input,
+  .mobile-ui .modal-shell .subscription-fields textarea { max-width: 100%; }
+  .mobile-ui .modal-shell .access-switch {
+    min-height: 64px;
+    align-self: stretch;
+  }
+  .mobile-ui .modal-shell .subscription-form .form-actions {
+    bottom: -17px;
+    padding: 12px 15px calc(12px + env(safe-area-inset-bottom));
+    background: rgba(15,16,17,.985);
+    -webkit-backdrop-filter: blur(18px);
+    backdrop-filter: blur(18px);
+  }
+  .mobile-ui .modal-shell .subscription-form .form-actions .button {
+    min-height: 52px;
+    padding-inline: 14px;
+    line-height: 1.35;
+    white-space: normal;
+    text-align: center;
+  }
+}
+@media (max-width: 760px) and (max-height: 700px) {
+  .mobile-ui .modal-shell .subscription-form .form-actions { position: static; }
 }
