@@ -3,6 +3,7 @@ const SX = {
   PROP_URL: 'RENDER_URL',
   PROP_KEY: 'SYNC_KEY',
   CURSOR: 'SYNC_CURSOR',
+  PENDING_SYNC: 'DRIVE_SYNC_PENDING',
   WEATHER_CACHE: 'ASHGABAT_WEATHER_V1',
   WEATHER_CACHE_SECONDS: 240,
   WEATHER_URL: 'https://api.open-meteo.com/v1/forecast?latitude=37.9601&longitude=58.3261&current=temperature_2m&timezone=Asia%2FAshgabat',
@@ -33,38 +34,67 @@ function doPost(e) {
       return json_({ ok: false, error: 'Недействительные настройки или доступ.' });
     }
     if (data.action !== 'sync') return json_({ ok: false, error: 'Неизвестное действие.' });
+    const wasPending = props.getProperty(SX.PENDING_SYNC) === '1';
+    // Remember this request before trying the lock. If another delivery or the
+    // five-minute trigger is using Drive, it will be retried automatically.
+    props.setProperty(SX.PENDING_SYNC, '1');
     lock = LockService.getScriptLock();
-    lock.waitLock(15000);
-
-    const manifest = fetchManifest_(base, key, Array.isArray(data.user_ids) ? data.user_ids : null);
-    if (!manifest || !Array.isArray(manifest.users) || !manifest.users.length) {
-      return json_({ ok: false, error: 'Манифест пуст или недоступен.' });
+    if (!lock.tryLock(1500)) {
+      Logger.log('Drive занят; запрос сохранён для автоматической синхронизации.');
+      return json_({ ok: true, pending: true, processed: 0, failed: 0 });
     }
-    if (manifest.partial) Logger.log('Апстрим недоступен; выполняются только отзываемые подписки. Остальные профили не меняются.');
-    const wanted = Array.isArray(data.user_ids) ? new Set(data.user_ids.map(String)) : null;
-    const users = wanted ? manifest.users.filter(user => wanted.has(String(user.id))) : manifest.users;
+
     let processed = 0;
-    let failed = manifest.partial ? 1 : 0;
-    users.forEach(user => {
-      try {
-        processUser_(base, key, user);
-        processed++;
-      } catch (err) {
-        failed++;
-        const message = safeError_(err);
-        Logger.log('Немедленная доставка не удалась для id=' + String(user && user.id) + ': ' + message);
-        if (user && user.id != null) {
-          try {
-            const rememberedId = PropertiesService.getScriptProperties().getProperty('PENDING_FILE_' + user.id);
-            report_(base, key, user.id, user.drive_file_id || rememberedId || null, false, message);
-          } catch (reportErr) {
-            Logger.log('Не удалось отправить отчёт для id=' + String(user.id) + '.');
+    let failed = 0;
+    let firstError = '';
+    let pass = 0;
+    let userIds = wasPending ? null : (Array.isArray(data.user_ids) ? data.user_ids : null);
+    let pending = false;
+    // Coalesce edits that arrive while a Drive update is running. A second
+    // pass reads the latest manifest; more changes remain queued for updateSub.
+    while (pass < 2) {
+      props.deleteProperty(SX.PENDING_SYNC);
+      const manifest = fetchManifest_(base, key, userIds);
+      if (!manifest || !Array.isArray(manifest.users) || !manifest.users.length) {
+        props.setProperty(SX.PENDING_SYNC, '1');
+        return json_({ ok: false, pending: true, error: 'Манифест пуст или недоступен.' });
+      }
+      if (manifest.partial) {
+        Logger.log('Апстрим недоступен; выполняются только отзываемые подписки. Остальные профили не меняются.');
+      }
+      const wanted = Array.isArray(userIds) ? new Set(userIds.map(String)) : null;
+      const users = wanted ? manifest.users.filter(user => wanted.has(String(user.id))) : manifest.users;
+      let passFailed = 0;
+      let passError = '';
+      users.forEach(user => {
+        try {
+          processUserWithRetry_(base, key, user);
+          processed++;
+        } catch (err) {
+          passFailed++;
+          const message = safeError_(err);
+          if (!passError) passError = message;
+          Logger.log('Немедленная доставка не удалась для id=' + String(user && user.id) + ': ' + message);
+          if (user && user.id != null) {
+            try {
+              const rememberedId = props.getProperty('PENDING_FILE_' + user.id);
+              report_(base, key, user.id, user.drive_file_id || rememberedId || null, false, message);
+            } catch (reportErr) {
+              Logger.log('Не удалось отправить отчёт для id=' + String(user.id) + '.');
+            }
           }
         }
-      }
-    });
-    Logger.log('Немедленная доставка: обработано ' + processed + ', ошибок ' + failed + '.');
-    return json_({ ok: failed === 0, processed: processed, failed: failed });
+      });
+      failed = passFailed;
+      firstError = passError || firstError;
+      pass++;
+      pending = manifest.partial || props.getProperty(SX.PENDING_SYNC) === '1';
+      if (!pending || manifest.partial || pass >= 2) break;
+      userIds = null;
+    }
+    if (pending) props.setProperty(SX.PENDING_SYNC, '1');
+    Logger.log('Немедленная доставка: обработано ' + processed + ', ошибок ' + failed + (pending ? ', ожидает повторения.' : '.'));
+    return json_({ ok: failed === 0, pending: pending, processed: processed, failed: failed, error: firstError || undefined });
   } catch (err) {
     Logger.log('Немедленная доставка не выполнена (' + safeError_(err) + ').');
     return json_({ ok: false, error: 'Не удалось выполнить доставку.' });
@@ -101,6 +131,10 @@ function updateSub() {
     Logger.log('Синхронизация пропущена: выполните setup() после задания Script Properties.');
     return;
   }
+
+  // updateSub always fetches the complete current manifest, so it also drains
+  // any request left queued when an immediate delivery found Drive busy.
+  props.deleteProperty(SX.PENDING_SYNC);
 
   const manifest = fetchManifest_(base, key);
   if (!manifest || !Array.isArray(manifest.users) || manifest.users.length === 0) {
@@ -270,6 +304,20 @@ function processUser_(base, key, user) {
   report_(base, key, user.id, fileId, true, null);
   props.deleteProperty('PENDING_FILE_' + user.id);
   Logger.log('Пользователь id=' + user.id + ': файл синхронизирован.');
+}
+
+function processUserWithRetry_(base, key, user) {
+  let lastError;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      processUser_(base, key, user);
+      return;
+    } catch (err) {
+      lastError = err;
+      if (attempt < 2) Utilities.sleep(800);
+    }
+  }
+  throw lastError;
 }
 
 function base64Utf8_(value) {
