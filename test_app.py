@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import time
 import unittest
 from unittest.mock import patch
 
@@ -35,9 +36,13 @@ class SubscriptionRelayTests(unittest.IsolatedAsyncioTestCase):
         self.previous_snapshot = relay._snapshot
         self.previous_headers = relay._upstream_headers
         self.previous_task = relay._refresh_task
+        self.previous_sas_url = relay.SAS_SUBSCRIPTION_URL
+        self.previous_sas_snapshots = relay._sas_snapshots.copy()
         relay.SUBSCRIPTION_URL = "https://subscription.invalid/private"
+        relay.SAS_SUBSCRIPTION_URL = ""
         relay._snapshot = None
         relay._upstream_headers = None
+        relay._sas_snapshots.clear()
         relay._refresh_task = None
 
     async def asyncTearDown(self):
@@ -51,8 +56,11 @@ class SubscriptionRelayTests(unittest.IsolatedAsyncioTestCase):
             await relay.http.aclose()
         relay.http = self.previous_http
         relay.SUBSCRIPTION_URL = self.previous_url
+        relay.SAS_SUBSCRIPTION_URL = self.previous_sas_url
         relay._snapshot = self.previous_snapshot
         relay._upstream_headers = self.previous_headers
+        relay._sas_snapshots.clear()
+        relay._sas_snapshots.update(self.previous_sas_snapshots)
         relay._refresh_task = self.previous_task
 
     async def test_first_request_fetches_and_serves_raw_subscription(self):
@@ -99,6 +107,9 @@ class SubscriptionRelayTests(unittest.IsolatedAsyncioTestCase):
             await relay.current_snapshot(make_request([]))
 
         self.assertEqual(caught.exception.status_code, 503)
+
+    async def test_relay_refreshes_the_combined_subscription_every_five_minutes(self):
+        self.assertEqual(relay.REFRESH_INTERVAL_SECONDS, 5 * 60)
 
     async def test_profile_diagnostics_never_include_header_values(self):
         summary = relay._profile_summary(
@@ -173,6 +184,61 @@ class SubscriptionRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(browser_response.body, b"profile=Browser/test")
         self.assertEqual(happ_response.body, b"profile=Happ/test")
         self.assertEqual(seen, ["Browser/test", "Happ/test"])
+
+    async def test_relay_combines_primary_and_sas_and_keeps_primary_metadata(self):
+        main_uri = "vless://main-id@main.example:443#Main"
+        sas_uri = "trojan://sas-secret@sas.example:443#SAS%20Node"
+        body_by_url = {
+            "https://subscription.invalid/private": base64.b64encode(main_uri.encode()),
+            "https://sas.invalid/": base64.b64encode(f"{sas_uri}\n{main_uri}".encode()),
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = body_by_url[str(request.url)]
+            headers = {"content-type": "text/plain; charset=utf-8"}
+            if str(request.url) == "https://subscription.invalid/private":
+                headers["subscription-userinfo"] = "upload=7; download=11; total=99; expire=0"
+            return httpx.Response(200, content=body, headers=headers)
+
+        relay.SAS_SUBSCRIPTION_URL = "https://sas.invalid/"
+        relay.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        response = await relay.serve_subscription(make_request([(b"user-agent", b"Happ/test")]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.body.decode().splitlines(), [main_uri, sas_uri])
+        self.assertEqual(response.headers["subscription-userinfo"], "upload=7; download=11; total=99; expire=0")
+        self.assertTrue(response.headers["content-type"].startswith("text/plain"))
+
+    async def test_relay_uses_last_good_sas_snapshot_when_sas_is_temporarily_unavailable(self):
+        main_uri = "vless://main-id@main.example:443#Main"
+        sas_uri = "vless://sas-id@sas.example:443#SAS"
+        headers = {"user-agent": "Happ/test"}
+        cache_key = tuple(sorted(headers.items()))
+        relay.SAS_SUBSCRIPTION_URL = "https://sas.invalid/"
+        relay._sas_snapshots[cache_key] = relay.SubscriptionSnapshot(sas_uri.encode(), {}, time.monotonic() - 600)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == "https://sas.invalid/":
+                return httpx.Response(503, text="temporarily unavailable")
+            return httpx.Response(200, content=main_uri.encode(), headers={"content-type": "text/plain"})
+
+        relay.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        response = await relay.serve_subscription(make_request([(b"user-agent", b"Happ/test")]))
+        self.assertEqual(response.body.decode().splitlines(), [main_uri, sas_uri])
+
+    async def test_relay_does_not_publish_partial_feed_before_first_sas_snapshot(self):
+        relay.SAS_SUBSCRIPTION_URL = "https://sas.invalid/"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == "https://sas.invalid/":
+                return httpx.Response(503, text="temporarily unavailable")
+            return httpx.Response(200, content=b"vless://main-id@main.example:443#Main", headers={"content-type": "text/plain"})
+
+        relay.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with self.assertRaises(HTTPException) as caught:
+            await relay.serve_subscription(make_request([(b"user-agent", b"Happ/test")]))
+        self.assertEqual(caught.exception.status_code, 502)
+        self.assertIsNone(relay._snapshot)
 
     async def test_html_page_is_rejected_and_not_cached(self):
         relay.http = httpx.AsyncClient(

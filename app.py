@@ -19,7 +19,8 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 SUBSCRIPTION_URL = os.getenv("SUBSCRIPTION_URL", "").strip()
-REFRESH_INTERVAL_SECONDS = 15 * 60
+SAS_SUBSCRIPTION_URL = os.getenv("SAS_SUBSCRIPTION_URL", "").strip()
+REFRESH_INTERVAL_SECONDS = 5 * 60
 REQUEST_HEADERS = frozenset(
     {
         "user-agent",
@@ -68,6 +69,7 @@ class SubscriptionSnapshot:
 http: httpx.AsyncClient | None = None
 _snapshot: SubscriptionSnapshot | None = None
 _upstream_headers: dict[str, str] | None = None
+_sas_snapshots: dict[tuple[tuple[str, str], ...], SubscriptionSnapshot] = {}
 _refresh_task: asyncio.Task | None = None
 _refresh_lock = asyncio.Lock()
 
@@ -189,11 +191,53 @@ async def _fetch_snapshot(headers: dict[str, str]) -> SubscriptionSnapshot:
             detail="Upstream returned a web page instead of subscription data.",
         )
 
+    body = upstream.content
+    if SAS_SUBSCRIPTION_URL:
+        profile_key = tuple(sorted(headers.items()))
+        try:
+            sas = await http.get(SAS_SUBSCRIPTION_URL, headers=headers)
+            if sas.status_code >= 400:
+                raise ValueError(f"SAS ответил HTTP {sas.status_code}")
+            invalid = admin_panel._invalid_payload(sas.content, sas.headers.get("content-type", ""))
+            if invalid:
+                raise ValueError(invalid)
+            body = admin_panel.merge_subscription_bodies(
+                upstream.content,
+                sas.content,
+                upstream.headers.get("content-type", ""),
+                sas.headers.get("content-type", ""),
+            )
+            _sas_snapshots[profile_key] = SubscriptionSnapshot(
+                body=sas.content,
+                headers={},
+                fetched_at=time.monotonic(),
+            )
+            if len(_sas_snapshots) > 64:
+                oldest_key = min(_sas_snapshots, key=lambda key: _sas_snapshots[key].fetched_at)
+                _sas_snapshots.pop(oldest_key, None)
+        except Exception as exc:
+            cached_sas = _sas_snapshots.get(profile_key)
+            if cached_sas is None:
+                logger.warning("SAS subscription fetch failed (%s); no saved SAS snapshot is available.", type(exc).__name__)
+                raise HTTPException(status_code=502, detail="Could not fetch the SAS subscription.") from exc
+            try:
+                body = admin_panel.merge_subscription_bodies(
+                    upstream.content,
+                    cached_sas.body,
+                    upstream.headers.get("content-type", ""),
+                    "text/plain",
+                )
+            except ValueError as merge_exc:
+                raise HTTPException(status_code=502, detail="Could not build the combined subscription.") from merge_exc
+            logger.warning("SAS subscription refresh failed (%s); serving the last good SAS snapshot.", type(exc).__name__)
+
     response_headers = {
         name.lower(): value
         for name, value in upstream.headers.items()
         if name.lower() not in SKIP_RESPONSE_HEADERS
     }
+    if SAS_SUBSCRIPTION_URL:
+        response_headers["content-type"] = "text/plain; charset=utf-8"
     response_headers["cache-control"] = "no-store, no-cache, must-revalidate"
     logger.info(
         "Fetched subscription payload (content-type=%s, bytes=%d, device-headers=%s).",
@@ -202,7 +246,7 @@ async def _fetch_snapshot(headers: dict[str, str]) -> SubscriptionSnapshot:
         ",".join(sorted(name for name in headers if name.startswith("x-"))) or "none",
     )
     return SubscriptionSnapshot(
-        body=upstream.content,
+        body=body,
         headers=response_headers,
         fetched_at=time.monotonic(),
     )
@@ -266,8 +310,9 @@ async def lifespan(_: FastAPI):
     global http, _refresh_task
     http = httpx.AsyncClient(follow_redirects=True, timeout=20.0)
     logger.info(
-        "Relay started (subscription-url-configured=%s, fixed-hwid-configured=%s, fixed-user-agent-configured=%s).",
+        "Relay started (subscription-url-configured=%s, sas-url-configured=%s, fixed-hwid-configured=%s, fixed-user-agent-configured=%s).",
         "yes" if SUBSCRIPTION_URL else "no",
+        "yes" if SAS_SUBSCRIPTION_URL else "no",
         "yes" if os.getenv("UPSTREAM_X_HWID", "").strip() else "no",
         "yes" if os.getenv("UPSTREAM_USER_AGENT", "").strip() else "no",
     )

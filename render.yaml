@@ -10,6 +10,8 @@ services:
         value: 3.12.8
       - key: SUBSCRIPTION_URL
         sync: false
+      - key: SAS_SUBSCRIPTION_URL
+        value: https://sas-c3nt.onrender.com/
       - key: UPSTREAM_X_HWID
         sync: false
       - key: UPSTREAM_USER_AGENT

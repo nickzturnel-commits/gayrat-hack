@@ -187,3 +187,15 @@ test('expired profiles remain active records and update their placeholder file',
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, 'https://render.example/api/sync/report');
 });
+
+test('unchanged profiles do not rewrite their Google Drive file', () => {
+  const content = '#profile-title: Secure X\nvless://same@server.example:443#Main\n';
+  const { sandbox, calls, file } = loadScript({ currentContent: content });
+  sandbox.processUser_('https://render.example', 'sync-key', {
+    id: 14, slug: 'same-profile', status: 'active', drive_file_id: 'same-file', content
+  });
+
+  assert.equal(file.contentWritten, undefined);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'https://render.example/api/sync/report');
+});

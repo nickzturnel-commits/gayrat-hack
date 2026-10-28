@@ -3,6 +3,7 @@ import json
 import os
 import unittest
 from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs, urlsplit
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -243,6 +244,95 @@ class UriTests(unittest.TestCase):
                 self.assertEqual(uris, [expected])
                 self.assertIsNone(panel._invalid_payload(body, "application/json"))
 
+    def test_sas_xray_profile_list_converts_vless_and_preserves_transport_security(self):
+        xhttp_outbound = {
+            "tag": "proxy-0", "protocol": "vless",
+            "settings": {"vnext": [{"address": "203.0.113.20", "port": 443, "users": [
+                {"id": "00000000-0000-4000-8000-000000000020", "encryption": "none", "flow": ""}
+            ]}]},
+            "streamSettings": {
+                "network": "xhttp", "security": "tls",
+                "tlsSettings": {"serverName": "cdn.example", "fingerprint": "chrome", "alpn": ["h3"]},
+                "xhttpSettings": {"path": "/edge", "host": "cdn.example", "mode": "auto",
+                                  "extra": {"scMaxConcurrentPosts": 8}},
+                "finalmask": {"XDNS": {"enabled": True}},
+            },
+        }
+        reality_outbound = {
+            "tag": "proxy", "protocol": "vless",
+            "settings": {"vnext": [{"address": "203.0.113.21", "port": 8443, "users": [
+                {"id": "00000000-0000-4000-8000-000000000021", "encryption": "none", "flow": "xtls-rprx-vision"}
+            ]}]},
+            "streamSettings": {
+                "network": "grpc", "security": "reality",
+                "realitySettings": {"serverName": "real.example", "fingerprint": "firefox",
+                                    "publicKey": "fixture-public-key", "shortId": "1a2b", "spiderX": "/"},
+                "grpcSettings": {"serviceName": "service.v1", "multiMode": True},
+            },
+        }
+        profile_json = json.dumps([
+            {"remarks": "🇪🇺 Автовыбор", "outbounds": [xhttp_outbound, reality_outbound,
+                {"tag": "direct", "protocol": "freedom", "settings": {}}]},
+            {"remarks": "SAS Frankfurt", "outbounds": [xhttp_outbound]},
+            {"remarks": "SAS Reality", "outbounds": [reality_outbound]},
+        ], ensure_ascii=False)
+
+        uris = panel._extract_uris(panel._decode_subscription(profile_json.encode("utf-8")))
+        by_name = {panel.parse_server_uri(uri)["name"]: uri for uri in uris}
+
+        self.assertEqual(set(by_name), {"SAS Frankfurt", "SAS Reality"})
+        xhttp = parse_qs(urlsplit(by_name["SAS Frankfurt"]).query)
+        self.assertEqual(xhttp["type"], ["xhttp"])
+        self.assertEqual(xhttp["security"], ["tls"])
+        self.assertEqual(xhttp["sni"], ["cdn.example"])
+        self.assertEqual(xhttp["fp"], ["chrome"])
+        self.assertEqual(xhttp["alpn"], ["h3"])
+        self.assertEqual(xhttp["path"], ["/edge"])
+        self.assertEqual(xhttp["host"], ["cdn.example"])
+        self.assertEqual(json.loads(xhttp["extra"][0]), {"scMaxConcurrentPosts": 8})
+        self.assertEqual(json.loads(xhttp["fm"][0]), {"XDNS": {"enabled": True}})
+
+        grpc = parse_qs(urlsplit(by_name["SAS Reality"]).query)
+        self.assertEqual(grpc["type"], ["grpc"])
+        self.assertEqual(grpc["security"], ["reality"])
+        self.assertEqual(grpc["flow"], ["xtls-rprx-vision"])
+        self.assertEqual(grpc["pbk"], ["fixture-public-key"])
+        self.assertEqual(grpc["sid"], ["1a2b"])
+        self.assertEqual(grpc["spx"], ["/"])
+        self.assertEqual(grpc["serviceName"], ["service.v1"])
+        self.assertEqual(grpc["mode"], ["multi"])
+
+    def test_merger_combines_primary_uri_list_with_sas_json_profiles(self):
+        primary_uri = "vless://primary@primary.example:443?encryption=none&type=tcp#Primary"
+        sas_profile = [{
+            "remarks": "SAS Frankfurt",
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": {"vnext": [{"address": "203.0.113.22", "port": 443, "users": [
+                    {"id": "00000000-0000-4000-8000-000000000022", "encryption": "none"}
+                ]}]},
+                "streamSettings": {"network": "ws", "security": "tls",
+                                   "tlsSettings": {"serverName": "ws.example", "fingerprint": "chrome"},
+                                   "wsSettings": {"path": "/stream", "headers": {"Host": "cdn.example"}}},
+            }],
+        }]
+        merged = panel.merge_subscription_bodies(
+            base64.b64encode(primary_uri.encode()),
+            json.dumps(sas_profile).encode(),
+            "text/plain",
+            "application/json",
+        ).decode()
+
+        self.assertEqual(len(panel._extract_uris(merged)), 2)
+        self.assertTrue(merged.startswith(primary_uri + "\n"))
+        self.assertIn("#SAS%20Frankfurt", merged)
+        sas_uri = next(uri for uri in panel._extract_uris(merged) if "SAS%20Frankfurt" in uri)
+        sas_params = parse_qs(urlsplit(sas_uri).query)
+        self.assertEqual(sas_params["type"], ["ws"])
+        self.assertEqual(sas_params["security"], ["tls"])
+        self.assertEqual(sas_params["path"], ["/stream"])
+        self.assertEqual(sas_params["host"], ["cdn.example"])
+
     def test_ss_uri_without_fragment_is_a_valid_server_line(self):
         userinfo = base64.urlsafe_b64encode(b"chacha20-ietf-poly1305:fixture-password").decode().rstrip("=")
         uri = f"ss://{userinfo}@203.0.113.46:869"
@@ -436,6 +526,95 @@ class UpstreamCacheTests(unittest.IsolatedAsyncioTestCase):
             body, _, stale = await self.state.fetch_upstream()
         self.assertIn(b"vless://", body)
         self.assertFalse(stale)
+
+    async def test_primary_and_sas_feeds_merge_in_order_and_keep_primary_headers(self):
+        main_uri = "vless://main-id@main.example:443#Main"
+        sas_uri = "trojan://sas-secret@sas.example:443#SAS%20Node"
+
+        def handler(request):
+            if str(request.url) == "https://primary.invalid/path":
+                return httpx.Response(200, content=base64.b64encode(main_uri.encode()), headers={
+                    "content-type": "text/plain", "subscription-userinfo": "upload=1; download=2; total=9; expire=0"
+                })
+            self.assertEqual(str(request.url), "https://sas.invalid/")
+            return httpx.Response(200, content=base64.b64encode(f"{sas_uri}\n{main_uri}".encode()), headers={
+                "content-type": "text/plain"
+            })
+
+        self.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch.dict(os.environ, {
+            "SUBSCRIPTION_URL": "https://primary.invalid/path",
+            "SAS_SUBSCRIPTION_URL": "https://sas.invalid/",
+        }, clear=True):
+            body, headers, stale = await self.state.fetch_upstream()
+
+        self.assertEqual(body.decode().splitlines(), [main_uri, sas_uri])
+        self.assertEqual(headers["subscription-userinfo"], "upload=1; download=2; total=9; expire=0")
+        self.assertFalse(stale)
+
+    async def test_manifest_style_forced_sas_refresh_picks_up_changed_servers(self):
+        sas_body = [b"vless://sas-one@sas.example:443#SAS-One", b"vless://sas-two@sas.example:443#SAS-Two"]
+        sas_calls = 0
+
+        def handler(request):
+            nonlocal sas_calls
+            if str(request.url) == "https://primary.invalid/path":
+                return httpx.Response(200, content=b"vless://main@main.example:443#Main", headers={"content-type": "text/plain"})
+            sas_calls += 1
+            return httpx.Response(200, content=sas_body[min(sas_calls - 1, 1)], headers={"content-type": "text/plain"})
+
+        self.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch.dict(os.environ, {
+            "SUBSCRIPTION_URL": "https://primary.invalid/path",
+            "SAS_SUBSCRIPTION_URL": "https://sas.invalid/",
+        }, clear=True):
+            first, _, _ = await self.state.fetch_upstream(force_sas=True)
+            second, _, _ = await self.state.fetch_upstream(force_sas=True)
+
+        self.assertIn(b"sas-one", first)
+        self.assertIn(b"sas-two", second)
+        self.assertEqual(sas_calls, 2)
+
+    async def test_sas_failure_uses_last_good_copy_and_marks_combined_data_stale(self):
+        calls = 0
+
+        def handler(request):
+            nonlocal calls
+            if str(request.url) == "https://primary.invalid/path":
+                return httpx.Response(200, content=b"vless://main@main.example:443#Main", headers={"content-type": "text/plain"})
+            calls += 1
+            if calls == 1:
+                return httpx.Response(200, content=b"vless://sas@sas.example:443#SAS", headers={"content-type": "text/plain"})
+            return httpx.Response(503, text="temporarily unavailable")
+
+        self.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch.dict(os.environ, {
+            "SUBSCRIPTION_URL": "https://primary.invalid/path",
+            "SAS_SUBSCRIPTION_URL": "https://sas.invalid/",
+        }, clear=True):
+            await self.state.fetch_upstream(force_sas=True)
+            body, _, stale = await self.state.fetch_upstream(force_sas=True)
+
+        self.assertIn(b"vless://sas@sas.example:443#SAS", body)
+        self.assertTrue(stale)
+        self.assertIn("SAS", self.state.upstream_warning)
+
+    async def test_cold_sas_failure_blocks_incomplete_combined_profile(self):
+        def handler(request):
+            if str(request.url) == "https://sas.invalid/":
+                return httpx.Response(503, text="temporarily unavailable")
+            return httpx.Response(200, content=b"vless://main@main.example:443#Main", headers={"content-type": "text/plain"})
+
+        self.state.upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch.dict(os.environ, {
+            "SUBSCRIPTION_URL": "https://primary.invalid/path",
+            "SAS_SUBSCRIPTION_URL": "https://sas.invalid/",
+        }, clear=True):
+            with self.assertRaises(HTTPException) as caught:
+                await self.state.fetch_upstream(force_sas=True)
+
+        self.assertEqual(caught.exception.status_code, 502)
+        self.assertIsNone(self.state.combined_body)
 
 
 class AnnouncementWeatherTests(unittest.IsolatedAsyncioTestCase):
@@ -704,6 +883,31 @@ class DriveSyncPushTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ManifestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manifest_forces_sas_refresh_and_includes_servers_in_every_profile(self):
+        body = b"vless://main@main.example:443#Main\nvless://sas@sas.example:443#SAS"
+        users = [
+            {"id": 40, "slug": "legacy", "name": "Main profile", "note": "", "enabled": True,
+             "expires_at": None, "title_override": None, "announce_override": "", "status": "active",
+             "drive_file_id": panel.LEGACY_DRIVE_FILE_ID},
+            {"id": 41, "slug": "subscriber", "name": "Subscriber", "note": "", "enabled": True,
+             "expires_at": None, "title_override": None, "announce_override": "", "status": "active",
+             "drive_file_id": None},
+        ]
+        conn = FakeConn(users=users)
+        fetch = AsyncMock(return_value=(body, {"subscription-userinfo": "upload=1; download=2; total=9; expire=0"}, False))
+        with patch.dict(os.environ, {"SYNC_KEY": "sync"}, clear=False), \
+             patch.object(panel.state, "db", new=AsyncMock(return_value=FakePool(conn))), \
+             patch.object(panel.state, "fetch_upstream", new=fetch), \
+             patch.object(panel, "_settings", new=AsyncMock(return_value=dict(
+                 panel.DEFAULT_SETTINGS, announce_enabled=False))):
+            result = await panel.sync_manifest(make_request({"X-Sync-Key": "sync"}))
+
+        fetch.assert_awaited_once_with(force_sas=True)
+        self.assertEqual(len(result["users"]), 2)
+        for user in result["users"]:
+            self.assertIn("vless://main@main.example:443#Main", user["content"])
+            self.assertIn("vless://sas@sas.example:443#SAS", user["content"])
+
     async def test_sync_manifest_delivers_all_new_nodes_from_base64_with_spaced_names(self):
         provider_text = "\n".join([
             "vless://uuid@de.example:443?security=tls#Germany West 01",

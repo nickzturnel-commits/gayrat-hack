@@ -17,7 +17,7 @@ import secrets
 import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 import asyncpg
 import httpx
@@ -121,61 +121,222 @@ def _slugify(name: str) -> str:
     return f"{base}-{secrets.token_hex(3)}"
 
 
-def _xray_json_ss_uris(text: str) -> list[str] | None:
-    """Convert Xray Shadowsocks outbounds to standard SIP002 links.
-
-    Xray client exports are not subscription text files: they wrap each proxy
-    in `outbounds[].settings.servers[]`. Returning None means the input was not
-    an Xray-style JSON profile; an empty list means it was JSON but contained
-    no supported Shadowsocks outbound.
-    """
+def _xray_json_uris(text: str) -> list[str] | None:
+    """Convert supported Xray JSON outbounds to standard proxy share links."""
     try:
         document = json.loads(text)
     except (TypeError, json.JSONDecodeError):
         return None
-    if not isinstance(document, dict) or not isinstance(document.get("outbounds"), list):
+    documents = document if isinstance(document, list) else [document]
+    documents = [item for item in documents if isinstance(item, dict) and isinstance(item.get("outbounds"), list)]
+    if not documents:
         return None
 
-    links: list[str] = []
-    for outbound in document["outbounds"]:
-        if not isinstance(outbound, dict) or str(outbound.get("protocol", "")).lower() not in {"ss", "shadowsocks"}:
+    by_identity: dict[str, tuple[int, str]] = {}
+
+    def add_link(uri: str, rank: int):
+        try:
+            identity = parse_server_uri(uri)["id"]
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return
+        previous = by_identity.get(identity)
+        if previous is None or rank > previous[0]:
+            by_identity[identity] = (rank, uri)
+
+    def valid_endpoint(address_value, port_value):
+        if not isinstance(address_value, str) or isinstance(port_value, bool):
+            return None
+        address = address_value.strip()
+        try:
+            port = int(port_value)
+        except (TypeError, ValueError):
+            return None
+        if not address or any(char.isspace() for char in address) or not 1 <= port <= 65535:
+            return None
+        host = f"[{address}]" if ":" in address and not address.startswith("[") else address
+        return host, port
+
+    def query_uri(scheme: str, userinfo: str, host: str, port: int,
+                  params: list[tuple[str, str]], label: str) -> str:
+        query = urlencode(params, doseq=True, quote_via=quote, safe="")
+        return f"{scheme}://{userinfo}@{host}:{port}?{query}#{quote(label, safe='')}"
+
+    for profile in documents:
+        outbounds = profile["outbounds"]
+        if not isinstance(outbounds, list):
             continue
-        settings = outbound.get("settings")
-        servers = settings.get("servers") if isinstance(settings, dict) else None
-        if not isinstance(servers, list):
-            continue
-        for index, server in enumerate(servers, 1):
-            if not isinstance(server, dict):
+        vless_outbounds = [item for item in outbounds
+                           if isinstance(item, dict) and str(item.get("protocol", "")).lower() == "vless"]
+        profile_name = str(profile.get("remarks") or "").strip()
+        singleton_profile = len(vless_outbounds) == 1
+
+        for outbound in outbounds:
+            if not isinstance(outbound, dict):
                 continue
-            address_value = server.get("address")
-            method_value = server.get("method")
-            password = server.get("password")
-            port_value = server.get("port")
-            if (not isinstance(address_value, str) or not isinstance(method_value, str)
-                    or not isinstance(password, str) or not password
-                    or isinstance(port_value, bool)):
-                continue
-            address = address_value.strip()
-            method = method_value.strip()
-            if not address or not method:
-                continue
-            try:
-                port = int(port_value)
-            except (TypeError, ValueError):
-                continue
-            if not 1 <= port <= 65535 or any(char.isspace() for char in address):
+            protocol = str(outbound.get("protocol", "")).lower()
+            settings = outbound.get("settings") if isinstance(outbound.get("settings"), dict) else {}
+            if protocol in {"ss", "shadowsocks"}:
+                servers = settings.get("servers")
+                if not isinstance(servers, list):
+                    continue
+                for index, server in enumerate(servers, 1):
+                    if not isinstance(server, dict):
+                        continue
+                    endpoint = valid_endpoint(server.get("address"), server.get("port"))
+                    method, password = server.get("method"), server.get("password")
+                    if endpoint is None or not isinstance(method, str) or not isinstance(password, str) or not password:
+                        continue
+                    host, port = endpoint
+                    auth = base64.urlsafe_b64encode(f"{method.strip()}:{password}".encode("utf-8")).decode("ascii").rstrip("=")
+                    remark = str(outbound.get("remarks") or outbound.get("tag") or profile_name).strip()
+                    if len(servers) > 1 and remark:
+                        remark = f"{remark} {index}"
+                    label = remark or f"{host}:{port}"
+                    add_link(f"ss://{auth}@{host}:{port}#{quote(label, safe='')}", 2 if remark else 0)
                 continue
 
-            # SIP002 uses URL-safe Base64 for method:password. Bracket IPv6
-            # literals so the endpoint remains unambiguous to URI parsers.
-            endpoint = f"[{address}]" if ":" in address and not address.startswith("[") else address
-            userinfo = base64.urlsafe_b64encode(f"{method}:{password}".encode("utf-8")).decode("ascii").rstrip("=")
-            remark = (document.get("remarks") or outbound.get("remarks") or outbound.get("tag") or "")
-            if len(servers) > 1 and remark:
-                remark = f"{remark} {index}"
-            label = str(remark).strip() or f"{address}:{port}"
-            links.append(f"ss://{userinfo}@{endpoint}:{port}#{quote(label, safe='')}")
-    return links
+            if protocol != "vless":
+                continue
+            vnext = settings.get("vnext")
+            if not isinstance(vnext, list):
+                continue
+            stream = outbound.get("streamSettings") if isinstance(outbound.get("streamSettings"), dict) else {}
+            network = str(stream.get("network") or "tcp").lower()
+            if network not in {"tcp", "kcp", "ws", "http", "grpc", "httpupgrade", "xhttp"}:
+                continue
+            security = str(stream.get("security") or "none").lower()
+            tls = stream.get("tlsSettings") if isinstance(stream.get("tlsSettings"), dict) else {}
+            reality = stream.get("realitySettings") if isinstance(stream.get("realitySettings"), dict) else {}
+            transport = {
+                key: stream.get(key) for key in
+                ("tcpSettings", "kcpSettings", "wsSettings", "httpSettings", "grpcSettings", "httpupgradeSettings", "xhttpSettings")
+                if isinstance(stream.get(key), dict)
+            }
+            outbound_tag = str(outbound.get("remarks") or outbound.get("tag") or "").strip()
+            generic_tag = bool(re.fullmatch(r"(?:proxy|outbound|vless)(?:[-_ ]?\d+)?", outbound_tag, flags=re.I))
+
+            for server_index, server in enumerate(vnext, 1):
+                if not isinstance(server, dict):
+                    continue
+                endpoint = valid_endpoint(server.get("address"), server.get("port"))
+                users = server.get("users")
+                if endpoint is None or not isinstance(users, list):
+                    continue
+                host, port = endpoint
+                for user_index, user in enumerate(users, 1):
+                    if not isinstance(user, dict) or not isinstance(user.get("id"), str) or not user["id"].strip():
+                        continue
+                    params: list[tuple[str, str]] = [("encryption", str(user.get("encryption") or "none")),
+                                                     ("type", network)]
+                    flow = str(user.get("flow") or "").strip()
+                    if flow:
+                        params.append(("flow", flow))
+                    if security in {"tls", "reality"}:
+                        params.append(("security", security))
+                        secure_settings = reality if security == "reality" else tls
+                        sni = secure_settings.get("serverName")
+                        if isinstance(sni, str) and sni:
+                            params.append(("sni", sni))
+                        fingerprint = secure_settings.get("fingerprint")
+                        if isinstance(fingerprint, str) and fingerprint:
+                            params.append(("fp", fingerprint))
+                        alpn = secure_settings.get("alpn")
+                        if isinstance(alpn, list) and alpn:
+                            params.append(("alpn", ",".join(str(item) for item in alpn)))
+                        if security == "reality":
+                            public_key = reality.get("publicKey") or reality.get("password")
+                            short_id = reality.get("shortId")
+                            spider_x = reality.get("spiderX")
+                            if isinstance(public_key, str) and public_key:
+                                params.append(("pbk", public_key))
+                            if isinstance(short_id, str) and short_id:
+                                params.append(("sid", short_id))
+                            if isinstance(spider_x, str) and spider_x:
+                                params.append(("spx", spider_x))
+                            for key in ("pqv",):
+                                value = reality.get(key)
+                                if isinstance(value, str) and value:
+                                    params.append((key, value))
+                    elif security != "none":
+                        continue
+
+                    connection = transport.get(f"{network}Settings", {})
+                    if network in {"ws", "httpupgrade"}:
+                        path = connection.get("path")
+                        if isinstance(path, str) and path:
+                            params.append(("path", path))
+                        host_header = connection.get("host")
+                        if network == "ws" and isinstance(connection.get("headers"), dict):
+                            host_header = connection["headers"].get("Host") or host_header
+                        if isinstance(host_header, str) and host_header:
+                            params.append(("host", host_header))
+                    elif network == "grpc":
+                        service_name = connection.get("serviceName")
+                        authority = connection.get("authority")
+                        if isinstance(service_name, str) and service_name:
+                            params.append(("serviceName", service_name))
+                        if isinstance(authority, str) and authority:
+                            params.append(("authority", authority))
+                        mode = connection.get("mode")
+                        if not isinstance(mode, str) or not mode:
+                            mode = "multi" if connection.get("multiMode") else "gun"
+                        if mode != "gun":
+                            params.append(("mode", mode))
+                    elif network == "xhttp":
+                        path = connection.get("path")
+                        host_header = connection.get("host")
+                        mode = connection.get("mode")
+                        if isinstance(path, str) and path:
+                            params.append(("path", path))
+                        if isinstance(host_header, str) and host_header:
+                            params.append(("host", host_header))
+                        if isinstance(mode, str) and mode:
+                            params.append(("mode", mode))
+                        extra = connection.get("extra")
+                        if isinstance(extra, dict):
+                            params.append(("extra", json.dumps(extra, separators=(",", ":"), ensure_ascii=False)))
+                        elif isinstance(extra, str) and extra:
+                            params.append(("extra", extra))
+                    elif network == "kcp":
+                        header = connection.get("header")
+                        if isinstance(header, dict) and isinstance(header.get("type"), str) and header["type"]:
+                            params.append(("headerType", header["type"]))
+                        for key in ("seed", "mtu", "tti"):
+                            value = connection.get(key)
+                            if isinstance(value, (str, int, float)) and not isinstance(value, bool) and str(value):
+                                params.append((key, str(value)))
+                    elif network == "tcp":
+                        header = connection.get("header")
+                        if isinstance(header, dict) and isinstance(header.get("type"), str) and header["type"] != "none":
+                            params.append(("headerType", header["type"]))
+                            request = header.get("request") if isinstance(header.get("request"), dict) else {}
+                            path_values = request.get("path")
+                            if isinstance(path_values, list) and path_values:
+                                params.append(("path", ",".join(str(item) for item in path_values)))
+                            request_headers = request.get("headers") if isinstance(request.get("headers"), dict) else {}
+                            host_values = request_headers.get("Host")
+                            if isinstance(host_values, list) and host_values:
+                                params.append(("host", ",".join(str(item) for item in host_values)))
+                    finalmask = stream.get("finalmask")
+                    if isinstance(finalmask, (dict, list)) and finalmask:
+                        params.append(("fm", json.dumps(finalmask, separators=(",", ":"), ensure_ascii=False)))
+
+                    if singleton_profile and profile_name:
+                        label, rank = profile_name, 3
+                    elif outbound_tag and not generic_tag:
+                        label, rank = outbound_tag, 2
+                    elif profile_name and not re.search(r"(?i)auto|автовыбор|selector", profile_name):
+                        label, rank = profile_name, 1
+                    else:
+                        label, rank = f"{host}:{port}", 0
+                    if len(vnext) > 1:
+                        label = f"{label} {server_index}"
+                    if len(users) > 1:
+                        label = f"{label} {user_index}"
+                    uri = query_uri("vless", quote(user["id"].strip(), safe="-._~"), host, port, params, label)
+                    add_link(uri, rank)
+
+    return [uri for _rank, uri in by_identity.values()]
 
 
 def _decode_subscription(body: bytes) -> str:
@@ -190,7 +351,7 @@ def _decode_subscription(body: bytes) -> str:
         decoded_text = decoded.decode("utf-8-sig").strip()
         if URI_ANY.search(decoded_text):
             return decoded_text
-        converted = _xray_json_ss_uris(decoded_text)
+        converted = _xray_json_uris(decoded_text)
         if converted:
             return "\n".join(converted)
     except (ValueError, UnicodeDecodeError):
@@ -254,7 +415,7 @@ def _extract_uris(text: str) -> list[str]:
     # `#Germany West` is valid input for clients even though it contains spaces.
     # Only allow those spaces after `#`; whitespace in the connection part
     # would make the URI ambiguous and is treated as malformed.
-    converted = _xray_json_ss_uris(text)
+    converted = _xray_json_uris(text)
     if converted is not None:
         text = "\n".join(converted)
     uris = []
@@ -309,6 +470,29 @@ def _invalid_payload(body: bytes, content_type: str) -> str | None:
     return None
 
 
+def merge_subscription_bodies(primary_body: bytes, secondary_body: bytes,
+                              primary_content_type: str = "",
+                              secondary_content_type: str = "") -> bytes:
+    """Return a plain-text union of supported server URIs from two feeds."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for body, content_type, source in (
+        (primary_body, primary_content_type, "основной подписки"),
+        (secondary_body, secondary_content_type, "SAS"),
+    ):
+        invalid = _invalid_payload(body, content_type)
+        if invalid:
+            raise ValueError(f"Некорректный источник {source}: {invalid}")
+        uris = _extract_uris(_decode_subscription(body))
+        if not uris:
+            raise ValueError(f"Источник {source} не содержит поддерживаемых VPN-серверов")
+        for uri in uris:
+            if uri not in seen:
+                seen.add(uri)
+                merged.append(uri)
+    return ("\n".join(merged) + "\n").encode("utf-8")
+
+
 class PanelState:
     def __init__(self):
         self.pool = None
@@ -320,6 +504,12 @@ class PanelState:
         self.upstream_fetched_at = 0.0
         self.upstream_attempt_at = 0.0
         self.upstream_warning: str | None = None
+        self.sas_body: bytes | None = None
+        self.sas_fetched_at = 0.0
+        self.sas_attempt_at = 0.0
+        self.sas_warning: str | None = None
+        self.combined_body: bytes | None = None
+        self.combined_fetched_at = 0.0
         self.upstream_lock = asyncio.Lock()
         self.announce_cache: tuple[int, str] | None = None
         self.announce_quote: str | None = None
@@ -428,60 +618,115 @@ class PanelState:
             log.warning("Immediate Drive update failed (%s)", type(exc).__name__)
             return {"ok": False, "pending": True, "message": self.drive_push_error}
 
-    async def fetch_upstream(self, force=False):
+    def _upstream_headers_for_panel(self) -> dict[str, str]:
+        headers = {}
+        names = {"UPSTREAM_USER_AGENT": "User-Agent", "UPSTREAM_X_HWID": "X-HWID",
+                 "UPSTREAM_X_DEVICE_INFO": "X-Device-Info", "UPSTREAM_X_DEVICE_MODEL": "X-Device-Model",
+                 "UPSTREAM_X_DEVICE_OS": "X-Device-OS", "UPSTREAM_X_VER_OS": "X-Ver-OS",
+                 "UPSTREAM_X_APP_VERSION": "X-App-Version"}
+        for env_name, header in names.items():
+            value = os.getenv(env_name, "").strip()
+            if value:
+                headers[header] = value
+        headers.setdefault("User-Agent", PANEL_UPSTREAM_DEFAULT_USER_AGENT)
+        return headers
+
+    async def _fetch_primary_locked(self, url: str, headers: dict[str, str], force: bool):
         now = time.monotonic()
         fresh = self.upstream_body is not None and now - self.upstream_fetched_at < PANEL_CACHE_TTL_SECONDS
         if fresh and not force:
-            return self.upstream_body, self.upstream_headers, False
+            return self.upstream_body, False
+        self.upstream_attempt_at = time.time()
+        try:
+            response = await self.upstream_client.get(url, headers=headers)
+            if response.status_code >= 400:
+                raise ValueError(f"Апстрим ответил HTTP {response.status_code}")
+            invalid = _invalid_payload(response.content, response.headers.get("content-type", ""))
+            if invalid:
+                raise ValueError(invalid)
+            self.upstream_body = response.content
+            self.upstream_headers = {k.lower(): v for k, v in response.headers.items()}
+            self.upstream_fetched_at = time.monotonic()
+            self.upstream_warning = None
+            log.info("Panel upstream cache updated: bytes=%d; servers=%d", len(response.content), len(_extract_uris(_decode_subscription(response.content))))
+            return self.upstream_body, False
+        except Exception as exc:
+            self.upstream_warning = "Не удалось получить актуальную подписку от основного апстрима"
+            if isinstance(exc, ValueError):
+                self.upstream_warning = str(exc)
+            log.warning("Panel upstream request failed (%s)", type(exc).__name__)
+            if self.upstream_body is not None:
+                return self.upstream_body, True
+            raise HTTPException(502, self.upstream_warning) from exc
+
+    async def _fetch_sas_locked(self, url: str, headers: dict[str, str], force: bool):
+        now = time.monotonic()
+        fresh = self.sas_body is not None and now - self.sas_fetched_at < PANEL_CACHE_TTL_SECONDS
+        if fresh and not force:
+            return self.sas_body, False
+        self.sas_attempt_at = time.time()
+        try:
+            response = await self.upstream_client.get(url, headers=headers)
+            if response.status_code >= 400:
+                raise ValueError(f"SAS ответил HTTP {response.status_code}")
+            invalid = _invalid_payload(response.content, response.headers.get("content-type", ""))
+            if invalid:
+                raise ValueError(invalid)
+            self.sas_body = response.content
+            self.sas_fetched_at = time.monotonic()
+            self.sas_warning = None
+            log.info("SAS subscription cache updated: bytes=%d; servers=%d", len(response.content), len(_extract_uris(_decode_subscription(response.content))))
+            return self.sas_body, False
+        except Exception as exc:
+            self.sas_warning = "Не удалось обновить подписку SAS; используется последняя удачная копия"
+            log.warning("SAS subscription refresh failed (%s)", type(exc).__name__)
+            if self.sas_body is not None:
+                return self.sas_body, True
+            self.sas_warning = "Не удалось получить подписку SAS; объединённый профиль пока не готов"
+            raise HTTPException(502, self.sas_warning) from exc
+
+    async def fetch_upstream(self, force=False, force_sas=False):
         async with self.upstream_lock:
-            now = time.monotonic()
-            fresh = self.upstream_body is not None and now - self.upstream_fetched_at < PANEL_CACHE_TTL_SECONDS
-            if fresh and not force:
-                return self.upstream_body, self.upstream_headers, False
-            url = os.getenv("SUBSCRIPTION_URL", "").strip()
-            if not url:
-                self.upstream_warning = "SUBSCRIPTION_URL не задан"
-                if self.upstream_body is not None:
-                    return self.upstream_body, self.upstream_headers, True
-                raise HTTPException(503, self.upstream_warning)
+            primary_url = os.getenv("SUBSCRIPTION_URL", "").strip()
             if self.upstream_client is None:
                 self.upstream_client = httpx.AsyncClient(follow_redirects=True, timeout=UPSTREAM_TIMEOUT_SECONDS)
-            headers = {}
-            names = {"UPSTREAM_USER_AGENT": "User-Agent", "UPSTREAM_X_HWID": "X-HWID",
-                     "UPSTREAM_X_DEVICE_INFO": "X-Device-Info", "UPSTREAM_X_DEVICE_MODEL": "X-Device-Model",
-                     "UPSTREAM_X_DEVICE_OS": "X-Device-OS", "UPSTREAM_X_VER_OS": "X-Ver-OS",
-                     "UPSTREAM_X_APP_VERSION": "X-App-Version"}
-            for env_name, header in names.items():
-                value = os.getenv(env_name, "").strip()
-                if value:
-                    headers[header] = value
-            headers.setdefault("User-Agent", PANEL_UPSTREAM_DEFAULT_USER_AGENT)
-            self.upstream_attempt_at = time.time()
-            try:
-                response = await self.upstream_client.get(url, headers=headers)
-                if response.status_code >= 400:
-                    raise ValueError(f"Апстрим ответил HTTP {response.status_code}")
-                invalid = _invalid_payload(response.content, response.headers.get("content-type", ""))
-                if invalid:
-                    self.upstream_warning = invalid
-                    log.warning("Panel upstream update rejected: %s; status=%d bytes=%d", invalid, response.status_code, len(response.content))
-                    if self.upstream_body is not None:
-                        return self.upstream_body, self.upstream_headers, True
-                    raise HTTPException(502, invalid)
-                self.upstream_body = response.content
-                self.upstream_headers = {k.lower(): v for k, v in response.headers.items()}
-                self.upstream_fetched_at = time.monotonic()
-                self.upstream_warning = None
-                log.info("Panel upstream cache updated: bytes=%d; servers=%d", len(response.content), len(_extract_uris(_decode_subscription(response.content))))
-                return self.upstream_body, self.upstream_headers, False
-            except HTTPException:
-                raise
-            except Exception as exc:
-                self.upstream_warning = "Не удалось получить актуальную подписку от апстрима"
-                log.warning("Panel upstream request failed (%s)", type(exc).__name__)
-                if self.upstream_body is not None:
-                    return self.upstream_body, self.upstream_headers, True
-                raise HTTPException(502, self.upstream_warning) from exc
+            headers = self._upstream_headers_for_panel()
+            if primary_url:
+                primary_body, primary_stale = await self._fetch_primary_locked(primary_url, headers, force)
+            elif self.upstream_body is not None:
+                self.upstream_warning = "SUBSCRIPTION_URL не задан; используется последняя удачная копия"
+                primary_body, primary_stale = self.upstream_body, True
+            else:
+                self.upstream_warning = "SUBSCRIPTION_URL не задан"
+                raise HTTPException(503, self.upstream_warning)
+
+            sas_url = os.getenv("SAS_SUBSCRIPTION_URL", "").strip()
+            sas_stale = False
+            if sas_url:
+                sas_body, sas_stale = await self._fetch_sas_locked(sas_url, headers, force or force_sas)
+                try:
+                    combined_body = merge_subscription_bodies(
+                        primary_body,
+                        sas_body,
+                        self.upstream_headers.get("content-type", ""),
+                        "text/plain",
+                    )
+                except ValueError as exc:
+                    self.sas_warning = "Не удалось сформировать объединённый профиль SAS"
+                    log.warning("Combined subscription rejected (%s)", type(exc).__name__)
+                    if self.combined_body is None:
+                        raise HTTPException(502, self.sas_warning) from exc
+                    combined_body = self.combined_body
+                    sas_stale = True
+            else:
+                combined_body = primary_body
+                self.sas_warning = None
+
+            self.combined_body = combined_body
+            self.combined_fetched_at = time.monotonic()
+            warnings = [warning for warning in (self.upstream_warning, self.sas_warning) if warning]
+            self.upstream_warning = " · ".join(warnings) or None
+            return combined_body, self.upstream_headers, primary_stale or sas_stale
 
 
 state = PanelState()
@@ -1146,7 +1391,8 @@ async def dashboard(request: Request):
     parts = dict(token.strip().split("=", 1) for token in info.split(";") if "=" in token)
     data = {k: int(v) if str(v).isdigit() else 0 for k, v in parts.items()}
     return {"database": db_info, "upstream": {"cached": state.upstream_body is not None,
-            "last_success_at": state.upstream_fetched_at or None, "server_count": len(_extract_uris(_decode_subscription(state.upstream_body))) if state.upstream_body else 0,
+            "last_success_at": state.combined_fetched_at or state.upstream_fetched_at or None,
+            "server_count": len(_extract_uris(_decode_subscription(state.combined_body or state.upstream_body))) if (state.combined_body or state.upstream_body) else 0,
             "warning": state.upstream_warning}, "traffic": {"upload": data.get("upload", 0), "download": data.get("download", 0),
             "total": data.get("total", 0), "expire": data.get("expire", 0)}, "users": user_count,
             "last_script_request": last_script, "sync_errors": errors, "sync_enabled": state.sync_configured,
@@ -1440,7 +1686,8 @@ def _safe_sync_error(message: str | None) -> str | None:
     if not message:
         return None
     value = str(message)
-    for name in ("DATABASE_URL", "ADMIN_PASSWORD", "SESSION_SECRET", "SYNC_KEY", "DRIVE_API_KEY", "SUBSCRIPTION_URL"):
+    for name in ("DATABASE_URL", "ADMIN_PASSWORD", "SESSION_SECRET", "SYNC_KEY", "DRIVE_API_KEY",
+                 "SUBSCRIPTION_URL", "SAS_SUBSCRIPTION_URL"):
         secret = os.getenv(name, "")
         if secret:
             value = value.replace(secret, "[секрет скрыт]")
@@ -1481,7 +1728,9 @@ async def sync_manifest(request: Request):
     # If that fails, return only pending deletions so they can still be revoked;
     # active profiles remain untouched and the regular retry will refresh them.
     try:
-        body, headers, _stale = await state.fetch_upstream()
+        # The five-minute Apps Script poll bypasses the SAS cache so every
+        # scheduled manifest request checks for newly posted Telegram servers.
+        body, headers, _stale = await state.fetch_upstream(force_sas=True)
     except HTTPException:
         async with pool.acquire() as conn:
             if selected_ids:
