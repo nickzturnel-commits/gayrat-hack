@@ -159,6 +159,9 @@
     const data = await api('/api/admin/dashboard');
     const traffic = data.traffic || {};
     const delivery = data.drive_delivery || {};
+    const sources = data.sources || {};
+    const sas = sources.sas || {};
+    const primary = sources.primary || {};
     const banners = [
       !data.database.connected ? `<div class="alert-card">${esc(data.database.error || 'База данных недоступна')}</div>` : '',
       data.upstream.warning ? `<div class="alert-card">Апстрим: ${esc(data.upstream.warning)}. Используется последняя удачная копия, если она доступна.</div>` : '',
@@ -173,8 +176,16 @@
         <article class="stat-card"><div class="stat-icon">${svg('users')}</div><p>Пользователи</p><strong>${data.users.active} <span class="stat-divider">/</span> ${data.users.total}</strong><small>активны · отключено ${data.users.disabled}</small></article>
         <article class="stat-card"><div class="stat-icon">${svg('refresh')}</div><p>Трафик аккаунта провайдера</p><strong>${traffic.total ? `${esc(bytes((traffic.upload || 0) + (traffic.download || 0)))} / ${esc(bytes(traffic.total))}` : 'Безлимит'}</strong><small>Загрузка ${esc(bytes(traffic.upload))} · скачивание ${esc(bytes(traffic.download))}</small></article>
         <article class="stat-card"><div class="stat-icon">${svg('link')}</div><p>Google Drive</p><strong class="${delivery.configured ? 'tone-good' : 'tone-warn'}">${delivery.configured ? 'Синхронизация включена' : 'Не настроено'}</strong><small>Последнее обновление: ${esc(date(delivery.last_success_at))}</small></article>
-      </div>`
+      </div>
+      <section class="section-block source-health-block"><div class="section-heading"><div><p class="eyebrow">ПОДКЛЮЧЁННЫЕ ИСТОЧНИКИ</p><h2>Состав каталога</h2></div><span class="source-refresh-note">Обновление SAS каждые 5 минут</span></div>
+        <div class="source-health-grid">
+          <article class="source-health-card primary-health"><div class="health-card-head"><span class="health-source-mark">SX</span><span class="badge ${primary.configured ? 'badge-good' : 'badge-warn'}">${primary.configured ? 'Основной' : 'Не настроен'}</span></div><p>Secure X</p><strong>${Number(primary.server_count) || 0}<small> серверов</small></strong><div class="health-meter"><i style="width:${primary.configured ? '100%' : '0%'}"></i></div><small class="health-caption">Основная подписка проекта</small></article>
+          <article class="source-health-card sas-health"><div class="health-card-head"><span class="health-source-mark">SAS</span><span class="badge ${sas.warning ? 'badge-warn' : sas.configured ? 'badge-good' : 'badge-muted'}">${sas.warning ? 'Есть предупреждение' : sas.configured ? 'Подключён' : 'Не настроен'}</span></div><p>Источник SAS</p><strong>${Number(sas.server_count) || 0}<small> серверов</small></strong><div class="health-meter"><i style="width:${sas.configured ? '100%' : '0%'}"></i></div><small class="health-caption">${sas.warning ? esc(sas.warning) : sas.last_success_at ? `Обновлён ${esc(date(Number(sas.last_success_at) * 1000))}` : 'Ожидает первого обновления'}</small></article>
+        </div>
+        <div class="dashboard-shortcuts"><button type="button" class="button button-secondary" data-dashboard-page="users">${svg('users')}<span>Подписки</span></button><button type="button" class="button button-secondary" data-dashboard-page="servers">${svg('servers')}<span>Управлять серверами</span></button><button type="button" class="button button-secondary" data-dashboard-page="settings">${svg('settings')}<span>Настройки источников</span></button></div>
+      </section>`
       + (data.sync_errors?.length ? `<section class="section-block"><div class="section-heading"><div><p class="eyebrow">ТРЕБУЕТ ВНИМАНИЯ</p><h2>Ошибки синхронизации</h2></div></div><div class="card-list">${data.sync_errors.map(item => `<article class="surface-card"><h3>${esc(item.name)}</h3><p class="tone-bad">${esc(item.last_sync_error)}</p><small>${esc(date(item.last_synced_at))}</small></article>`).join('')}</div></section>` : '');
+    root.querySelectorAll('[data-dashboard-page]').forEach(button => button.addEventListener('click', () => setPage(button.dataset.dashboardPage)));
   }
 
   function releaseQrObjectUrl() {
@@ -325,10 +336,26 @@
   async function users(root) {
     const data = await api('/api/admin/users');
     const list = data.users || [];
-    root.innerHTML = pageHead('Пользователи', `<button id="addUser" class="button button-primary">${svg('plus')}<span>Добавить</span></button>`)
-      + (list.length ? `<div class="card-list">${list.map(user => {
+    const activeCount = list.filter(user => userStatus(user)[0] === 'Включена').length;
+    const sasCount = list.filter(user => user.include_sas !== false).length;
+    const inactiveCount = list.length - activeCount;
+    root.innerHTML = pageHead('Подписки', `<button id="addUser" class="button button-primary">${svg('plus')}<span>Создать подписку</span></button>`)
+      + (list.length ? `<section class="collection-toolbar surface-card">
+          <div class="collection-overview"><div><p class="eyebrow">ПРОФИЛИ GOOGLE DRIVE</p><strong>${list.length} <small>всего</small></strong></div><span class="overview-divider"></span><div><strong>${activeCount} <small>активны</small></strong></div><span class="overview-divider"></span><div><strong>${sasCount} <small>с SAS</small></strong></div></div>
+          <div class="collection-tools"><label class="search-box"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/></svg><input id="userSearch" type="search" autocomplete="off" placeholder="Найти подписку по имени или заметке"></label>
+            <div class="filter-pills" id="userFilters" aria-label="Фильтр подписок">
+              <button type="button" class="filter-chip active" data-user-filter="all" aria-pressed="true">Все <span>${list.length}</span></button>
+              <button type="button" class="filter-chip" data-user-filter="sas" aria-pressed="false">С SAS <span>${sasCount}</span></button>
+              <button type="button" class="filter-chip" data-user-filter="primary" aria-pressed="false">Только Secure X <span>${list.length - sasCount}</span></button>
+              <button type="button" class="filter-chip" data-user-filter="inactive" aria-pressed="false">Неактивные <span>${inactiveCount}</span></button>
+            </div>
+          </div>
+        </section>
+        <div class="result-caption"><span id="userResultCount">${list.length} подписок</span><span>Изменения отправляются в Google Drive</span></div>
+        <div class="card-list" id="userList">${list.map(user => {
         const [status, tone] = userStatus(user);
-        return `<article class="surface-card user-card">
+        const state = status === 'Включена' ? 'active' : 'inactive';
+        return `<article class="surface-card user-card" data-user-card data-user-name="${esc(`${user.name || ''} ${user.note || ''}`.toLowerCase())}" data-user-state="${state}" data-user-sas="${user.include_sas === false ? 'off' : 'on'}">
           <div class="user-card-head"><div class="avatar-mark">${esc((user.name || '?').trim().slice(0, 1).toUpperCase())}</div><div class="user-main"><h2>${esc(user.name)}</h2><p>${esc(user.note || 'Без заметки')}</p></div><span class="badge ${tone}">${status}</span><span class="badge ${user.drive_file_id ? 'badge-good' : 'badge-muted'}">${user.drive_file_id ? 'Drive готов' : 'Ожидает Drive'}</span><span class="badge ${user.include_sas === false ? 'badge-muted' : 'source-sas'}">${user.include_sas === false ? 'Только Secure X' : 'Secure X + SAS'}</span>${user.hide_traffic_usage && user.slug !== 'legacy' ? '<span class="badge badge-muted">Счётчик скрыт</span>' : ''}</div>
           <div class="user-meta"><span>Срок действия</span><strong>${esc(date(user.expires_at))}</strong></div>
           <div class="user-actions">
@@ -340,10 +367,42 @@
             <button class="button button-danger" data-delete="${user.id}" ${user.status === 'pending_delete' ? 'disabled' : ''}>${svg('trash')}<span>Удалить</span></button>
           </div>
         </article>`;
-      }).join('')}</div>` : '<div class="empty-state"><div class="empty-orbit">'+svg('users')+'</div><h2>Пока нет пользователей</h2><p>Добавьте подписку, чтобы создать профиль в Google Drive.</p></div>');
+      }).join('')}</div><div id="userFilterEmpty" class="filter-empty hidden"><div class="empty-orbit">${svg('users')}</div><h2>Ничего не найдено</h2><p>Измените запрос или выберите другой фильтр.</p></div>` : '<div class="empty-state"><div class="empty-orbit">'+svg('users')+'</div><h2>Пока нет подписок</h2><p>Создайте профиль, выберите серверы Secure X и SAS и получите ссылку Google Drive.</p><button class="button button-primary" id="addUserEmpty">'+svg('plus')+'<span>Создать подписку</span></button></div>');
     $('#addUser').addEventListener('click', async () => {
       try { await userForm(null); } catch (failure) { toast(failure.message); }
     });
+    if ($('#addUserEmpty')) $('#addUserEmpty').addEventListener('click', async () => {
+      try { await userForm(null); } catch (failure) { toast(failure.message); }
+    });
+    if ($('#userSearch')) {
+      const applyFilters = () => {
+        const query = ($('#userSearch').value || '').trim().toLocaleLowerCase('ru-RU');
+        const selected = $('.filter-chip.active', $('#userFilters'))?.dataset.userFilter || 'all';
+        let visible = 0;
+        $$('[data-user-card]', $('#userList')).forEach(card => {
+          const matchesQuery = !query || card.dataset.userName.includes(query);
+          const matchesFilter = selected === 'all'
+            || (selected === 'sas' && card.dataset.userSas === 'on')
+            || (selected === 'primary' && card.dataset.userSas === 'off')
+            || (selected === 'inactive' && card.dataset.userState === 'inactive');
+          card.hidden = !(matchesQuery && matchesFilter);
+          if (!card.hidden) visible++;
+        });
+        $('#userResultCount').textContent = `${visible} из ${list.length} подписок`;
+        $('#userFilterEmpty').classList.toggle('hidden', visible > 0);
+      };
+      $('#userSearch').addEventListener('input', applyFilters);
+      $('#userFilters').addEventListener('click', event => {
+        const chip = event.target.closest('[data-user-filter]');
+        if (!chip) return;
+        $$('.filter-chip', $('#userFilters')).forEach(item => {
+          const active = item === chip;
+          item.classList.toggle('active', active);
+          item.setAttribute('aria-pressed', String(active));
+        });
+        applyFilters();
+      });
+    }
     root.onclick = event => handleUserAction(event, list);
   }
 
@@ -398,24 +457,42 @@
     const includeSas = user ? user.include_sas !== false : defaultIncludeSas;
     const expiry = user?.expires_at ? new Date(user.expires_at) : null;
     const localExpiry = expiry ? new Date(expiry.getTime() - expiry.getTimezoneOffset() * 60000).toISOString().slice(0, 16) : '';
-    openModal(user ? 'Изменить пользователя' : 'Новая подписка', `<form id="userForm" class="form-grid">
-      <label>Имя пользователя<input name="name" required maxlength="120" value="${esc(user?.name || '')}" placeholder="Например, Иван"></label>
-      <label>Заметка<textarea name="note" maxlength="2000" rows="3" placeholder="Внутренняя заметка">${esc(user?.note || '')}</textarea></label>
-      <label>Срок подписки<input name="expires_at" type="datetime-local" value="${localExpiry}"><span class="field-hint">Оставьте пустым для подписки без срока. После указанного времени профиль получит один нерабочий сервер-заглушку.</span></label>
-      <label class="switch-row"><input name="enabled" type="checkbox" ${user?.enabled === false ? '' : 'checked'}><span class="switch"></span><span><b>Подписка включена</b><small>Отключённый профиль получит одну нерабочую заглушку.</small></span></label>
-      <label class="switch-row sas-switch-row"><input name="include_sas" type="checkbox" ${includeSas ? 'checked' : ''}><span class="switch"></span><span><b>Добавлять серверы SAS</b><small>Включено — Secure X и SAS. Выключено — только серверы Secure X. Изменение обновит ссылку в Drive.</small></span></label>
-      ${isLegacy ? '<div class="setting-note"><b>Счётчик трафика всегда виден</b><span>Это ваша основная подписка; в Happ показывается общий расход аккаунта провайдера.</span></div>' : `<label class="switch-row"><input name="hide_traffic_usage" type="checkbox" ${hideTraffic ? 'checked' : ''}><span class="switch"></span><span><b>Скрывать счётчик трафика в Happ</b><small>Выключено — показываются общие данные провайдера. Включено — строка трафика скрыта.</small></span></label>`}
-      <label>Заголовок профиля<input name="title_override" maxlength="200" value="${esc(user?.title_override || '')}" placeholder="Использовать название по умолчанию"></label>
-      <label>Объявление<textarea name="announce_override" maxlength="4000" rows="3" placeholder="Оставьте пустым для общего объявления">${esc(user?.announce_override || '')}</textarea></label>
-      <div class="form-actions"><button class="button button-primary" type="submit">Сохранить и обновить Drive</button></div>
+    openModal(user ? 'Настройки подписки' : 'Создание подписки', `<form id="userForm" class="subscription-form">
+      <section class="form-section"><p class="eyebrow">01 / ПРОФИЛЬ</p><h3>Кому выдаём подписку?</h3>
+        <div class="field-pair subscription-fields"><label>Имя пользователя<input name="name" required maxlength="120" value="${esc(user?.name || '')}" placeholder="Например, Иван"></label>
+          <label>Внутренняя заметка<textarea name="note" maxlength="2000" rows="2" placeholder="Например, тариф или контакт">${esc(user?.note || '')}</textarea></label></div>
+      </section>
+      <section class="form-section source-picker-section"><p class="eyebrow">02 / СОСТАВ ПОДПИСКИ</p><h3>Выберите источники серверов</h3>
+        <fieldset class="source-picker"><legend class="visually-hidden">Источники серверов</legend><div class="source-choice-grid">
+          <label class="source-choice ${includeSas ? 'selected' : ''}"><input type="radio" name="include_sas" value="with-sas" ${includeSas ? 'checked' : ''}><span class="choice-indicator"></span><span class="choice-copy"><b>Secure X + SAS</b><small>Серверы основного проекта и SAS</small></span><span class="choice-count">2 источника</span></label>
+          <label class="source-choice ${includeSas ? '' : 'selected'}"><input type="radio" name="include_sas" value="securex-only" ${includeSas ? '' : 'checked'}><span class="choice-indicator"></span><span class="choice-copy"><b>Только Secure X</b><small>Без серверов из SAS</small></span><span class="choice-count">1 источник</span></label>
+        </div></fieldset>
+        <p class="field-hint">LTE — Обход глушилок из SAS исключены автоматически. Изменение состава обновит профиль в Google Drive.</p>
+      </section>
+      <section class="form-section"><p class="eyebrow">03 / ДОСТУП</p><h3>Срок и состояние</h3>
+        <div class="field-pair subscription-fields"><label>Срок подписки<input name="expires_at" type="datetime-local" value="${localExpiry}"><span class="field-hint">Пустое поле — без срока.</span></label>
+          <label class="switch-row access-switch"><input name="enabled" type="checkbox" ${user?.enabled === false ? '' : 'checked'}><span class="switch"></span><span><b>Подписка включена</b><small>При отключении ссылка покажет заглушку.</small></span></label></div>
+        ${isLegacy ? '<div class="setting-note"><b>Счётчик трафика всегда виден</b><span>Это основная подписка; Happ показывает общий расход аккаунта провайдера.</span></div>' : `<label class="switch-row"><input name="hide_traffic_usage" type="checkbox" ${hideTraffic ? 'checked' : ''}><span class="switch"></span><span><b>Скрыть счётчик трафика</b><small>Управляет отображением общих данных провайдера в Happ.</small></span></label>`}
+      </section>
+      <section class="form-section"><p class="eyebrow">04 / ВИД ПРОФИЛЯ</p><h3>Заголовок и сообщение</h3>
+        <label>Заголовок профиля<input name="title_override" maxlength="200" value="${esc(user?.title_override || '')}" placeholder="Использовать название по умолчанию"></label>
+        <label>Объявление<textarea name="announce_override" maxlength="4000" rows="3" placeholder="Оставьте пустым для общего объявления">${esc(user?.announce_override || '')}</textarea></label>
+      </section>
+      <div class="form-actions"><button class="button button-primary" type="submit">${user ? 'Сохранить изменения' : 'Создать и синхронизировать'}</button></div>
     </form>`);
+    $('#userForm').addEventListener('change', event => {
+      if (event.target.name !== 'include_sas') return;
+      $$('.source-choice', $('#userForm')).forEach(choice => {
+        choice.classList.toggle('selected', $('input[name="include_sas"]', choice).checked);
+      });
+    });
     $('#userForm').addEventListener('submit', async event => {
       event.preventDefault();
       const form = event.currentTarget;
       const submit = $('button[type="submit"]', form);
       if (form.dataset.busy === '1') return;
       form.dataset.busy = '1'; submit.disabled = true;
-      submit.innerHTML = '<span class="spinner"></span><span>Сохраняю и обновляю Drive…</span>';
+      submit.innerHTML = `<span class="spinner"></span><span>${user ? 'Сохраняю изменения…' : 'Создаю профиль…'}</span>`;
       const values = new FormData(form);
       const expiryValue = values.get('expires_at');
       try {
@@ -426,7 +503,7 @@
           announce_override: values.get('announce_override') || null,
           // The legacy account always keeps the provider counter visible.
           hide_traffic_usage: isLegacy ? false : values.has('hide_traffic_usage'),
-          include_sas: values.has('include_sas'),
+          include_sas: values.get('include_sas') === 'with-sas',
           traffic_limit_bytes: user?.traffic_limit_bytes ?? null
         };
         const result = await api(user ? `/api/admin/users/${user.id}` : '/api/admin/users', {
@@ -437,7 +514,7 @@
         await render();
       } catch (failure) {
         form.dataset.busy = '0'; submit.disabled = false;
-        submit.innerHTML = `${svg('edit')}<span>Сохранить и обновить Drive</span>`;
+        submit.innerHTML = `<span>${user ? 'Сохранить изменения' : 'Создать и синхронизировать'}</span>`;
         toast(failure.message);
       }
     });
@@ -446,37 +523,71 @@
   async function userServers(userId) {
     const result = await api(`/api/admin/users/${userId}/servers`);
     const rows = result.servers || [];
-    openModal('Серверы пользователя', rows.length ? `<div class="card-list">${rows.map(server => `<article class="surface-card compact-card">
+    openModal('Серверы пользователя', rows.length ? `<div class="server-override-intro"><p>Личные настройки действуют только для этой подписки. Пустое имя наследует глобальное.</p></div><div class="card-list">${rows.map(server => `<article class="surface-card compact-card">
       <div class="list-title"><div><h3>${esc(server.user_name || server.global_name || server.original_name)}</h3><small>${server.source === 'sas' ? '<span class="source-inline">SAS</span> · ' : '<span class="source-inline source-securex">Secure X</span> · '}${esc(server.original_name)}${server.present_upstream ? '' : ' · отсутствует в апстриме'}</small></div></div>
-      <label>Имя только для этого пользователя<input data-us-name="${esc(server.id)}" value="${esc(server.user_name || '')}" placeholder="Использовать глобальное имя"><span class="field-hint">Очистите поле, чтобы вернуть глобальное имя.</span></label>
+      <div class="rename-row"><label>Имя для этой подписки<input data-us-name="${esc(server.id)}" value="${esc(server.user_name || '')}" placeholder="Использовать глобальное имя"></label><button type="button" class="button button-quiet" data-us-reset="${esc(server.id)}" ${server.user_name ? '' : 'disabled'}>Сбросить имя</button></div>
+      <span class="field-hint">Пустое значение использует глобальное имя сервера.</span>
       <label class="switch-row"><input type="checkbox" data-us-hidden="${esc(server.id)}" ${server.user_hidden === true ? 'checked' : ''}><span class="switch"></span><span><b>Скрыть у этого пользователя</b></span></label>
       <button class="button button-secondary" data-us-save="${esc(server.id)}">Сохранить и обновить Drive</button>
     </article>`).join('')}</div>` : '<div class="empty-state"><h2>Список серверов пуст</h2><p>Обновите сервера в соответствующем разделе.</p></div>');
     $('#modalBody').onclick = async event => {
-      const button = event.target.closest('[data-us-save]');
+      const resetButton = event.target.closest('[data-us-reset]');
+      const saveButton = event.target.closest('[data-us-save]');
+      const button = resetButton || saveButton;
       if (!button) return;
       button.disabled = true;
-      const serverId = button.dataset.usSave;
+      const serverId = button.dataset.usReset || button.dataset.usSave;
+      const server = rows.find(item => String(item.id) === serverId);
       try {
+        if (resetButton) $(`[data-us-name="${CSS.escape(serverId)}"]`).value = '';
         const saved = await api(`/api/admin/users/${userId}/servers/${serverId}`, { method: 'PUT', body: {
           hidden: $(`[data-us-hidden="${CSS.escape(serverId)}"]`).checked,
           custom_name: $(`[data-us-name="${CSS.escape(serverId)}"]`).value || null
         }});
-        toast(resultText(saved, 'Настройки сервера сохранены'));
-      } catch (failure) { button.disabled = false; toast(failure.message); }
+        if (server) {
+          server.user_name = $(`[data-us-name="${CSS.escape(serverId)}"]`).value || null;
+          const card = button.closest('.compact-card');
+          $('h3', card).textContent = server.user_name || server.global_name || server.original_name;
+        }
+        toast(resultText(saved, resetButton ? 'Личное имя сброшено' : 'Настройки сервера сохранены'));
+      } catch (failure) { toast(failure.message); }
+      finally { button.disabled = resetButton ? !server?.user_name : false; }
+    };
+    $('#modalBody').oninput = event => {
+      const field = event.target.closest('[data-us-name]');
+      if (!field) return;
+      const reset = $(`[data-us-reset="${CSS.escape(field.dataset.usName)}"]`);
+      if (reset) reset.disabled = !field.value.trim();
     };
   }
 
   async function servers(root) {
     const result = await api('/api/admin/servers');
     const list = result.servers || [];
-    root.innerHTML = pageHead('Серверы', `<button id="refreshServers" class="button button-secondary">${svg('refresh')}<span>Обновить список</span></button>`)
-      + (list.length ? `<div class="card-list">${list.map(server => `<article class="surface-card server-card">
-        <div class="server-card-head"><div class="server-mark">${svg('servers')}</div><div class="user-main"><h2>${esc(server.custom_name || server.original_name)}</h2><p>Исходное имя: ${esc(server.original_name)}</p></div><span class="badge ${server.source === 'sas' ? 'source-sas' : 'source-primary'}">${server.source === 'sas' ? 'SAS' : 'Secure X'}</span>${server.present_upstream ? '<span class="badge badge-good">В апстриме</span>' : '<span class="badge badge-warn">Нет в апстриме</span>'}</div>
-        <div class="server-fields"><label>Глобальное имя<input data-name="${esc(server.id)}" value="${esc(server.custom_name || '')}" placeholder="Исходное имя"><span class="field-hint">Оставьте пустым, чтобы использовать исходное имя.</span></label><label>Порядок<input data-order="${esc(server.id)}" type="number" value="${server.sort_order}" min="0"></label></div>
-        <label class="switch-row"><input data-hidden="${esc(server.id)}" type="checkbox" ${server.hidden ? 'checked' : ''}><span class="switch"></span><span><b>Скрыть для всех</b></span></label>
-        <button class="button button-secondary" data-save-server="${esc(server.id)}">Сохранить и обновить Drive</button>
-      </article>`).join('')}</div>` : '<div class="empty-state"><div class="empty-orbit">'+svg('servers')+'</div><h2>Список пока пуст</h2><p>Загрузите текущий список из подписки провайдера.</p></div>');
+    const sasCount = list.filter(server => server.source === 'sas').length;
+    const primaryCount = list.length - sasCount;
+    const hiddenCount = list.filter(server => server.hidden).length;
+    root.innerHTML = pageHead('Серверы', `<button id="refreshServers" class="button button-secondary">${svg('refresh')}<span>Обновить источники</span></button>`)
+      + (list.length ? `<section class="server-overview surface-card"><div><p class="eyebrow">КАТАЛОГ СЕРВЕРОВ</p><strong>${list.length} <small>в профиле источников</small></strong><span>Названия сохраняются отдельно для Secure X и SAS.</span></div><div class="source-counts"><span class="source-count primary-count"><i></i> Secure X <b>${primaryCount}</b></span><span class="source-count sas-count"><i></i> SAS <b>${sasCount}</b></span><span class="source-count hidden-count"><i></i> Скрыты <b data-hidden-count>${hiddenCount}</b></span></div></section>
+        <section class="server-toolbar surface-card">
+          <label class="search-box"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/></svg><input id="serverSearch" type="search" autocomplete="off" placeholder="Поиск по имени сервера"></label>
+          <div class="filter-pills" id="serverFilters" aria-label="Фильтр серверов">
+            <button type="button" class="filter-chip active" data-server-filter="all" aria-pressed="true">Все <span>${list.length}</span></button>
+            <button type="button" class="filter-chip" data-server-filter="primary" aria-pressed="false">Secure X <span>${primaryCount}</span></button>
+            <button type="button" class="filter-chip" data-server-filter="sas" aria-pressed="false">SAS <span>${sasCount}</span></button>
+            <button type="button" class="filter-chip" data-server-filter="visible" aria-pressed="false">Показываются <span data-visible-server-count>${list.length - hiddenCount}</span></button>
+            <button type="button" class="filter-chip" data-server-filter="hidden" aria-pressed="false">Скрыты <span data-hidden-server-count>${hiddenCount}</span></button>
+          </div>
+          <div class="bulk-server-bar"><label class="select-visible"><input id="selectVisibleServers" type="checkbox"><span class="check-ui"></span><b>Выбрать видимые</b></label><span id="selectedServerCount" class="selected-count">Выбрано: 0</span><div class="bulk-actions"><button type="button" class="button button-quiet" data-server-bulk="false" disabled>Показать</button><button type="button" class="button button-quiet" data-server-bulk="true" disabled>Скрыть</button></div></div>
+        </section>
+        <div class="result-caption"><span id="serverResultCount">${list.length} серверов</span><span>Массовые действия применяются к выбранным серверам</span></div>
+        <div class="card-list" id="serverList">${list.map(server => `<article class="surface-card server-card" data-server-card data-server-source="${server.source === 'sas' ? 'sas' : 'primary'}" data-server-hidden="${server.hidden ? 'yes' : 'no'}" data-server-name="${esc(`${server.custom_name || ''} ${server.original_name || ''} ${server.id}`.toLocaleLowerCase('ru-RU'))}">
+          <div class="server-select-row"><label class="server-select"><input type="checkbox" data-select-server="${esc(server.id)}"><span class="check-ui"></span><span>Выбрать</span></label><span class="server-id">ID · ${esc(server.id)}</span></div>
+          <div class="server-card-head"><div class="server-mark">${svg('servers')}</div><div class="user-main"><h2>${esc(server.custom_name || server.original_name)}</h2><p>Исходное имя: ${esc(server.original_name)}</p></div><span class="badge ${server.source === 'sas' ? 'source-sas' : 'source-primary'}">${server.source === 'sas' ? 'SAS' : 'Secure X'}</span>${server.present_upstream ? '<span class="badge badge-good">Доступен</span>' : '<span class="badge badge-warn">Нет в источнике</span>'}</div>
+          <div class="server-fields"><label>Глобальное имя<input data-name="${esc(server.id)}" value="${esc(server.custom_name || '')}" placeholder="Исходное имя"></label><label>Порядок в подписке<input data-order="${esc(server.id)}" type="number" value="${server.sort_order}" min="0"></label></div>
+          <label class="switch-row server-visibility"><input data-hidden="${esc(server.id)}" type="checkbox" ${server.hidden ? 'checked' : ''}><span class="switch"></span><span><b>Скрыть этот сервер у всех</b><small>Личное исключение пользователя можно настроить в его подписке.</small></span></label>
+          <div class="server-card-actions"><button type="button" class="button button-quiet" data-reset-server-name="${esc(server.id)}" ${server.custom_name ? '' : 'disabled'}>Сбросить имя</button><button type="button" class="button button-secondary" data-save-server="${esc(server.id)}">Сохранить и обновить Drive</button></div>
+        </article>`).join('')}</div><div id="serverFilterEmpty" class="filter-empty hidden"><div class="empty-orbit">${svg('servers')}</div><h2>Серверы не найдены</h2><p>Поменяйте поисковый запрос или фильтр.</p></div>` : '<div class="empty-state"><div class="empty-orbit">'+svg('servers')+'</div><h2>Каталог пока пуст</h2><p>Обновите источники, чтобы загрузить серверы Secure X и SAS.</p></div>');
     $('#refreshServers').addEventListener('click', async event => {
       const button = event.currentTarget;
       button.disabled = true;
@@ -485,22 +596,110 @@
         const refreshed = await api('/api/admin/servers/refresh', { method: 'POST', body: {} });
         toast(resultText(refreshed, `Серверов: ${refreshed.count}`));
         await render();
-      } catch (failure) { button.disabled = false; button.innerHTML = `${svg('refresh')}<span>Обновить список</span>`; toast(failure.message); }
+      } catch (failure) { button.disabled = false; button.innerHTML = `${svg('refresh')}<span>Обновить источники</span>`; toast(failure.message); }
+    });
+    if (!list.length) return;
+    const cards = $$('[data-server-card]', $('#serverList'));
+    const selectedCount = () => cards.filter(card => $('[data-select-server]', card).checked).length;
+    const updateSelection = () => {
+      const selected = selectedCount();
+      $('#selectedServerCount').textContent = `Выбрано: ${selected}`;
+      $$('[data-server-bulk]').forEach(button => { button.disabled = selected === 0; });
+      const visible = cards.filter(card => !card.hidden);
+      const selectedVisible = visible.filter(card => $('[data-select-server]', card).checked).length;
+      $('#selectVisibleServers').checked = visible.length > 0 && selectedVisible === visible.length;
+      $('#selectVisibleServers').indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
+    };
+    const applyServerFilters = () => {
+      const query = ($('#serverSearch').value || '').trim().toLocaleLowerCase('ru-RU');
+      const filter = $('.filter-chip.active', $('#serverFilters'))?.dataset.serverFilter || 'all';
+      let visible = 0;
+      cards.forEach(card => {
+        const sourceMatch = filter === 'all' || filter === 'visible' || filter === 'hidden'
+          || card.dataset.serverSource === filter;
+        const visibilityMatch = filter === 'all' || filter === 'primary' || filter === 'sas'
+          || (filter === 'visible' && card.dataset.serverHidden === 'no')
+          || (filter === 'hidden' && card.dataset.serverHidden === 'yes');
+        const match = sourceMatch && visibilityMatch && (!query || card.dataset.serverName.includes(query));
+        card.hidden = !match;
+        if (match) visible++;
+      });
+      $('#serverResultCount').textContent = `${visible} из ${list.length} серверов`;
+      $('#serverFilterEmpty').classList.toggle('hidden', visible > 0);
+      updateSelection();
+    };
+    $('#serverSearch').addEventListener('input', applyServerFilters);
+    $('#serverFilters').addEventListener('click', event => {
+      const chip = event.target.closest('[data-server-filter]');
+      if (!chip) return;
+      $$('.filter-chip', $('#serverFilters')).forEach(item => {
+        const active = item === chip;
+        item.classList.toggle('active', active);
+        item.setAttribute('aria-pressed', String(active));
+      });
+      applyServerFilters();
+    });
+    $('#selectVisibleServers').addEventListener('change', event => {
+      cards.filter(card => !card.hidden).forEach(card => { $('[data-select-server]', card).checked = event.target.checked; });
+      updateSelection();
+    });
+    $('#serverList').addEventListener('change', event => {
+      const checkbox = event.target.closest('[data-select-server]');
+      if (checkbox) updateSelection();
+    });
+    $('#serverList').addEventListener('input', event => {
+      const nameInput = event.target.closest('[data-name]');
+      if (!nameInput) return;
+      const reset = $(`[data-reset-server-name="${CSS.escape(nameInput.dataset.name)}"]`, root);
+      if (reset) reset.disabled = !nameInput.value.trim();
     });
     root.onclick = async event => {
-      const button = event.target.closest('[data-save-server]');
+      const bulkButton = event.target.closest('[data-server-bulk]');
+      if (bulkButton) {
+        const ids = cards.filter(card => $('[data-select-server]', card).checked).map(card => $('[data-select-server]', card).dataset.selectServer);
+        if (!ids.length) return;
+        bulkButton.disabled = true;
+        try {
+          const hidden = bulkButton.dataset.serverBulk === 'true';
+          const saved = await api('/api/admin/servers/bulk', { method: 'POST', body: { server_ids: ids, hidden } });
+          toast(resultText(saved, hidden ? `Скрыто серверов: ${ids.length}` : `Показано серверов: ${ids.length}`));
+          await render();
+        } catch (failure) { bulkButton.disabled = false; toast(failure.message); }
+        return;
+      }
+      const resetButton = event.target.closest('[data-reset-server-name]');
+      const saveButton = event.target.closest('[data-save-server]');
+      const button = resetButton || saveButton;
       if (!button) return;
-      const id = button.dataset.saveServer;
+      const id = button.dataset.resetServerName || button.dataset.saveServer;
+      const nameInput = $(`[data-name="${CSS.escape(id)}"]`, root);
+      if (resetButton) nameInput.value = '';
       button.disabled = true;
+      const server = list.find(item => String(item.id) === id);
       try {
         const saved = await api(`/api/admin/servers/${encodeURIComponent(id)}`, { method: 'PUT', body: {
-          custom_name: $(`[data-name="${CSS.escape(id)}"]`, root).value || null,
+          custom_name: nameInput.value || null,
           sort_order: Number($(`[data-order="${CSS.escape(id)}"]`, root).value),
           hidden: $(`[data-hidden="${CSS.escape(id)}"]`, root).checked
         }});
-        toast(resultText(saved, 'Сервер сохранён'));
+        if (server) {
+          server.custom_name = nameInput.value || null;
+          server.hidden = $(`[data-hidden="${CSS.escape(id)}"]`, root).checked;
+          server.sort_order = Number($(`[data-order="${CSS.escape(id)}"]`, root).value);
+          const card = button.closest('[data-server-card]');
+          $('h2', card).textContent = server.custom_name || server.original_name;
+          card.dataset.serverHidden = server.hidden ? 'yes' : 'no';
+          card.dataset.serverName = `${server.custom_name || ''} ${server.original_name || ''} ${server.id}`.toLocaleLowerCase('ru-RU');
+          const currentlyHidden = list.filter(item => item.hidden).length;
+          $('[data-hidden-count]', root).textContent = String(currentlyHidden);
+          $('[data-hidden-server-count]', root).textContent = String(currentlyHidden);
+          $('[data-visible-server-count]', root).textContent = String(list.length - currentlyHidden);
+        }
+        toast(resultText(saved, resetButton ? 'Исходное имя восстановлено' : 'Настройки сервера сохранены'));
+        if (resetButton) $('[data-save-server]', button.closest('[data-server-card]')).focus();
+        applyServerFilters();
       } catch (failure) { toast(failure.message); }
-      finally { button.disabled = false; }
+      finally { button.disabled = resetButton ? !server?.custom_name : false; }
     };
   }
 
@@ -537,7 +736,7 @@
         ${textarea('quotes', 'Цитаты — по одной на строку')}
         ${textarea('footers', 'Нижние строки; {t} заменяется текущим временем')}
       </div>
-      <div class="form-actions"><button class="button button-primary" type="submit">Сохранить и обновить Drive</button></div>
+      <div class="form-actions"><button class="button button-primary" type="submit">Сохранить настройки</button></div>
     </form>`;
     $('#settingsForm').addEventListener('submit', async event => {
       event.preventDefault();
@@ -545,7 +744,7 @@
       const submit = $('button[type="submit"]', form);
       if (form.dataset.busy === '1') return;
       form.dataset.busy = '1'; submit.disabled = true;
-      submit.innerHTML = '<span class="spinner"></span><span>Сохраняю и обновляю Drive…</span>';
+      submit.innerHTML = '<span class="spinner"></span><span>Сохраняю настройки…</span>';
       const fields = new FormData(form);
       const values = {
         title: fields.get('title'), support_url: fields.get('support_url'), web_page_url: fields.get('web_page_url'),
@@ -561,10 +760,10 @@
         const saved = await api('/api/admin/settings', { method: 'PUT', body: { values } });
         toast(resultText(saved, 'Настройки сохранены'));
         form.dataset.busy = '0'; submit.disabled = false;
-        submit.innerHTML = '<span>Сохранить и обновить Drive</span>';
+        submit.innerHTML = '<span>Сохранить настройки</span>';
       } catch (failure) {
         form.dataset.busy = '0'; submit.disabled = false;
-        submit.innerHTML = '<span>Сохранить и обновить Drive</span>';
+        submit.innerHTML = '<span>Сохранить настройки</span>';
         toast(failure.message);
       }
     });
