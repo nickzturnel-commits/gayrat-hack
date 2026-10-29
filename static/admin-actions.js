@@ -15,5 +15,26 @@
     return null;
   }
 
-  return { resolveUserAction };
+  function formatDate(value) {
+    if (value === null || value === undefined || value === '') return '—';
+
+    let parsed;
+    if (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value)))) {
+      const timestamp = Number(value);
+      if (!Number.isFinite(timestamp) || timestamp === 0) return '—';
+      // Python time.time() values are seconds; Date expects milliseconds.
+      parsed = new Date(Math.abs(timestamp) < 1e12 ? timestamp * 1000 : timestamp);
+    } else {
+      parsed = new Date(value);
+    }
+
+    if (!Number.isFinite(parsed.getTime())) return '—';
+    try {
+      return parsed.toLocaleString('ru-RU', { dateStyle: 'medium', timeStyle: 'short' });
+    } catch {
+      return '—';
+    }
+  }
+
+  return { resolveUserAction, formatDate };
 });

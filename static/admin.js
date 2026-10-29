@@ -38,9 +38,7 @@
   }
 
   function date(value) {
-    if (!value) return '—';
-    try { return new Date(value).toLocaleString('ru-RU', { dateStyle: 'medium', timeStyle: 'short' }); }
-    catch { return String(value); }
+    return window.PanelAdminActions.formatDate(value);
   }
 
   function bytes(value) {
@@ -180,7 +178,7 @@
       <section class="section-block source-health-block"><div class="section-heading"><div><p class="eyebrow">ПОДКЛЮЧЁННЫЕ ИСТОЧНИКИ</p><h2>Состав каталога</h2></div><span class="source-refresh-note">Обновление SAS каждые 5 минут</span></div>
         <div class="source-health-grid">
           <article class="source-health-card primary-health"><div class="health-card-head"><span class="health-source-mark">SX</span><span class="badge ${primary.configured ? 'badge-good' : 'badge-warn'}">${primary.configured ? 'Основной' : 'Не настроен'}</span></div><p>Secure X</p><strong>${Number(primary.server_count) || 0}<small> серверов</small></strong><div class="health-meter"><i style="width:${primary.configured ? '100%' : '0%'}"></i></div><small class="health-caption">Основная подписка проекта</small></article>
-          <article class="source-health-card sas-health"><div class="health-card-head"><span class="health-source-mark">SAS</span><span class="badge ${sas.warning ? 'badge-warn' : sas.configured ? 'badge-good' : 'badge-muted'}">${sas.warning ? 'Есть предупреждение' : sas.configured ? 'Подключён' : 'Не настроен'}</span></div><p>Источник SAS</p><strong>${Number(sas.server_count) || 0}<small> серверов</small></strong><div class="health-meter"><i style="width:${sas.configured ? '100%' : '0%'}"></i></div><small class="health-caption">${sas.warning ? esc(sas.warning) : sas.last_success_at ? `Обновлён ${esc(date(Number(sas.last_success_at) * 1000))}` : 'Ожидает первого обновления'}</small></article>
+          <article class="source-health-card sas-health"><div class="health-card-head"><span class="health-source-mark">SAS</span><span class="badge ${sas.warning ? 'badge-warn' : sas.configured ? 'badge-good' : 'badge-muted'}">${sas.warning ? 'Есть предупреждение' : sas.configured ? 'Подключён' : 'Не настроен'}</span></div><p>Источник SAS</p><strong>${Number(sas.server_count) || 0}<small> серверов</small></strong><div class="health-meter"><i style="width:${sas.configured ? '100%' : '0%'}"></i></div><small class="health-caption">${sas.warning ? esc(sas.warning) : sas.last_success_at ? `Обновлён ${esc(date(sas.last_success_at))}` : 'Ожидает первого обновления'}</small></article>
         </div>
         <div class="dashboard-shortcuts"><button type="button" class="button button-secondary" data-dashboard-page="users">${svg('users')}<span>Подписки</span></button><button type="button" class="button button-secondary" data-dashboard-page="servers">${svg('servers')}<span>Управлять серверами</span></button><button type="button" class="button button-secondary" data-dashboard-page="settings">${svg('settings')}<span>Настройки источников</span></button></div>
       </section>`
@@ -368,10 +366,8 @@
           </div>
         </article>`;
       }).join('')}</div><div id="userFilterEmpty" class="filter-empty hidden"><div class="empty-orbit">${svg('users')}</div><h2>Ничего не найдено</h2><p>Измените запрос или выберите другой фильтр.</p></div>` : '<div class="empty-state"><div class="empty-orbit">'+svg('users')+'</div><h2>Пока нет подписок</h2><p>Создайте профиль, выберите серверы Secure X и SAS и получите ссылку Google Drive.</p><button class="button button-primary" id="addUserEmpty">'+svg('plus')+'<span>Создать подписку</span></button></div>');
-    $('#addUser').addEventListener('click', async () => {
-      try { await userForm(null); } catch (failure) { toast(failure.message); }
-    });
-    if ($('#addUserEmpty')) $('#addUserEmpty').addEventListener('click', async () => {
+    const addUserButton = $('#addUser') || $('#addUserEmpty');
+    if (addUserButton) addUserButton.addEventListener('click', async () => {
       try { await userForm(null); } catch (failure) { toast(failure.message); }
     });
     if ($('#userSearch')) {
@@ -726,7 +722,7 @@
       <div class="form-section sas-settings-section"><p class="eyebrow">ИСТОЧНИК SAS</p><h2>Серверы из SAS</h2>
         <article class="sas-status-card surface-card">
           <div class="sas-status-head"><span class="sas-status-mark">SAS</span><div><b>${sas.configured ? 'Источник настроен' : 'Источник не настроен'}</b><small>${sas.configured ? `Сейчас в источнике ${Number(sas.server_count) || 0} серверов. Вся группа «LTE — Обход глушилок» исключена.` : 'Добавьте SAS_SUBSCRIPTION_URL в переменные среды Secure X на Render.'}</small></div><span class="badge ${sas.configured ? 'badge-good' : 'badge-warn'}">${sas.configured ? 'Render' : 'Отключён'}</span></div>
-          <div class="sas-status-meta"><span>Последнее успешное получение</span><strong>${esc(sas.last_success_at ? date(Number(sas.last_success_at) * 1000) : 'Ещё не загружено')}</strong></div>
+          <div class="sas-status-meta"><span>Последнее успешное получение</span><strong>${esc(sas.last_success_at ? date(sas.last_success_at) : 'Ещё не загружено')}</strong></div>
           ${sas.warning ? `<p class="tone-warn sas-warning">${esc(sas.warning)}</p>` : ''}
           <p class="field-hint">Адрес источника хранится в переменной окружения Render. В этой панели управляются включение SAS в подписки, видимость серверов и их имена.</p>
         </article>
