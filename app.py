@@ -192,7 +192,17 @@ async def _fetch_snapshot(headers: dict[str, str]) -> SubscriptionSnapshot:
         )
 
     body = upstream.content
-    if SAS_SUBSCRIPTION_URL:
+    if not device_limit:
+        invalid = admin_panel._invalid_payload(upstream.content, content_type)
+        if invalid:
+            logger.warning("Subscription source returned an invalid profile (%s; %s).",
+                           invalid, _profile_summary(headers))
+            raise HTTPException(status_code=502, detail="Upstream returned invalid subscription data.")
+
+    # Device-limit payloads are provider instructions rather than server lists.
+    # Forward them intact instead of rejecting them as an invalid subscription
+    # or attempting to merge them with SAS nodes.
+    if SAS_SUBSCRIPTION_URL and not device_limit:
         profile_key = tuple(sorted(headers.items()))
         try:
             sas = await http.get(SAS_SUBSCRIPTION_URL, headers=headers)
@@ -262,6 +272,9 @@ async def _refresh_loop() -> None:
                 if current_headers is None:
                     continue
                 updated = await _fetch_snapshot(current_headers)
+                if _inspect_payload(updated.body)[1]:
+                    logger.warning("Upstream returned a device-limit response; the last good profile was kept.")
+                    continue
                 _snapshot = updated
         except asyncio.CancelledError:
             raise
@@ -291,6 +304,8 @@ async def current_snapshot(request: Request) -> SubscriptionSnapshot:
         # Refresh whenever the incoming client profile differs so one caller
         # cannot poison the shared cache for another.
         updated = await _fetch_snapshot(request_headers)
+        if _inspect_payload(updated.body)[1]:
+            return updated
         _snapshot = updated
         _upstream_headers = request_headers
 

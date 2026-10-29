@@ -43,15 +43,17 @@ class FakeConn:
             for row in self.servers:
                 row["present_upstream"] = False
         elif query.startswith("INSERT INTO servers(id,original_name,source_key"):
-            server_id, original_name, source_key, sort_order = args
+            server_id, original_name, source_key, source, sort_order = args
             row = next((item for item in self.servers if item.get("id") == server_id), None)
             if row is None:
                 row = {"id": server_id, "original_name": original_name, "source_key": source_key,
+                       "source": source,
                        "custom_name": None, "hidden": False, "sort_order": sort_order,
                        "present_upstream": True}
                 self.servers.append(row)
             else:
-                row.update(original_name=original_name, source_key=source_key, present_upstream=True)
+                row.update(original_name=original_name, source_key=source_key, source=source,
+                           present_upstream=True)
         elif query.startswith("UPDATE servers AS target SET"):
             target_id, old_ids = args
             target = next((item for item in self.servers if item.get("id") == target_id), None)
@@ -89,14 +91,14 @@ class FakeConn:
             if "WHERE present_upstream=TRUE" in query:
                 return [row for row in self.servers if row.get("present_upstream", True)]
             return self.servers
-        if "SELECT id,original_name,source_key,custom_name,hidden,sort_order" in query:
+        if "SELECT id,original_name,source_key,source,custom_name,hidden,sort_order" in query:
             return self.servers
         if "SELECT server_id,COUNT(*) AS override_count FROM user_servers" in query:
             counts = {}
             for row in self.user_servers:
                 counts[row["server_id"]] = counts.get(row["server_id"], 0) + 1
             return [{"server_id": key, "override_count": value} for key, value in counts.items()]
-        if "SELECT id,original_name,custom_name,hidden,sort_order FROM servers" in query:
+        if "SELECT id,original_name,custom_name,hidden,sort_order,source FROM servers" in query:
             if "WHERE present_upstream=TRUE" in query:
                 return [row for row in self.servers if row.get("present_upstream", True)]
             return self.servers
@@ -361,6 +363,26 @@ class ServerReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len({server["id"] for server in servers}), 2)
         self.assertIn("vless://uuid@de.example:443?security=tls#Germany%20West%2001", content)
         self.assertIn("trojan://secret@jp.example:443#Japan%20Tokyo", content)
+
+    async def test_manual_order_survives_refresh_and_new_servers_append(self):
+        first = panel.parse_server_uri("vless://first@one.example#First")
+        second = panel.parse_server_uri("vless://second@two.example#Second")
+        added = panel.parse_server_uri("vless://added@three.example#Added")
+        conn = FakeConn(servers=[
+            {"id": first["id"], "original_name": "First", "source_key": first["source_key"],
+             "source": "primary", "custom_name": None, "hidden": False, "sort_order": 11,
+             "present_upstream": True},
+            {"id": second["id"], "original_name": "Second", "source_key": second["source_key"],
+             "source": "primary", "custom_name": None, "hidden": False, "sort_order": 3,
+             "present_upstream": True},
+        ])
+
+        await panel._sync_servers(conn, f"{added['uri']}\n{second['uri']}\n{first['uri']}".encode())
+
+        order = {row["id"]: row["sort_order"] for row in conn.servers if row.get("present_upstream")}
+        self.assertEqual(order[first["id"]], 11)
+        self.assertEqual(order[second["id"]], 3)
+        self.assertEqual(order[added["id"]], 12)
 
     async def test_changed_uri_keeps_global_and_per_user_customizations(self):
         previous = panel.parse_server_uri("vless://old-id@old.example:443#Nord")
@@ -902,7 +924,7 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
                  panel.DEFAULT_SETTINGS, announce_enabled=False))):
             result = await panel.sync_manifest(make_request({"X-Sync-Key": "sync"}))
 
-        fetch.assert_awaited_once_with(force_sas=True)
+        fetch.assert_awaited_once_with(force_sas=True, allow_sas_failure=False)
         self.assertEqual(len(result["users"]), 2)
         for user in result["users"]:
             self.assertIn("vless://main@main.example:443#Main", user["content"])
@@ -994,7 +1016,7 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
             async def fetchrow(self, query, *args):
                 self.insert_query = query
                 self.insert_args = args
-                return {"id": 41, "hide_traffic_usage": args[-1]}
+                return {"id": 41, "hide_traffic_usage": args[8]}
 
         for explicit, default, expected in ((None, True, True), (False, True, False), (True, False, True)):
             with self.subTest(explicit=explicit, default=default):
@@ -1196,10 +1218,10 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mobile.status_code, 200)
         self.assertIn('class="desktop-ui"', desktop.text)
         self.assertIn('class="mobile-ui"', mobile.text)
-        self.assertIn("/static/admin.js?v=20261028-6", desktop.text)
-        self.assertIn("/static/admin.js?v=20261028-6", mobile.text)
-        self.assertIn("/static/admin-actions.js?v=20261025-1", desktop.text)
-        self.assertIn("/static/admin-actions.js?v=20261025-1", mobile.text)
+        self.assertIn("/static/admin.js?v=20261029-2", desktop.text)
+        self.assertIn("/static/admin.js?v=20261029-2", mobile.text)
+        self.assertIn("/static/admin-actions.js?v=20261029-2", desktop.text)
+        self.assertIn("/static/admin-actions.js?v=20261029-2", mobile.text)
         self.assertIn("/static/admin.css?v=20261028-7", desktop.text)
         self.assertIn("/static/admin.css?v=20261028-7", mobile.text)
         self.assertIn('class="mobile-nav-glider"', mobile.text)
@@ -1214,6 +1236,9 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("showDriveQr(shareAction.userId)", javascript.text)
         self.assertIn("driveQrLoadingContent()", javascript.text)
         self.assertIn("credentials: 'same-origin'", javascript.text)
+        self.assertIn("window.PanelAdminActions.formatDate(value)", javascript.text)
+        self.assertIn("const addUserButton = $('#addUser') || $('#addUserEmpty');", javascript.text)
+        self.assertIn("Python time.time() values are seconds", action_script.text)
         self.assertIn("День/приветствие, цитата и подпись меняются с этим интервалом", javascript.text)
         self.assertNotIn("function driveShareContent(userId, link, includeQr)", javascript.text)
         self.assertIn("document.execCommand('copy')", javascript.text)

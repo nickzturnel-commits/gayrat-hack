@@ -1249,8 +1249,21 @@ async def _sync_servers(conn, body: bytes, *, primary_body: bytes | None = None,
         counts = await conn.fetch("SELECT server_id,COUNT(*) AS override_count FROM user_servers GROUP BY server_id")
         override_counts = {str(row["server_id"]): int(row["override_count"]) for row in counts}
         parsed, merge_ids = _plan_server_reconciliation(parsed, existing, override_counts)
+        existing_by_id = {str(row["id"]): row for row in existing}
+        next_sort_order = max(
+            (int(_server_row_value(row, "sort_order", -1)) for row in existing),
+            default=-1,
+        ) + 1
         await conn.execute("UPDATE servers SET present_upstream=FALSE")
         for index, server in enumerate(parsed):
+            existing_row = existing_by_id.get(str(server["id"]))
+            if existing_row is None:
+                sort_order = next_sort_order
+                next_sort_order += 1
+            else:
+                sort_order = _server_row_value(existing_row, "sort_order", index)
+                if sort_order is None:
+                    sort_order = index
             old_ids = merge_ids.get(server["id"], [])
             if len(old_ids) > 1:
                 await conn.execute("""UPDATE servers AS target SET
@@ -1279,7 +1292,7 @@ async def _sync_servers(conn, body: bytes, *, primary_body: bytes | None = None,
             await conn.execute("""INSERT INTO servers(id,original_name,source_key,source,sort_order,present_upstream,last_seen_at)
                 VALUES($1,$2,$3,$4,$5,TRUE,now()) ON CONFLICT(id) DO UPDATE SET original_name=EXCLUDED.original_name,
                 source_key=EXCLUDED.source_key,source=EXCLUDED.source,present_upstream=TRUE,last_seen_at=now()""",
-                server["id"], server["name"], server["source_key"], server["source"], index)
+                server["id"], server["name"], server["source_key"], server["source"], sort_order)
     return parsed
 
 

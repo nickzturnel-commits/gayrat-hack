@@ -167,13 +167,17 @@ class SubscriptionRelayTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_client_profile_change_refetches_instead_of_serving_wrong_cache(self):
         seen = []
+        profiles = {
+            "Browser/test": b"vless://browser@browser.example:443#Browser",
+            "Happ/test": b"vless://happ@happ.example:443#Happ",
+        }
 
         def handler(request: httpx.Request) -> httpx.Response:
             user_agent = request.headers.get("user-agent", "")
             seen.append(user_agent)
             return httpx.Response(
                 200,
-                content=f"profile={user_agent}".encode(),
+                content=profiles[user_agent],
                 headers={"content-type": "text/plain"},
             )
 
@@ -181,9 +185,44 @@ class SubscriptionRelayTests(unittest.IsolatedAsyncioTestCase):
         browser_response = await relay.serve_subscription(make_request([(b"user-agent", b"Browser/test")]))
         happ_response = await relay.serve_subscription(make_request([(b"user-agent", b"Happ/test")]))
 
-        self.assertEqual(browser_response.body, b"profile=Browser/test")
-        self.assertEqual(happ_response.body, b"profile=Happ/test")
+        self.assertEqual(browser_response.body, profiles["Browser/test"])
+        self.assertEqual(happ_response.body, profiles["Happ/test"])
         self.assertEqual(seen, ["Browser/test", "Happ/test"])
+
+    async def test_empty_upstream_profile_is_rejected_without_replacing_snapshot(self):
+        previous = relay.SubscriptionSnapshot(
+            b"vless://saved@saved.example:443#Saved", {}, time.monotonic() - 10
+        )
+        relay._snapshot = previous
+        relay._upstream_headers = {"user-agent": "Happ/previous"}
+        relay.http = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(200, content=b"", headers={"content-type": "text/plain"})
+            )
+        )
+
+        with self.assertRaises(HTTPException) as caught:
+            await relay.serve_subscription(make_request([(b"user-agent", b"Happ/new")]))
+
+        self.assertEqual(caught.exception.status_code, 502)
+        self.assertIs(relay._snapshot, previous)
+
+    async def test_device_limit_is_forwarded_intact_and_skips_sas_merge(self):
+        placeholder = base64.b64encode(b"DEVICE LIMIT FULL (5/5) - remove a device first")
+        sas_requests = []
+        relay.SAS_SUBSCRIPTION_URL = "https://sas.invalid/"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == "https://sas.invalid/":
+                sas_requests.append(request.url)
+                return httpx.Response(200, content=b"vless://sas@sas.example:443#SAS")
+            return httpx.Response(200, content=placeholder, headers={"content-type": "text/plain"})
+
+        relay.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        response = await relay.serve_subscription(make_request([(b"user-agent", b"Happ/test")]))
+
+        self.assertEqual(response.body, placeholder)
+        self.assertEqual(sas_requests, [])
 
     async def test_relay_combines_primary_and_sas_and_keeps_primary_metadata(self):
         main_uri = "vless://main-id@main.example:443#Main"
@@ -272,6 +311,29 @@ class SubscriptionRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.body, placeholder)
         self.assertEqual(response.headers["content-type"], "text/plain; charset=utf-8")
+        self.assertIsNone(relay._snapshot)
+
+    async def test_refresh_keeps_last_good_profile_when_provider_reports_device_limit(self):
+        original = relay.SubscriptionSnapshot(
+            b"vless://saved@saved.example:443#Saved", {}, time.monotonic() - 10
+        )
+        placeholder = base64.b64encode(b"DEVICE LIMIT FULL (5/5) - remove a device first")
+        relay._snapshot = original
+        relay._upstream_headers = {"user-agent": "Happ/test"}
+
+        async def fetch(headers):
+            if not getattr(fetch, "called", False):
+                fetch.called = True
+                return relay.SubscriptionSnapshot(placeholder, {}, time.monotonic())
+            raise asyncio.CancelledError
+
+        with patch.object(relay, "REFRESH_INTERVAL_SECONDS", 0), patch.object(
+            relay, "_fetch_snapshot", side_effect=fetch
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await relay._refresh_loop()
+
+        self.assertIs(relay._snapshot, original)
 
     async def test_refresh_reuses_headers_and_keeps_last_good_snapshot_on_failure(self):
         original = relay.SubscriptionSnapshot(b"old", {}, 1.0)
