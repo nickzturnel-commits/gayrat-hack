@@ -145,6 +145,20 @@ textarea { min-height: 100px; resize: vertical; }
 .user-actions { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }
 .user-actions .button { min-width: 0; min-height: 42px; padding: 9px 10px; font-size: 12px; }
 .user-actions .icon-svg { width: 16px; height: 16px; }
+.device-limit-error { margin: 2px 0 0; overflow-wrap: anywhere; font-size: 12px; }
+.device-limit-current { margin: 0; color: var(--muted); font-size: 12px; }
+.device-limit-dialog { justify-items: stretch; }
+.device-limit-status-card { display: grid; gap: 6px; width: 100%; padding: 15px; border: 1px solid #ffffff12; border-radius: 15px; background: #ffffff04; color: var(--muted); font-size: 12px; line-height: 1.55; overflow-wrap: anywhere; }
+.device-limit-status-card b { color: var(--text); font-size: 14px; }
+.device-limit-status-card.is-ready { border-color: #a5c9b320; }
+.device-limit-status-card.is-error { border-color: #d9bd7d35; color: var(--warn); }
+.device-limit-status-card.is-error b { color: var(--warn); }
+.device-limited-link-label { width: 100%; }
+.device-limited-link-label input { width: 100%; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; }
+.device-limit-settings-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 16px; }
+.device-limit-settings-card > div:first-child { display: grid; gap: 5px; }
+.device-limit-settings-card small { color: var(--muted); line-height: 1.5; }
+.device-limit-settings-meta { grid-column: 1 / -1; display: flex; justify-content: space-between; gap: 12px; padding-top: 12px; border-top: 1px solid #ffffff0c; font-size: 12px; }
 .user-qr-action { border-color: #ffffff24; }
 .server-card { display: grid; gap: 16px; }
 .server-card-head .badge { margin-left: 0; }

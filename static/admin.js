@@ -10,6 +10,9 @@
   let page = 'dashboard';
   let toastTimer;
   let activeQrObjectUrl = '';
+  let deviceStatusPollTimer = null;
+  let deviceStatusPollRounds = 0;
+  let deviceLimitBounds = null;
 
   function toast(message) {
     const node = $('#toast');
@@ -72,6 +75,13 @@
   }
 
   function setPage(next) {
+    if (next !== 'users') {
+      clearTimeout(deviceStatusPollTimer);
+      deviceStatusPollTimer = null;
+      deviceStatusPollRounds = 0;
+    } else if (page !== 'users') {
+      deviceStatusPollRounds = 0;
+    }
     page = next;
     const navButtons = $$('#nav [data-page]');
     navButtons.forEach((button, index) => {
@@ -173,6 +183,7 @@
         <article class="stat-card"><div class="stat-icon">${svg('servers')}</div><p>Серверы апстрима</p><strong>${Number(data.upstream.server_count) || 0}</strong><small>Обновлено: ${esc(date(data.upstream.last_success_at))}</small></article>
         <article class="stat-card"><div class="stat-icon">${svg('users')}</div><p>Пользователи</p><strong>${data.users.active} <span class="stat-divider">/</span> ${data.users.total}</strong><small>активны · отключено ${data.users.disabled}</small></article>
         <article class="stat-card"><div class="stat-icon">${svg('refresh')}</div><p>Трафик аккаунта провайдера</p><strong>${traffic.total ? `${esc(bytes((traffic.upload || 0) + (traffic.download || 0)))} / ${esc(bytes(traffic.total))}` : 'Безлимит'}</strong><small>Загрузка ${esc(bytes(traffic.upload))} · скачивание ${esc(bytes(traffic.download))}</small></article>
+        <article class="stat-card"><div class="stat-icon">${svg('users')}</div><p>Лимит устройств Happ</p><strong>${Number(data.device_limits?.count) || 0}</strong><small>Ошибок создания ссылки: ${Number(data.device_limits?.errors) || 0}</small></article>
         <article class="stat-card"><div class="stat-icon">${svg('link')}</div><p>Google Drive</p><strong class="${delivery.configured ? 'tone-good' : 'tone-warn'}">${delivery.configured ? 'Синхронизация включена' : 'Не настроено'}</strong><small>Последнее обновление: ${esc(date(delivery.last_success_at))}</small></article>
       </div>
       <section class="section-block source-health-block"><div class="section-heading"><div><p class="eyebrow">ПОДКЛЮЧЁННЫЕ ИСТОЧНИКИ</p><h2>Состав каталога</h2></div><span class="source-refresh-note">Обновление SAS каждые 5 минут</span></div>
@@ -282,11 +293,11 @@
     return '<div class="qr-only"><div class="drive-qr-frame qr-loading" aria-label="Загрузка QR-кода"><span class="spinner" aria-hidden="true"></span></div></div>';
   }
 
-  async function showDriveQr(userId) {
+  async function showDriveQr(userId, limited = false) {
     openModal('QR-код подписки', driveQrLoadingContent());
     const body = $('#modalBody');
     try {
-      const response = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/drive-qr.svg`, {
+      const response = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/${limited ? 'limited-qr.svg' : 'drive-qr.svg'}`, {
         method: 'GET', cache: 'no-store', credentials: 'same-origin',
         headers: { Accept: 'image/svg+xml' },
       });
@@ -334,9 +345,12 @@
   async function users(root) {
     const data = await api('/api/admin/users');
     const list = data.users || [];
+    deviceLimitBounds = data.device_limit_bounds || deviceLimitBounds;
     const activeCount = list.filter(user => userStatus(user)[0] === 'Включена').length;
     const sasCount = list.filter(user => user.include_sas !== false).length;
     const inactiveCount = list.length - activeCount;
+    const limitedCount = list.filter(user => user.device_limit !== null && user.device_limit !== undefined).length;
+    const noLimitCount = list.length - limitedCount;
     root.innerHTML = pageHead('Подписки', `<button id="addUser" class="button button-primary">${svg('plus')}<span>Создать подписку</span></button>`)
       + (list.length ? `<section class="collection-toolbar surface-card">
           <div class="collection-overview"><div><p class="eyebrow">ПРОФИЛИ GOOGLE DRIVE</p><strong>${list.length} <small>всего</small></strong></div><span class="overview-divider"></span><div><strong>${activeCount} <small>активны</small></strong></div><span class="overview-divider"></span><div><strong>${sasCount} <small>с SAS</small></strong></div></div>
@@ -345,6 +359,8 @@
               <button type="button" class="filter-chip active" data-user-filter="all" aria-pressed="true">Все <span>${list.length}</span></button>
               <button type="button" class="filter-chip" data-user-filter="sas" aria-pressed="false">С SAS <span>${sasCount}</span></button>
               <button type="button" class="filter-chip" data-user-filter="primary" aria-pressed="false">Только Secure X <span>${list.length - sasCount}</span></button>
+               <button type="button" class="filter-chip" data-user-filter="limited" aria-pressed="false">С лимитом <span>${limitedCount}</span></button>
+               <button type="button" class="filter-chip" data-user-filter="unlimited" aria-pressed="false">Без лимита <span>${noLimitCount}</span></button>
               <button type="button" class="filter-chip" data-user-filter="inactive" aria-pressed="false">Неактивные <span>${inactiveCount}</span></button>
             </div>
           </div>
@@ -353,15 +369,36 @@
         <div class="card-list" id="userList">${list.map(user => {
         const [status, tone] = userStatus(user);
         const state = status === 'Включена' ? 'active' : 'inactive';
-        return `<article class="surface-card user-card" data-user-card data-user-name="${esc(`${user.name || ''} ${user.note || ''}`.toLowerCase())}" data-user-state="${state}" data-user-sas="${user.include_sas === false ? 'off' : 'on'}">
-          <div class="user-card-head"><div class="avatar-mark">${esc((user.name || '?').trim().slice(0, 1).toUpperCase())}</div><div class="user-main"><h2>${esc(user.name)}</h2><p>${esc(user.note || 'Без заметки')}</p></div><span class="badge ${tone}">${status}</span><span class="badge ${user.drive_file_id ? 'badge-good' : 'badge-muted'}">${user.drive_file_id ? 'Drive готов' : 'Ожидает Drive'}</span><span class="badge ${user.include_sas === false ? 'badge-muted' : 'source-sas'}">${user.include_sas === false ? 'Только Secure X' : 'Secure X + SAS'}</span>${user.hide_traffic_usage && user.slug !== 'legacy' ? '<span class="badge badge-muted">Счётчик скрыт</span>' : ''}</div>
+        const hasLimit = user.device_limit !== null && user.device_limit !== undefined;
+        const limitStatus = hasLimit ? (user.device_limit_status || (user.limited_link ? 'ready' : 'waiting')) : 'none';
+        const limitStatusLabel = ({ready: 'Ссылка с лимитом готова', waiting: 'Ссылка ожидает создания', error: 'Ошибка Happ'})[limitStatus] || 'Без лимита';
+        const limitStatusTone = limitStatus === 'ready' ? 'badge-good' : limitStatus === 'error' ? 'badge-warn' : 'badge-muted';
+        // When a limit is configured, never present the unlimited Drive URL as
+        // the primary share action while Happ is still building its link.
+        const mainLink = hasLimit ? (user.limited_link || '') : (user.drive_link || '');
+        const mainLinkLabel = hasLimit
+          ? (user.limited_link ? 'Копировать Happ' : 'Happ-ссылка готовится')
+          : 'Копировать Drive';
+        const mainLinkTitle = hasLimit
+          ? (user.limited_link
+            ? `Скопировать зашифрованную подписку Happ с лимитом ${user.device_limit} устройств`
+            : 'Зашифрованная ссылка Happ ещё создаётся')
+          : 'Скопировать обычную ссылку Google Drive без лимита устройств';
+        const mainQrLabel = hasLimit
+          ? (user.limited_link ? 'QR с лимитом' : 'QR появится с Happ-ссылкой')
+          : 'QR-код Drive';
+        return `<article class="surface-card user-card" data-user-card data-user-name="${esc(`${user.name || ''} ${user.note || ''}`.toLowerCase())}" data-user-state="${state}" data-user-sas="${user.include_sas === false ? 'off' : 'on'}" data-user-limit="${hasLimit ? 'limited' : 'unlimited'}">
+          <div class="user-card-head"><div class="avatar-mark">${esc((user.name || '?').trim().slice(0, 1).toUpperCase())}</div><div class="user-main"><h2>${esc(user.name)}</h2><p>${esc(user.note || 'Без заметки')}</p></div><span class="badge ${tone}">${status}</span><span class="badge ${user.drive_file_id ? 'badge-good' : 'badge-muted'}">${user.drive_file_id ? 'Drive готов' : 'Ожидает Drive'}</span><span class="badge ${user.include_sas === false ? 'badge-muted' : 'source-sas'}">${user.include_sas === false ? 'Только Secure X' : 'Secure X + SAS'}</span>${user.hide_traffic_usage && user.slug !== 'legacy' ? '<span class="badge badge-muted">Счётчик скрыт</span>' : ''}${hasLimit ? `<span class="badge ${limitStatusTone}">Устройств: ${esc(user.device_limit)} · ${limitStatusLabel}</span>` : '<span class="badge badge-muted">Без лимита устройств</span>'}</div>
+          ${hasLimit && user.device_limit_error ? `<p class="tone-warn device-limit-error" role="status">${esc(user.device_limit_error)}</p>` : ''}
           <div class="user-meta"><span>Срок действия</span><strong>${esc(date(user.expires_at))}</strong></div>
           <div class="user-actions">
             <button class="button button-secondary" data-edit="${user.id}">${svg('edit')}<span>Изменить</span></button>
             <button class="button button-secondary" data-servers="${user.id}">${svg('servers')}<span>Серверы</span></button>
             <button class="button button-secondary" data-preview="${user.id}">${svg('eye')}<span>Предпросмотр</span></button>
-            <button class="button button-secondary" data-action="copy-link" data-link="${esc(user.drive_link || '')}" data-user-id="${user.id}" ${user.drive_link ? '' : 'disabled'}>${svg('link')}<span>Ссылка Drive</span></button>
-            <button class="button button-secondary user-qr-action" data-action="qr" data-user-id="${user.id}" ${user.drive_link ? '' : 'disabled'}>${svg('qr')}<span>QR-код</span></button>
+            <button class="button button-secondary" aria-label="${esc(mainLinkTitle)}" title="${esc(mainLinkTitle)}" data-action="copy-link" data-link="${esc(mainLink)}" data-user-id="${user.id}" ${mainLink ? '' : 'disabled'}>${svg('link')}<span>${mainLinkLabel}</span></button>
+            <button class="button button-secondary user-qr-action" data-action="qr" data-limited="${user.limited_link ? 'yes' : 'no'}" data-user-id="${user.id}" ${mainLink ? '' : 'disabled'}>${svg('qr')}<span>${mainQrLabel}</span></button>
+            ${hasLimit && user.drive_link ? `<button class="button button-secondary" data-action="copy-link" data-link="${esc(user.drive_link)}" data-user-id="${user.id}">${svg('link')}<span>Drive без лимита</span></button>` : ''}
+            ${user.slug !== 'legacy' ? `<button class="button button-secondary" data-devices="${user.id}">${svg('users')}<span>Лимит устройств</span></button>` : ''}
             <button class="button button-danger" data-delete="${user.id}" ${user.status === 'pending_delete' ? 'disabled' : ''}>${svg('trash')}<span>Удалить</span></button>
           </div>
         </article>`;
@@ -380,6 +417,8 @@
           const matchesFilter = selected === 'all'
             || (selected === 'sas' && card.dataset.userSas === 'on')
             || (selected === 'primary' && card.dataset.userSas === 'off')
+            || (selected === 'limited' && card.dataset.userLimit === 'limited')
+            || (selected === 'unlimited' && card.dataset.userLimit === 'unlimited')
             || (selected === 'inactive' && card.dataset.userState === 'inactive');
           card.hidden = !(matchesQuery && matchesFilter);
           if (!card.hidden) visible++;
@@ -400,6 +439,19 @@
       });
     }
     root.onclick = event => handleUserAction(event, list);
+    const hasPendingLimit = list.some(user => user.device_limit !== null && user.device_limit !== undefined
+      && user.device_limit_status === 'waiting' && user.status === 'active' && user.enabled !== false);
+    if (!hasPendingLimit) {
+      clearTimeout(deviceStatusPollTimer);
+      deviceStatusPollTimer = null;
+      deviceStatusPollRounds = 0;
+    } else if (deviceStatusPollRounds < 12) {
+      clearTimeout(deviceStatusPollTimer);
+      deviceStatusPollRounds += 1;
+      deviceStatusPollTimer = setTimeout(() => {
+        if (page === 'users' && $('#content') === root) render();
+      }, 2500);
+    }
   }
 
   async function handleUserAction(event, list) {
@@ -408,7 +460,7 @@
     const shareAction = window.PanelAdminActions.resolveUserAction(button);
     try {
       if (shareAction?.kind === 'qr') {
-        await showDriveQr(shareAction.userId);
+        await showDriveQr(shareAction.userId, button.dataset.limited === 'yes');
       } else if (shareAction?.kind === 'copy-link') {
         const copied = copyText(shareAction.link);
         Promise.resolve(copied).then(ok => {
@@ -417,6 +469,9 @@
       } else if (button.dataset.edit) {
         const user = list.find(item => item.id === Number(button.dataset.edit));
         if (user) await userForm(user);
+      } else if (button.dataset.devices) {
+        const user = list.find(item => item.id === Number(button.dataset.devices));
+        if (user) await deviceLimitDialog(user, list);
       } else if (button.dataset.servers) {
         await userServers(button.dataset.servers);
       } else if (button.dataset.preview) {
@@ -441,17 +496,108 @@
     return label;
   }
 
+  async function deviceLimitDialog(user, list) {
+    const hasLimit = user.device_limit !== null && user.device_limit !== undefined;
+    const status = user.device_limit_status || (user.limited_link ? 'ready' : hasLimit ? 'waiting' : 'none');
+    const statusText = ({
+      none: 'Для этой подписки лимит устройств не задан.',
+      waiting: user.device_limit_error || 'Ссылка создастся после появления файла в Google Drive.',
+      ready: 'Зашифрованная Happ-ссылка готова. Пользователям выдавайте её, а не обычную Drive-ссылку.',
+      error: user.device_limit_error || 'Happ не смог создать ссылку. Проверьте сообщение и повторите попытку.'
+    })[status] || 'Статус ссылки не определён.';
+    openModal(`Лимит устройств · ${user.name}`, `<div class="drive-share device-limit-dialog">
+      <div class="device-limit-status-card ${status === 'error' ? 'is-error' : status === 'ready' ? 'is-ready' : ''}" role="status">
+        <b>${hasLimit ? `Лимит: ${esc(user.device_limit)} устройств` : 'Без лимита устройств'}</b>
+        <span>${esc(statusText)}</span>
+      </div>
+      ${user.limited_link ? `<label class="device-limited-link-label">Основная ссылка с лимитом<input data-dl-url readonly value="${esc(user.limited_link)}" autocapitalize="off" autocomplete="off" spellcheck="false" aria-label="Зашифрованная ссылка Happ"></label>` : ''}
+      ${user.limited_link && user.drive_link ? `<p class="field-hint">Обычная ссылка Drive без ограничений доступна отдельно в карточке подписки.</p>` : ''}
+      <div class="drive-share-actions">
+        ${hasLimit && user.slug !== 'legacy' ? `<button class="button button-secondary" type="button" data-dl-edit>${svg('edit')}<span>Изменить лимит</span></button>` : ''}
+        ${hasLimit && status !== 'ready' ? `<button class="button button-primary" type="button" data-dl-retry ${!user.drive_file_id || !user.enabled || user.status !== 'active' ? 'disabled' : ''}>${svg('refresh')}<span>Повторить создание ссылки</span></button>` : ''}
+        ${hasLimit && status === 'ready' ? `<button class="button button-primary" type="button" data-dl-rebuild>${svg('link')}<span>Пересобрать ссылку · счётчик сохранится</span></button>` : ''}
+        ${user.limited_link ? `<button class="button button-secondary" type="button" data-dl-copy>${svg('copy')}<span>Копировать Happ-ссылку</span></button><button class="button button-secondary" type="button" data-dl-qr>${svg('qr')}<span>QR-код Happ</span></button>` : ''}
+        ${hasLimit && user.slug !== 'legacy' ? `<button class="button button-danger" type="button" data-dl-clear>${svg('trash')}<span>Убрать лимит</span></button>` : ''}
+        ${!hasLimit && user.slug !== 'legacy' ? `<button class="button button-primary" type="button" data-dl-edit>${svg('edit')}<span>Задать лимит</span></button>` : ''}
+      </div>
+      <p class="field-hint">Изменение числа устройств создаёт новый счётчик. Старые выданные ссылки продолжают работать. «Пересобрать ссылку» использует текущий счётчик. Чтобы отключить старый счётчик в Happ, используйте кабинет провайдера: Secure X пока не сохраняет его внутренний ID.</p>
+    </div>`);
+    const body = $('#modalBody');
+    body.onclick = async event => {
+      const button = event.target.closest('button');
+      if (!button) return;
+      try {
+        if (button.hasAttribute('data-dl-edit')) {
+          $('#modal').close();
+          await userForm(user);
+          return;
+        }
+        if (button.hasAttribute('data-dl-copy')) {
+          const input = $('[data-dl-url]', body);
+          copyText(input.value, input);
+          return;
+        }
+        if (button.hasAttribute('data-dl-qr')) {
+          await showDriveQr(user.id, true);
+          return;
+        }
+        if (button.hasAttribute('data-dl-clear')) {
+          if (!confirm('Убрать лимит из панели? Счётчик останется активным в Happ, и ранее выданная ссылка продолжит работать.')) return;
+          button.disabled = true;
+          const result = await api(`/api/admin/users/${encodeURIComponent(user.id)}/device-limit`, {method: 'DELETE', body: {}});
+          Object.assign(user, result, {limited_link: null, happ_install_code: null, device_limit_error: null});
+          const item = list.find(entry => entry.id === user.id);
+          if (item) Object.assign(item, user);
+          toast('Лимит убран из панели');
+        } else if (button.hasAttribute('data-dl-retry') || button.hasAttribute('data-dl-rebuild')) {
+          button.disabled = true;
+          const result = await api(`/api/admin/users/${encodeURIComponent(user.id)}/device-limit`, {
+            method: 'POST', body: {action: button.hasAttribute('data-dl-rebuild') ? 'rebuild' : 'retry'}
+          });
+          Object.assign(user, result);
+          const item = list.find(entry => entry.id === user.id);
+          if (item) Object.assign(item, user);
+          toast(result.device_limit_status === 'ready' ? 'Ссылка Happ обновлена' : 'Ссылка ожидает создания');
+        } else {
+          return;
+        }
+        await render();
+        await deviceLimitDialog(user, list);
+      } catch (failure) {
+        if (button.isConnected) button.disabled = false;
+        toast(failure.message);
+        try {
+          const refreshed = await api('/api/admin/users');
+          const item = (refreshed.users || []).find(entry => entry.id === user.id);
+          if (item) Object.assign(user, item);
+          await render();
+          await deviceLimitDialog(user, list);
+        } catch { /* keep the current dialog usable */ }
+      }
+    };
+  }
+
   async function userForm(user) {
     let defaultHideTraffic = false;
     let defaultIncludeSas = true;
+    const formSettings = await api('/api/admin/settings');
+    deviceLimitBounds = formSettings.device_limit_bounds || deviceLimitBounds;
     if (!user) {
-      const data = await api('/api/admin/settings');
+      const data = formSettings;
       defaultHideTraffic = data.settings?.hide_traffic_for_new_users === true;
       defaultIncludeSas = data.settings?.include_sas_for_new_users !== false;
+    }
+    const bounds = deviceLimitBounds;
+    if (!bounds || !Number.isInteger(Number(bounds.min)) || !Number.isInteger(Number(bounds.max))) {
+      throw new Error('Не удалось загрузить допустимый диапазон лимита устройств');
     }
     const isLegacy = user?.slug === 'legacy' || user?.drive_file_id === '160lsZ2nDrSXTzA09r9jeGHnd6QyFylw9';
     const hideTraffic = isLegacy ? false : (user ? user.hide_traffic_usage === true : defaultHideTraffic);
     const includeSas = user ? user.include_sas !== false : defaultIncludeSas;
+    const deviceLimitValue = user ? (user.device_limit ?? '') : (formSettings.settings?.device_limit_for_new_users ?? '');
+    const deviceStatus = user?.device_limit_status || (user?.limited_link ? 'ready' : user?.device_limit ? 'waiting' : 'none');
+    const deviceStatusText = ({ready: 'Ссылка Happ готова.', waiting: 'Ссылка создастся автоматически после появления файла в Google Drive.', error: `Ошибка Happ: ${user?.device_limit_error || 'повторите создание ссылки в настройках лимита.'}`})[deviceStatus]
+      || 'Без лимита. Ссылка Drive остаётся обычной.';
     const expiry = user?.expires_at ? new Date(user.expires_at) : null;
     const localExpiry = expiry ? new Date(expiry.getTime() - expiry.getTimezoneOffset() * 60000).toISOString().slice(0, 16) : '';
     openModal(user ? 'Настройки подписки' : 'Создание подписки', `<form id="userForm" class="subscription-form">
@@ -471,7 +617,11 @@
           <label class="switch-row access-switch"><input name="enabled" type="checkbox" ${user?.enabled === false ? '' : 'checked'}><span class="switch"></span><span><b>Подписка включена</b><small>При отключении ссылка покажет заглушку.</small></span></label></div>
         ${isLegacy ? '<div class="setting-note"><b>Счётчик трафика всегда виден</b><span>Это основная подписка; Happ показывает общий расход аккаунта провайдера.</span></div>' : `<label class="switch-row"><input name="hide_traffic_usage" type="checkbox" ${hideTraffic ? 'checked' : ''}><span class="switch"></span><span><b>Скрыть счётчик трафика</b><small>Управляет отображением общих данных провайдера в Happ.</small></span></label>`}
       </section>
-      <section class="form-section"><p class="eyebrow">04 / ВИД ПРОФИЛЯ</p><h3>Заголовок и сообщение</h3>
+      <section class="form-section device-limit-form-section"><p class="eyebrow">04 / УСТРОЙСТВА</p><h3>Лимит устройств Happ</h3>
+        <label>Максимальное количество устройств<input name="device_limit" type="number" min="${Number(bounds.min)}" max="${Number(bounds.max)}" step="1" inputmode="numeric" value="${esc(deviceLimitValue)}" placeholder="Без лимита" ${isLegacy ? 'disabled' : ''}><span class="field-hint">Пустое поле — без лимита. Допустимо от ${Number(bounds.min)} до ${Number(bounds.max)}. Новая или изменённая ссылка создаётся через Happ после появления файла в Drive.</span></label>
+        ${isLegacy ? '<p class="setting-note"><b>Для основной (legacy) подписки лимит отключён</b><span>Её Drive-ссылка и профиль не изменяются этой функцией.</span></p>' : `<p class="device-limit-current ${deviceStatus === 'error' ? 'tone-warn' : ''}" role="status">${esc(deviceStatusText)}</p>`}
+      </section>
+      <section class="form-section"><p class="eyebrow">05 / ВИД ПРОФИЛЯ</p><h3>Заголовок и сообщение</h3>
         <label>Заголовок профиля<input name="title_override" maxlength="200" value="${esc(user?.title_override || '')}" placeholder="Использовать название по умолчанию"></label>
         <label>Объявление<textarea name="announce_override" maxlength="4000" rows="3" placeholder="Оставьте пустым для общего объявления">${esc(user?.announce_override || '')}</textarea></label>
       </section>
@@ -488,9 +638,25 @@
       const form = event.currentTarget;
       const submit = $('button[type="submit"]', form);
       if (form.dataset.busy === '1') return;
+      const values = new FormData(form);
+      const rawDeviceLimit = String(values.get('device_limit') || '').trim();
+      const requestedDeviceLimit = rawDeviceLimit === '' ? null : Number(rawDeviceLimit);
+      if (requestedDeviceLimit !== null && (!Number.isInteger(requestedDeviceLimit)
+        || requestedDeviceLimit < Number(bounds.min) || requestedDeviceLimit > Number(bounds.max))) {
+        toast(`Лимит должен быть целым числом от ${bounds.min} до ${bounds.max}`);
+        return;
+      }
+      const previousDeviceLimit = user?.device_limit ?? null;
+      if (user && requestedDeviceLimit !== previousDeviceLimit) {
+        const message = requestedDeviceLimit === null
+          ? 'Убрать лимит в панели? Счётчик останется активным в Happ, поэтому ранее выданные ссылки продолжат работать.'
+          : previousDeviceLimit !== null
+            ? `Создать новый счётчик Happ на ${requestedDeviceLimit} устройств? Старый счётчик и уже выданная ссылка продолжат работать у тех, кто её добавил.`
+            : `Создать новый счётчик Happ на ${requestedDeviceLimit} устройств?`;
+        if (!confirm(message)) return;
+      }
       form.dataset.busy = '1'; submit.disabled = true;
       submit.innerHTML = `<span class="spinner"></span><span>${user ? 'Сохраняю изменения…' : 'Создаю профиль…'}</span>`;
-      const values = new FormData(form);
       const expiryValue = values.get('expires_at');
       try {
         const body = {
@@ -501,7 +667,8 @@
           // The legacy account always keeps the provider counter visible.
           hide_traffic_usage: isLegacy ? false : values.has('hide_traffic_usage'),
           include_sas: values.get('include_sas') === 'with-sas',
-          traffic_limit_bytes: user?.traffic_limit_bytes ?? null
+          traffic_limit_bytes: user?.traffic_limit_bytes ?? null,
+          device_limit: requestedDeviceLimit
         };
         const result = await api(user ? `/api/admin/users/${user.id}` : '/api/admin/users', {
           method: user ? 'PUT' : 'POST', body
@@ -704,6 +871,10 @@
     const data = await api('/api/admin/settings');
     const settings = data.settings || {};
     const sas = data.sas || {};
+    const happ = data.happ || {};
+    deviceLimitBounds = data.device_limit_bounds || deviceLimitBounds;
+    const deviceMin = Number(deviceLimitBounds?.min);
+    const deviceMax = Number(deviceLimitBounds?.max);
     const textarea = (name, label, hint = '') => `<label>${label}<textarea name="${name}" rows="${name === 'days' ? 5 : 7}">${esc((settings[name] || []).join('\n'))}</textarea>${hint ? `<span class="field-hint">${hint}</span>` : ''}</label>`;
     root.innerHTML = pageHead('Настройки') + `<form id="settingsForm" class="surface-card settings-form">
       <div class="form-section"><p class="eyebrow">ПРОФИЛЬ</p><h2>Внешний вид подписки</h2>
@@ -718,6 +889,15 @@
       <div class="form-section"><p class="eyebrow">НОВЫЕ ПОДПИСКИ</p><h2>Счётчик трафика в клиенте</h2>
         <label class="switch-row"><input name="hide_traffic_for_new_users" type="checkbox" ${settings.hide_traffic_for_new_users ? 'checked' : ''}><span class="switch"></span><span><b>Скрывать счётчик по умолчанию</b><small>Применяется только к новым пользователям. Переключатель можно изменить отдельно в каждой подписке. Основная подписка всегда показывает общий трафик аккаунта.</small></span></label>
         <span class="field-hint">Если счётчик включён, VPN-клиент увидит общий трафик провайдера. Это не отдельный лимит или учёт расхода конкретного пользователя.</span>
+      </div>
+      <div class="form-section device-limit-settings-section"><p class="eyebrow">HAPP LIMITED LINKS</p><h2>Ограничение числа устройств</h2>
+        <article class="device-limit-settings-card surface-card">
+          <div><b>${happ.configured ? 'API Happ настроен' : 'Нужны переменные Happ'}</b><small>${happ.configured ? 'Ссылки можно создавать из карточек подписок.' : 'Добавьте HAPP_PROVIDER_CODE и HAPP_AUTH_KEY в Secrets сервиса Secure X на Render.'}</small></div>
+          <span class="badge ${happ.configured ? 'badge-good' : 'badge-warn'}">${happ.configured ? 'Подключён' : 'Не настроен'}</span>
+          <div class="device-limit-settings-meta"><span>Provider ID для профилей</span><strong class="${happ.provider_id_configured ? 'tone-good' : 'tone-warn'}">${happ.provider_id_configured ? 'Задан' : 'Не задан'}</strong></div>
+        </article>
+        <label>Лимит устройств для новых подписок по умолчанию<input name="device_limit_for_new_users" type="number" min="${deviceMin}" max="${deviceMax}" step="1" inputmode="numeric" value="${esc(settings.device_limit_for_new_users ?? '')}" placeholder="Без лимита"><span class="field-hint">Пустое поле — новые подписки создаются без лимита. Допустимый диапазон: ${deviceMin}–${deviceMax}; для отдельных пользователей значение можно изменить в форме подписки.</span></label>
+        <span class="field-hint">Устройства считает Happ по install code и HWID. Обычная ссылка Drive остаётся без ограничения.</span>
       </div>
       <div class="form-section sas-settings-section"><p class="eyebrow">ИСТОЧНИК SAS</p><h2>Серверы из SAS</h2>
         <article class="sas-status-card surface-card">
@@ -749,6 +929,7 @@
         announce_enabled: fields.has('announce_enabled'), announce_refresh_minutes: Number(fields.get('announce_refresh_minutes')),
         hide_traffic_for_new_users: fields.has('hide_traffic_for_new_users'),
         include_sas_for_new_users: fields.has('include_sas_for_new_users'),
+        device_limit_for_new_users: fields.get('device_limit_for_new_users') === '' ? null : Number(fields.get('device_limit_for_new_users')),
         days: fields.get('days').split('\n').map(line => line.trim()).filter(Boolean),
         quotes: fields.get('quotes').split('\n').map(line => line.trim()).filter(Boolean),
         footers: fields.get('footers').split('\n').map(line => line.trim()).filter(Boolean)
