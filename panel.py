@@ -17,6 +17,7 @@ import secrets
 import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 from urllib.parse import quote, unquote, urlencode, urlsplit
 
 import asyncpg
@@ -25,9 +26,10 @@ import qrcode
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 from qrcode.image.svg import SvgPathImage
 from starlette.middleware.base import BaseHTTPMiddleware
+import happ_limit
 
 log = logging.getLogger("vpn_panel")
 router = APIRouter()
@@ -74,6 +76,7 @@ DEFAULT_SETTINGS = {
     "default_traffic_limit_bytes": None,
     "hide_traffic_for_new_users": False,
     "include_sas_for_new_users": True,
+    "device_limit_for_new_users": None,
     "quotes": QUOTE_DEFAULTS, "footers": FOOTER_DEFAULTS, "days": DAY_DEFAULTS,
 }
 
@@ -533,6 +536,7 @@ class PanelState:
         self.login_fails: dict[str, tuple[int, float]] = {}
         self.drive_push_last: float = 0.0
         self.drive_push_error: str | None = None
+        self.happ_tasks: set[asyncio.Task] = set()
 
     @property
     def db_configured(self):
@@ -584,6 +588,11 @@ class PanelState:
             ON CONFLICT (slug) DO NOTHING""", LEGACY_DRIVE_FILE_ID)
 
     async def close(self):
+        for task in tuple(self.happ_tasks):
+            task.cancel()
+        if self.happ_tasks:
+            await asyncio.gather(*self.happ_tasks, return_exceptions=True)
+        self.happ_tasks.clear()
         if self.upstream_client is not None:
             await self.upstream_client.aclose()
             self.upstream_client = None
@@ -851,6 +860,11 @@ class UserBody(BaseModel):
     traffic_limit_bytes: int | None = Field(default=None, ge=1_000_000, le=1_000_000_000_000)
     hide_traffic_usage: bool | None = None
     include_sas: bool | None = None
+    device_limit: StrictInt | None = Field(default=None, ge=happ_limit.MIN_LIMIT, le=happ_limit.MAX_LIMIT)
+
+
+class DeviceLimitActionBody(BaseModel):
+    action: Literal["retry", "rebuild"] = "retry"
 
 
 class ServerBody(BaseModel):
@@ -875,7 +889,13 @@ def _expiry_utc(value: datetime | None) -> datetime | None:
 
 
 def _serialize(row):
-    return dict(row) if row is not None else None
+    if row is None:
+        return None
+    result = dict(row)
+    # The install code is needed only for server-side rebuilds. Never expose it
+    # through the generic admin serializer (the encrypted link is user-facing).
+    result.pop("happ_install_code", None)
+    return result
 
 
 async def _settings(conn) -> dict:
@@ -1324,6 +1344,9 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
              f"#profile-update-interval: {int(settings.get('update_interval', 1))}",
              "#announce: base64:" + base64.b64encode(announcement.encode()).decode(),
              "#support-url: " + str(settings.get("support_url", "https://t.me/moserrr1"))]
+    provider_id = os.getenv("HAPP_PROVIDER_ID", "").strip()
+    if re.fullmatch(r"[A-Za-z0-9]{8}", provider_id):
+        lines.append("#providerid " + provider_id)
     is_legacy = user.get("slug") == "legacy" or user.get("drive_file_id") == LEGACY_DRIVE_FILE_ID
     if is_legacy or not bool(user.get("hide_traffic_usage", False)):
         expiry = int(user["expires_at"].timestamp()) if user.get("expires_at") else None
@@ -1470,15 +1493,21 @@ async def dashboard(request: Request):
     pool = await state.db(required=False)
     db_info = {"connected": pool is not None, "error": state.db_error if pool is None else None}
     user_count = {"active": 0, "disabled": 0, "total": 0}
+    device_limit_count = 0
+    device_limit_errors = 0
     errors = []
     last_script = None
     if pool:
         async with pool.acquire() as conn:
-            rows = await conn.fetch("SELECT enabled,status,expires_at FROM users")
+            rows = await conn.fetch("SELECT enabled,status,expires_at,slug,drive_file_id,device_limit,device_limit_status FROM users")
             user_count["total"] = len(rows)
             for row in rows:
                 if row["enabled"] and row["status"] == "active" and (row["expires_at"] is None or row["expires_at"] > datetime.now(timezone.utc)): user_count["active"] += 1
                 else: user_count["disabled"] += 1
+                if row["device_limit"] is not None and row["slug"] != "legacy" and row["drive_file_id"] != LEGACY_DRIVE_FILE_ID:
+                    device_limit_count += 1
+                    if row["device_limit_status"] == "error":
+                        device_limit_errors += 1
             errors = [dict(r) for r in await conn.fetch("SELECT id,name,last_sync_error,last_synced_at FROM users WHERE last_sync_error IS NOT NULL ORDER BY updated_at DESC")]
             row = await conn.fetchrow("SELECT value FROM app_state WHERE key='last_script_request'")
             if row: last_script = row["value"]
@@ -1505,6 +1534,7 @@ async def dashboard(request: Request):
             "server_count": len(_extract_uris(_decode_subscription(state.combined_body or state.upstream_body))) if (state.combined_body or state.upstream_body) else 0,
             "warning": state.upstream_warning}, "traffic": {"upload": data.get("upload", 0), "download": data.get("download", 0),
             "total": data.get("total", 0), "expire": data.get("expire", 0)}, "users": user_count,
+            "device_limits": {"count": device_limit_count, "errors": device_limit_errors},
             "sources": {"primary": {"configured": bool(os.getenv("SUBSCRIPTION_URL", "").strip()),
                                      "server_count": primary_server_count},
                         "sas": {"configured": bool(os.getenv("SAS_SUBSCRIPTION_URL", "").strip()),
@@ -1532,7 +1562,7 @@ async def users_list(request: Request):
         user["drive_link"] = (_drive_subscription_link(user["drive_file_id"])
                               if user.get("drive_file_id") and api_key_configured else None)
         users.append(user)
-    return {"users": users}
+    return {"users": users, "device_limit_bounds": {"min": happ_limit.MIN_LIMIT, "max": happ_limit.MAX_LIMIT}}
 
 
 @router.post("/api/admin/users")
@@ -1551,9 +1581,23 @@ async def users_create(data: UserBody, request: Request):
                         else bool(settings.get("hide_traffic_for_new_users", False)))
         include_sas = bool(data.include_sas if data.include_sas is not None
                            else settings.get("include_sas_for_new_users", True))
-        row = await conn.fetchrow("""INSERT INTO users(name,slug,note,enabled,expires_at,title_override,announce_override,traffic_limit_bytes,hide_traffic_usage,include_sas)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *""", data.name.strip(), slug, data.note, data.enabled,
-            _expiry_utc(data.expires_at), data.title_override, data.announce_override, data.traffic_limit_bytes, hide_traffic, include_sas)
+        device_limit = data.device_limit if "device_limit" in data.model_fields_set else settings.get("device_limit_for_new_users")
+        if device_limit is not None:
+            try:
+                if isinstance(device_limit, bool) or (isinstance(device_limit, float) and not device_limit.is_integer()):
+                    raise ValueError
+                device_limit = int(device_limit)
+            except (TypeError, ValueError, OverflowError):
+                raise HTTPException(422, f"Лимит устройств должен быть целым числом от {happ_limit.MIN_LIMIT} до {happ_limit.MAX_LIMIT}")
+            if not happ_limit.MIN_LIMIT <= device_limit <= happ_limit.MAX_LIMIT:
+                raise HTTPException(422, f"Лимит устройств должен быть целым числом от {happ_limit.MIN_LIMIT} до {happ_limit.MAX_LIMIT}")
+        device_status = "waiting" if device_limit is not None else "none"
+        row = await conn.fetchrow("""INSERT INTO users(name,slug,note,enabled,expires_at,title_override,announce_override,traffic_limit_bytes,hide_traffic_usage,include_sas,device_limit,device_limit_status)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *""", data.name.strip(), slug, data.note, data.enabled,
+            _expiry_utc(data.expires_at), data.title_override, data.announce_override, data.traffic_limit_bytes, hide_traffic, include_sas,
+            device_limit, device_status)
+    if row["device_limit"] is not None:
+        _schedule_limited_link(row["id"])
     drive_sync = await state.push_drive_sync([row["id"]])
     return {"user": _serialize(row), "drive_sync": drive_sync}
 
@@ -1565,13 +1609,29 @@ async def users_update(user_id: int, data: UserBody, request: Request):
         raise HTTPException(422, "Заголовок профиля не должен содержать переносы строк")
     pool = await state.db()
     async with pool.acquire() as conn:
+        old_limit = await conn.fetchrow("SELECT slug,drive_file_id,device_limit FROM users WHERE id=$1 AND status='active'", user_id)
+        if not old_limit:
+            raise HTTPException(404, "Пользователь не найден")
+        limit_supplied = "device_limit" in data.model_fields_set
+        if limit_supplied and (old_limit["slug"] == "legacy" or old_limit["drive_file_id"] == LEGACY_DRIVE_FILE_ID) and data.device_limit is not None:
+            raise HTTPException(409, "Основная (legacy) подписка всегда остаётся без лимита устройств")
+        limit_changed = limit_supplied and data.device_limit != old_limit["device_limit"]
         row = await conn.fetchrow("""UPDATE users SET name=$2,note=$3,enabled=$4,expires_at=$5,title_override=$6,
             announce_override=$7,traffic_limit_bytes=$8,
             hide_traffic_usage=CASE WHEN slug='legacy' OR drive_file_id=$10 THEN FALSE ELSE COALESCE($9,hide_traffic_usage) END,
-            include_sas=COALESCE($11,include_sas),updated_at=now() WHERE id=$1 AND status='active' RETURNING *""", user_id,
+            include_sas=COALESCE($11,include_sas),
+            device_limit=CASE WHEN $12 THEN $13 ELSE device_limit END,
+            happ_install_code=CASE WHEN $14 THEN NULL ELSE happ_install_code END,
+            limited_link=CASE WHEN $14 THEN NULL ELSE limited_link END,
+            device_limit_status=CASE WHEN $14 THEN CASE WHEN $13 IS NULL THEN 'none' ELSE 'waiting' END ELSE device_limit_status END,
+            device_limit_error=CASE WHEN $14 THEN NULL ELSE device_limit_error END,
+            updated_at=now() WHERE id=$1 AND status='active' RETURNING *""", user_id,
             data.name.strip(), data.note, data.enabled, _expiry_utc(data.expires_at), data.title_override, data.announce_override,
-            data.traffic_limit_bytes, data.hide_traffic_usage, LEGACY_DRIVE_FILE_ID, data.include_sas)
+            data.traffic_limit_bytes, data.hide_traffic_usage, LEGACY_DRIVE_FILE_ID, data.include_sas,
+            limit_supplied, data.device_limit, limit_changed)
     if not row: raise HTTPException(404, "Пользователь не найден")
+    if row["device_limit"] is not None:
+        _schedule_limited_link(user_id)
     drive_sync = await state.push_drive_sync([user_id])
     return {"user": _serialize(row), "drive_sync": drive_sync}
 
@@ -1611,6 +1671,106 @@ def _drive_subscription_link(file_id: str) -> str:
     return f"https://www.googleapis.com/drive/v3/files/{file_id}?{query}"
 
 
+_happ_user_locks: dict[int, asyncio.Lock] = {}
+
+
+async def _set_device_limit_error(user_id: int, limit: int, message: str) -> None:
+    pool = await state.db()
+    async with pool.acquire() as conn:
+        await conn.execute("""UPDATE users SET device_limit_status='error',device_limit_error=$3,updated_at=now()
+            WHERE id=$1 AND device_limit=$2 AND status='active' AND enabled=TRUE""", user_id, limit, message[:500])
+
+
+async def _create_limited_link(user_id: int, *, rebuild: bool = False) -> dict:
+    lock = _happ_user_locks.setdefault(user_id, asyncio.Lock())
+    async with lock:
+        pool = await state.db()
+        async with pool.acquire() as conn:
+            user = await conn.fetchrow("""SELECT id,slug,status,enabled,expires_at,drive_file_id,device_limit,
+                device_limit_status,happ_install_code,limited_link FROM users WHERE id=$1""", user_id)
+        if not user:
+            raise HTTPException(404, "Пользователь не найден")
+        if user["slug"] == "legacy" or user["drive_file_id"] == LEGACY_DRIVE_FILE_ID:
+            raise HTTPException(409, "Основная (legacy) подписка всегда остаётся без лимита устройств")
+        limit = user["device_limit"]
+        if limit is None:
+            raise HTTPException(409, "Для подписки не задан лимит устройств")
+        if user["status"] != "active" or not user["enabled"]:
+            raise HTTPException(409, "Отключённая или удаляемая подписка не получает новую ссылку")
+        expires_at = user["expires_at"]
+        if expires_at is not None and expires_at <= datetime.now(timezone.utc):
+            raise HTTPException(409, "Срок подписки истёк; новая ссылка не создавалась")
+        if not user["drive_file_id"]:
+            async with pool.acquire() as conn:
+                await conn.execute("""UPDATE users SET device_limit_status='waiting',
+                    device_limit_error='Ожидается создание файла подписки в Google Drive'
+                    WHERE id=$1 AND device_limit=$2 AND status='active'""", user_id, limit)
+            raise HTTPException(409, "Файл подписки ещё не создан в Google Drive")
+
+        existing_code = user["happ_install_code"]
+        if rebuild and not existing_code:
+            raise HTTPException(409, "Счётчик Happ ещё не создан; сначала повторите создание ссылки")
+        provider_code = os.getenv("HAPP_PROVIDER_CODE", "").strip()
+        auth_key = os.getenv("HAPP_AUTH_KEY", "").strip()
+        if not happ_limit.is_configured(provider_code, auth_key):
+            error = "Задайте HAPP_PROVIDER_CODE и HAPP_AUTH_KEY в переменных Render"
+            await _set_device_limit_error(user_id, limit, error)
+            raise HTTPException(503, error)
+
+        try:
+            drive_url = _drive_subscription_link(user["drive_file_id"])
+            async with pool.acquire() as conn:
+                await conn.execute("""UPDATE users SET device_limit_status='waiting',device_limit_error=NULL
+                    WHERE id=$1 AND device_limit=$2 AND status='active' AND enabled=TRUE""", user_id, limit)
+            async with _happ_client() as client:
+                code = existing_code
+                if not code:
+                    code = await happ_limit.create_install_code(client, provider_code, auth_key, int(limit))
+                    async with pool.acquire() as conn:
+                        saved = await conn.fetchrow("""UPDATE users SET happ_install_code=$3,device_limit_status='waiting',
+                            device_limit_error=NULL,updated_at=now() WHERE id=$1 AND device_limit=$2 AND status='active'
+                            AND enabled=TRUE AND drive_file_id=$4 RETURNING id""", user_id, limit, code, user["drive_file_id"])
+                    if not saved:
+                        raise HTTPException(409, "Настройки подписки изменились во время создания ссылки")
+                encrypted = await happ_limit.encrypt_link(client, happ_limit.limited_source_url(drive_url, code))
+            async with pool.acquire() as conn:
+                saved = await conn.fetchrow("""UPDATE users SET happ_install_code=$3,limited_link=$4,
+                    device_limit_status='ready',device_limit_error=NULL,updated_at=now()
+                    WHERE id=$1 AND device_limit=$2 AND status='active' AND enabled=TRUE AND drive_file_id=$5
+                    RETURNING id""", user_id, limit, code, encrypted, user["drive_file_id"])
+            if not saved:
+                raise HTTPException(409, "Настройки подписки изменились во время создания ссылки")
+            log.info("Happ limited link ready: user=%d limit=%d reused-counter=%s", user_id, limit,
+                     "yes" if existing_code else "no")
+            return {"ok": True, "device_limit": limit, "limited_link": encrypted,
+                    "device_limit_status": "ready", "device_limit_error": None}
+        except (happ_limit.HappLimitError, HTTPException) as exc:
+            message = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+            await _set_device_limit_error(user_id, limit, message)
+            if isinstance(exc, happ_limit.HappLimitError):
+                raise HTTPException(502, message) from None
+            raise
+
+
+async def _background_limited_link(user_id: int) -> None:
+    try:
+        await _create_limited_link(user_id)
+    except (HTTPException, happ_limit.HappLimitError) as exc:
+        # The status and safe reason are stored for the administrator; do not
+        # log credentials, provider URLs, subscription links, or response bodies.
+        log.info("Happ link is not ready: user=%d reason=%s", user_id, type(exc).__name__)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.warning("Happ background attempt failed: user=%d error=%s", user_id, type(exc).__name__)
+
+
+def _schedule_limited_link(user_id: int) -> None:
+    task = asyncio.create_task(_background_limited_link(user_id))
+    state.happ_tasks.add(task)
+    task.add_done_callback(state.happ_tasks.discard)
+
+
 def _drive_qr_svg(link: str) -> str:
     code = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=8, border=4)
     code.add_data(link)
@@ -1644,6 +1804,45 @@ async def drive_qr(user_id: int, request: Request):
     svg = _drive_qr_svg(_drive_subscription_link(user["drive_file_id"]))
     return Response(content=svg, media_type="image/svg+xml",
                     headers={"Cache-Control": "no-store", "Content-Disposition": "inline; filename=subscription-qr.svg"})
+
+
+def _happ_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=happ_limit.REQUEST_TIMEOUT, follow_redirects=False)
+
+
+@router.post("/api/admin/users/{user_id}/device-limit")
+async def device_limit_action(user_id: int, data: DeviceLimitActionBody, request: Request):
+    _auth(request, csrf=True)
+    return await _create_limited_link(user_id, rebuild=data.action == "rebuild")
+
+
+@router.delete("/api/admin/users/{user_id}/device-limit")
+async def device_limit_clear(user_id: int, request: Request):
+    _auth(request, csrf=True)
+    pool = await state.db()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""UPDATE users SET device_limit=NULL,happ_install_code=NULL,limited_link=NULL,
+            device_limit_status='none',device_limit_error=NULL,updated_at=now() WHERE id=$1 RETURNING id""", user_id)
+    if not row:
+        raise HTTPException(404, "Пользователь не найден")
+    # This table stores the install code but not Happ's numeric counter ID, so
+    # clearing it locally cannot disable a link that has already been issued.
+    return {"ok": True, "device_limit": None, "device_limit_status": "none"}
+
+
+@router.get("/api/admin/users/{user_id}/limited-qr.svg")
+async def limited_qr(user_id: int, request: Request):
+    _auth(request)
+    pool = await state.db()
+    async with pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT limited_link FROM users WHERE id=$1", user_id)
+    if not user:
+        raise HTTPException(404, "Пользователь не найден")
+    if not user["limited_link"]:
+        raise HTTPException(409, "Ссылка с лимитом ещё не создана")
+    svg = _drive_qr_svg(user["limited_link"])
+    return Response(content=svg, media_type="image/svg+xml",
+                    headers={"Cache-Control": "no-store", "Content-Disposition": "inline; filename=limited-subscription-qr.svg"})
 
 
 @router.post("/api/admin/drive/sync")
@@ -1748,7 +1947,11 @@ async def settings_get(request: Request):
                             if not is_excluded_sas_server(uri)]
             except (ValueError, UnicodeDecodeError):
                 sas_uris = []
-        return {"settings": await _settings(conn), "sas": {
+        return {"settings": await _settings(conn),
+            "device_limit_bounds": {"min": happ_limit.MIN_LIMIT, "max": happ_limit.MAX_LIMIT},
+            "happ": {"configured": happ_limit.is_configured(os.getenv("HAPP_PROVIDER_CODE"), os.getenv("HAPP_AUTH_KEY")),
+                     "provider_id_configured": bool(re.fullmatch(r"[A-Za-z0-9]{8}", os.getenv("HAPP_PROVIDER_ID", "").strip()))},
+            "sas": {
             "configured": bool(os.getenv("SAS_SUBSCRIPTION_URL", "").strip()),
             "server_count": len(sas_uris),
             "last_success_at": state.sas_success_at,
@@ -1776,6 +1979,20 @@ async def settings_put(data: SettingsBody, request: Request):
             if traffic_limit < 1_000_000 or traffic_limit > 1_000_000_000_000:
                 raise HTTPException(422, "Лимит трафика должен быть от 1 МБ до 1 ТБ")
             values["default_traffic_limit_bytes"] = traffic_limit
+    if "device_limit_for_new_users" in values:
+        limit = values["device_limit_for_new_users"]
+        if limit in (None, ""):
+            values["device_limit_for_new_users"] = None
+        else:
+            try:
+                if isinstance(limit, bool) or (isinstance(limit, float) and not limit.is_integer()):
+                    raise ValueError
+                limit = int(limit)
+            except (TypeError, ValueError):
+                raise HTTPException(422, f"Лимит по умолчанию должен быть пустым или числом от {happ_limit.MIN_LIMIT} до {happ_limit.MAX_LIMIT}")
+            if not happ_limit.MIN_LIMIT <= limit <= happ_limit.MAX_LIMIT:
+                raise HTTPException(422, f"Лимит по умолчанию должен быть пустым или числом от {happ_limit.MIN_LIMIT} до {happ_limit.MAX_LIMIT}")
+            values["device_limit_for_new_users"] = limit
     allowed = set(DEFAULT_SETTINGS)
     if set(values) - allowed: raise HTTPException(422, "Неизвестные настройки")
     string_limits = {"title": 200, "support_url": 2048, "web_page_url": 2048, "timezone": 128}
@@ -1809,7 +2026,8 @@ async def settings_put(data: SettingsBody, request: Request):
                 await conn.execute("INSERT INTO settings(key,value) VALUES($1,$2::jsonb) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", key, json.dumps(value, ensure_ascii=False))
     state.announce_cache = None
     drive_sync = await state.push_drive_sync() if set(values) - {
-        "default_traffic_limit_bytes", "hide_traffic_for_new_users", "include_sas_for_new_users"
+        "default_traffic_limit_bytes", "hide_traffic_for_new_users", "include_sas_for_new_users",
+        "device_limit_for_new_users"
     } else None
     return {"settings": values, "drive_sync": drive_sync}
 
@@ -1828,11 +2046,13 @@ def _safe_sync_error(message: str | None) -> str | None:
         return None
     value = str(message)
     for name in ("DATABASE_URL", "ADMIN_PASSWORD", "SESSION_SECRET", "SYNC_KEY", "DRIVE_API_KEY",
-                 "SUBSCRIPTION_URL", "SAS_SUBSCRIPTION_URL"):
+                 "SUBSCRIPTION_URL", "SAS_SUBSCRIPTION_URL", "HAPP_PROVIDER_CODE", "HAPP_AUTH_KEY"):
         secret = os.getenv(name, "")
         if secret:
             value = value.replace(secret, "[секрет скрыт]")
     value = re.sub(r"https?://\S+", "[адрес скрыт]", value, flags=re.I)
+    value = re.sub(r"(?i)happ://crypt\S+", "[ссылка Happ скрыта]", value)
+    value = re.sub(r"(?i)installid=[A-Za-z0-9]{12}", "installid=[скрыто]", value)
     value = re.sub(r"(?i)(?:vless|vmess|trojan|ss|hysteria2?|tuic)://\S+", "[сервер скрыт]", value)
     return value[:1000]
 
@@ -1921,13 +2141,15 @@ async def sync_report(data: SyncReport, request: Request):
     safe_error = _safe_sync_error(data.error) if not data.ok else None
     async with pool.acquire() as conn:
         await conn.execute("INSERT INTO app_state(key,value) VALUES('last_script_request',to_jsonb(now())) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value")
-        user = await conn.fetchrow("SELECT id,status FROM users WHERE id=$1", data.user_id)
+        user = await conn.fetchrow("SELECT id,status,device_limit FROM users WHERE id=$1", data.user_id)
         if not user: return {"ok": True, "ignored": True}
         if user["status"] == "pending_delete" and data.ok:
             await conn.execute("DELETE FROM users WHERE id=$1", data.user_id)
             return {"ok": True, "deleted": True}
         await conn.execute("""UPDATE users SET drive_file_id=COALESCE($2,drive_file_id),last_synced_at=CASE WHEN $3 THEN now() ELSE last_synced_at END,
             last_sync_error=$4,updated_at=now() WHERE id=$1""", data.user_id, data.drive_file_id, data.ok, safe_error)
+    if data.ok and user["device_limit"] is not None:
+        _schedule_limited_link(data.user_id)
     return {"ok": True}
 
 

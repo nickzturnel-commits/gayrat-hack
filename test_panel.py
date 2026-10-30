@@ -120,8 +120,13 @@ class FakeConn:
         return []
 
     async def fetchrow(self, query, *args):
-        if "SELECT id,status FROM users" in query:
-            return {"id": args[0], "status": self.status}
+        if "SELECT id,status" in query and "FROM users" in query:
+            matching = next((user for user in self.users if user.get("id") == args[0]), None)
+            if matching is not None:
+                return {"id": args[0], "status": matching.get("status", self.status),
+                        "device_limit": matching.get("device_limit")}
+            if self.status in {"active", "pending_delete"}:
+                return {"id": args[0], "status": self.status, "device_limit": None}
         return None
 
     async def fetchval(self, query, *args):
@@ -1016,7 +1021,7 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
             async def fetchrow(self, query, *args):
                 self.insert_query = query
                 self.insert_args = args
-                return {"id": 41, "hide_traffic_usage": args[8]}
+                return {"id": 41, "hide_traffic_usage": args[8], "device_limit": args[10]}
 
         for explicit, default, expected in ((None, True, True), (False, True, False), (True, False, True)):
             with self.subTest(explicit=explicit, default=default):
@@ -1026,6 +1031,7 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
                      patch.object(panel.state, "db", new=AsyncMock(return_value=pool)), \
                      patch.object(panel, "_settings", new=AsyncMock(return_value=dict(
                          panel.DEFAULT_SETTINGS, hide_traffic_for_new_users=default))), \
+                     patch.object(panel, "_schedule_limited_link"), \
                      patch.object(panel.state, "push_drive_sync", new=AsyncMock(return_value={"ok": True})):
                     data = panel.UserBody(name="New user", hide_traffic_usage=explicit)
                     result = await panel.users_create(data, make_request())
@@ -1218,22 +1224,26 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mobile.status_code, 200)
         self.assertIn('class="desktop-ui"', desktop.text)
         self.assertIn('class="mobile-ui"', mobile.text)
-        self.assertIn("/static/admin.js?v=20261029-2", desktop.text)
-        self.assertIn("/static/admin.js?v=20261029-2", mobile.text)
+        self.assertIn("/static/admin.js?v=20261030-1", desktop.text)
+        self.assertIn("/static/admin.js?v=20261030-1", mobile.text)
         self.assertIn("/static/admin-actions.js?v=20261029-2", desktop.text)
         self.assertIn("/static/admin-actions.js?v=20261029-2", mobile.text)
-        self.assertIn("/static/admin.css?v=20261028-7", desktop.text)
-        self.assertIn("/static/admin.css?v=20261028-7", mobile.text)
+        self.assertIn("/static/admin.css?v=20261030-1", desktop.text)
+        self.assertIn("/static/admin.css?v=20261030-1", mobile.text)
         self.assertIn('class="mobile-nav-glider"', mobile.text)
         self.assertIn('data-active-index="0"', mobile.text)
         self.assertEqual(javascript.status_code, 200)
         self.assertIn('name="expires_at" type="datetime-local"', javascript.text)
         self.assertIn("Подписка отключена, ссылка заменена заглушкой", javascript.text)
         self.assertIn("dataset.activeIndex = String(index)", javascript.text)
-        self.assertIn('class="button button-secondary user-qr-action" data-action="qr" data-user-id=', javascript.text)
+        self.assertIn('class="button button-secondary user-qr-action" data-action="qr" data-limited=', javascript.text)
+        self.assertIn("const mainLink = hasLimit ? (user.limited_link || '') : (user.drive_link || '');", javascript.text)
+        self.assertIn("Скопировать зашифрованную подписку Happ с лимитом", javascript.text)
+        self.assertIn('aria-label="${esc(mainLinkTitle)}" title="${esc(mainLinkTitle)}"', javascript.text)
+        self.assertIn('hasLimit && user.drive_link ? `<button class="button button-secondary" data-action="copy-link"', javascript.text)
         self.assertIn('data-action="copy-link" data-link=', javascript.text)
         self.assertNotIn('data-action="qr" data-link=', javascript.text)
-        self.assertIn("showDriveQr(shareAction.userId)", javascript.text)
+        self.assertIn("showDriveQr(shareAction.userId, button.dataset.limited === 'yes')", javascript.text)
         self.assertIn("driveQrLoadingContent()", javascript.text)
         self.assertIn("credentials: 'same-origin'", javascript.text)
         self.assertIn("window.PanelAdminActions.formatDate(value)", javascript.text)

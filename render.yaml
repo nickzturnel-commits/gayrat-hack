@@ -42,3 +42,9 @@ services:
         sync: false
       - key: DRIVE_API_KEY
         sync: false
+      - key: HAPP_PROVIDER_CODE
+        sync: false
+      - key: HAPP_AUTH_KEY
+        sync: false
+      - key: HAPP_PROVIDER_ID
+        sync: false
