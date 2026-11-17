@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 from contextlib import asynccontextmanager
 import hashlib
 import hmac
@@ -33,6 +34,7 @@ import happ_limit
 
 log = logging.getLogger("vpn_panel")
 router = APIRouter()
+_test_environment = contextvars.ContextVar("panel_test_environment", default=False)
 
 LEGACY_DRIVE_FILE_ID = "160lsZ2nDrSXTzA09r9jeGHnd6QyFylw9"
 PANEL_UPSTREAM_DEFAULT_USER_AGENT = "Happ"
@@ -513,8 +515,11 @@ def is_excluded_sas_server(uri: str) -> bool:
 class PanelState:
     def __init__(self):
         self.pool = None
+        self.test_pool = None
         self.db_error = "База ещё не проверялась"
+        self.test_db_error = "Тестовая база ещё не проверялась"
         self.db_last_attempt = 0.0
+        self.test_db_last_attempt = 0.0
         self.upstream_client: httpx.AsyncClient | None = None
         self.upstream_body: bytes | None = None
         self.upstream_headers: dict[str, str] = {}
@@ -531,7 +536,7 @@ class PanelState:
         self.combined_fetched_at = 0.0
         self.combined_success_at: float | None = None
         self.upstream_lock = asyncio.Lock()
-        self.announce_cache: tuple[int, str] | None = None
+        self.announce_cache: tuple[tuple, str] | None = None
         self.announce_quote: str | None = None
         self.login_fails: dict[str, tuple[int, float]] = {}
         self.drive_push_last: float = 0.0
@@ -558,8 +563,11 @@ class PanelState:
     async def connect(self):
         if not self.db_configured:
             self.db_error = "DATABASE_URL не задан"
+            self.test_db_error = "DATABASE_URL не задан"
             return
         if self.pool is not None:
+            if self.test_pool is None and time.monotonic() - self.test_db_last_attempt >= 4:
+                await self._connect_test_schema()
             return
         if time.monotonic() - self.db_last_attempt < 4:
             return
@@ -570,9 +578,10 @@ class PanelState:
             async with self.pool.acquire() as conn:
                 schema = open(os.path.join(os.path.dirname(__file__), "schema.sql"), encoding="utf-8").read()
                 await conn.execute(schema)
-                await self.seed(conn)
+                await self.seed(conn, include_legacy=True)
             self.db_error = ""
             log.info("Admin database connected and schema initialized")
+            await self._connect_test_schema()
         except Exception as exc:
             if self.pool is not None:
                 await self.pool.close()
@@ -581,11 +590,37 @@ class PanelState:
             # Error type only; driver messages can contain a hostname/user or connection details.
             log.warning("Admin database unavailable (%s). %s", type(exc).__name__, DB_HINT)
 
-    async def seed(self, conn):
+    async def _connect_test_schema(self):
+        if self.test_pool is not None or self.pool is None:
+            return
+        self.test_db_last_attempt = time.monotonic()
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute("CREATE SCHEMA IF NOT EXISTS secure_x_test")
+            params = parse_database_url(os.getenv("DATABASE_URL", ""))
+            self.test_pool = await asyncpg.create_pool(
+                **params, server_settings={"search_path": "secure_x_test"},
+                min_size=1, max_size=2, timeout=5, command_timeout=8,
+            )
+            async with self.test_pool.acquire() as conn:
+                schema = open(os.path.join(os.path.dirname(__file__), "schema.sql"), encoding="utf-8").read()
+                await conn.execute(schema)
+                await self.seed(conn, include_legacy=False)
+            self.test_db_error = ""
+            log.info("Test panel database schema initialized")
+        except Exception as exc:
+            if self.test_pool is not None:
+                await self.test_pool.close()
+                self.test_pool = None
+            self.test_db_error = "Не удалось инициализировать изолированную тестовую схему базы"
+            log.warning("Test database unavailable (%s)", type(exc).__name__)
+
+    async def seed(self, conn, *, include_legacy=True):
         for key, value in DEFAULT_SETTINGS.items():
             await conn.execute("INSERT INTO settings(key,value) VALUES($1,$2::jsonb) ON CONFLICT(key) DO NOTHING", key, json.dumps(value, ensure_ascii=False))
-        await conn.execute("""INSERT INTO users(name,slug,drive_file_id) VALUES('Основная (legacy)','legacy', $1)
-            ON CONFLICT (slug) DO NOTHING""", LEGACY_DRIVE_FILE_ID)
+        if include_legacy:
+            await conn.execute("""INSERT INTO users(name,slug,drive_file_id) VALUES('Основная (legacy)','legacy', $1)
+                ON CONFLICT (slug) DO NOTHING""", LEGACY_DRIVE_FILE_ID)
 
     async def close(self):
         for task in tuple(self.happ_tasks):
@@ -599,12 +634,18 @@ class PanelState:
         if self.pool is not None:
             await self.pool.close()
             self.pool = None
+        if self.test_pool is not None:
+            await self.test_pool.close()
+            self.test_pool = None
 
     async def db(self, required=True):
         await self.connect()
-        if self.pool is None and required:
-            raise HTTPException(503, self.db_error or DB_HINT)
-        return self.pool
+        test_mode = _test_environment.get()
+        pool = self.test_pool if test_mode else self.pool
+        error = self.test_db_error if test_mode else self.db_error
+        if pool is None and required:
+            raise HTTPException(503, error or DB_HINT)
+        return pool
 
     async def push_drive_sync(self, user_ids: list[int] | None = None) -> dict:
         """Ask the authenticated Apps Script web app to update Drive immediately."""
@@ -616,8 +657,10 @@ class PanelState:
             return {"ok": False, "pending": True, "message": message}
         try:
             async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(150.0, connect=12.0)) as client:
+                test_mode = _test_environment.get()
                 response = await client.post(target, headers={"X-Sync-Key": key, "Accept": "application/json"},
-                                             json={"action": "sync", "user_ids": user_ids, "sync_key": key})
+                                             json={"action": "sync", "user_ids": user_ids, "sync_key": key,
+                                                   "environment": "test" if test_mode else "main"})
             if response.status_code >= 400:
                 raise ValueError("Apps Script отклонил запрос")
             try:
@@ -819,7 +862,9 @@ def _sign_session(payload: dict) -> str:
 
 
 def _session(request: Request):
-    token = request.cookies.get("admin_session", "")
+    test_mode = request.url.path == "/test" or request.url.path.startswith("/test/")
+    cookie_name = "test_admin_session" if test_mode else "admin_session"
+    token = request.cookies.get(cookie_name, "")
     try:
         raw, sig = token.split(".", 1)
         actual = base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4))
@@ -827,7 +872,8 @@ def _session(request: Request):
         if not hmac.compare_digest(actual, expected):
             return None
         payload = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
-        if payload.get("exp", 0) < time.time() or payload.get("u") != os.getenv("ADMIN_USERNAME"):
+        if (payload.get("exp", 0) < time.time() or payload.get("u") != os.getenv("ADMIN_USERNAME")
+                or payload.get("environment", "main") != ("test" if test_mode else "main")):
             return None
         return payload
     except Exception:
@@ -1096,7 +1142,9 @@ async def _announce(settings: dict, weather_payload: dict | None = None) -> str:
             weather_line = ASHGABAT_WEATHER_UNAVAILABLE
     refresh = max(5, int(settings.get("announce_refresh_minutes", 5))) * 60
     refresh_slot = int(time.time() // refresh)
-    if state.announce_cache and refresh_slot == state.announce_cache[0]:
+    settings_key = hashlib.sha256(json.dumps(settings, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+    cache_key = ("test" if _test_environment.get() else "main", refresh_slot, settings_key)
+    if state.announce_cache and cache_key == state.announce_cache[0]:
         return state.announce_cache[1].replace("__CURRENT_ASHGABAT_WEATHER__", weather_line)
     local = _now_for_tz(settings.get("timezone", "Asia/Ashgabat"))
     lines = []
@@ -1116,7 +1164,7 @@ async def _announce(settings: dict, weather_payload: dict | None = None) -> str:
     footer_tpl = secrets.choice([str(x) for x in footers if str(x)]) if footers else ""
     lines.extend(["", quote_text, "", footer_tpl.replace("{t}", local.strftime("%H:%M:%S"))])
     template = "\n".join(lines).strip()
-    state.announce_cache = (refresh_slot, template)
+    state.announce_cache = (cache_key, template)
     return template.replace("__CURRENT_ASHGABAT_WEATHER__", weather_line)
 
 
@@ -1340,6 +1388,10 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
         title = f"Время подписки закончилось · {user.get('name', user.get('slug', 'Пользователь'))}"
     elif not user["enabled"] or user["status"] != "active":
         title = f"Подписка отключена · {user.get('name', user.get('slug', 'Пользователь'))}"
+    test_mode = _test_environment.get()
+    if test_mode:
+        title = "🧪 ТЕСТ · " + title
+        announcement = "🧪 ТЕСТОВАЯ ПОДПИСКА · " + (announcement or "Тестовый профиль")
     lines = ["#profile-title: base64:" + base64.b64encode(title.encode()).decode(),
              f"#profile-update-interval: {int(settings.get('update_interval', 1))}",
              "#announce: base64:" + base64.b64encode(announcement.encode()).decode(),
@@ -1376,6 +1428,8 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
             # name is unchanged. Some providers send raw spaces in `#name`;
             # emitting those as-is makes otherwise valid nodes disappear in
             # clients that expect a URL-encoded fragment.
+            if test_mode:
+                name = re.sub(r"(?: · ТЕСТ)+$", "", name, flags=re.I) + " · ТЕСТ"
             server_lines.append(rename_server_uri(server["uri"], name))
         if not server_lines:
             # Do not let Apps Script replace a working Drive profile with a
@@ -1384,6 +1438,8 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
         lines.extend(server_lines)
     else:
         reason = "Время подписки закончилось" if expired else "Подписка отключена"
+        if test_mode:
+            reason += " · ТЕСТ"
         lines.append("vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?type=tcp&encryption=none#" + quote(reason, safe=""))
     return "\n".join(lines) + "\n"
 
@@ -1409,15 +1465,17 @@ def _secure_headers(response: Response):
 
 class PanelSecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        response = await call_next(request)
-        if request.url.path.startswith("/admin") or request.url.path.startswith("/api/"):
-            _secure_headers(response)
-        elif request.url.path.startswith("/static/"):
-            # The panel's JS/CSS changes independently from the Python worker.
-            # Revalidate assets so mobile browsers do not retain old controls.
-            response.headers["Cache-Control"] = "no-cache, must-revalidate"
-            response.headers["X-Content-Type-Options"] = "nosniff"
-        return response
+        token = _test_environment.set(request.url.path == "/test" or request.url.path.startswith("/test/"))
+        try:
+            response = await call_next(request)
+            if request.url.path.startswith(("/admin", "/api/", "/test")):
+                _secure_headers(response)
+            elif request.url.path.startswith("/static/"):
+                response.headers["Cache-Control"] = "no-cache, must-revalidate"
+                response.headers["X-Content-Type-Options"] = "nosniff"
+            return response
+        finally:
+            _test_environment.reset(token)
 
 
 @router.get("/admin", response_class=HTMLResponse, include_in_schema=False)
@@ -1433,6 +1491,27 @@ async def admin_page():
 location.replace('/admin/'+(mobile?'mobile':'desktop')+location.search+location.hash)})()</script>
 <noscript><p><a href=\"/admin/mobile\">Телефон</a> · <a href=\"/admin/desktop\">Компьютер</a></p></noscript>
 </body></html>""")
+
+
+async def test_page():
+    return HTMLResponse("""<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
+<meta name=\"color-scheme\" content=\"dark\"><title>Secure X — ТЕСТ</title></head>
+<body style=\"margin:0;background:#090a0c;color:#f5f6f8;font:16px system-ui;display:grid;min-height:100dvh;place-items:center\">
+<p>Открываем тестовую панель…</p><script>(()=>{const mobile=matchMedia('(max-width: 760px), (pointer: coarse)').matches;
+location.replace('/test/'+(mobile?'mobile':'desktop')+location.search+location.hash)})()</script>
+<noscript><p><a href=\"/test/mobile\">Телефон</a> · <a href=\"/test/desktop\">Компьютер</a></p></noscript>
+</body></html>""")
+
+
+async def test_desktop_page():
+    return FileResponse(os.path.join(os.path.dirname(__file__), "static", "admin_desktop.html"),
+                        headers={"Cache-Control": "no-store"})
+
+
+async def test_mobile_page():
+    return FileResponse(os.path.join(os.path.dirname(__file__), "static", "admin_mobile.html"),
+                        headers={"Cache-Control": "no-store"})
 
 
 @router.get("/admin/desktop", response_class=HTMLResponse, include_in_schema=False)
@@ -1464,15 +1543,22 @@ async def login(data: LoginBody, request: Request, response: Response):
         raise HTTPException(401, "Неверные данные входа")
     state.login_fails.pop(ip, None)
     csrf = secrets.token_urlsafe(24)
-    token = _sign_session({"u": os.getenv("ADMIN_USERNAME"), "c": csrf, "exp": int(time.time()) + SESSION_SECONDS})
-    response.set_cookie("admin_session", token, max_age=SESSION_SECONDS, httponly=True, secure=True, samesite="strict", path="/")
+    test_mode = request.url.path.startswith("/test/")
+    token = _sign_session({"u": os.getenv("ADMIN_USERNAME"), "c": csrf,
+                           "environment": "test" if test_mode else "main",
+                           "exp": int(time.time()) + SESSION_SECONDS})
+    cookie_name = "test_admin_session" if test_mode else "admin_session"
+    response.set_cookie(cookie_name, token, max_age=SESSION_SECONDS, httponly=True, secure=True,
+                        samesite="strict", path="/test" if test_mode else "/")
     return {"ok": True, "csrf_token": csrf, "username": os.getenv("ADMIN_USERNAME")}
 
 
 @router.post("/api/admin/auth/logout")
 async def logout(request: Request, response: Response):
     _auth(request, csrf=True)
-    response.delete_cookie("admin_session", path="/")
+    test_mode = request.url.path.startswith("/test/")
+    response.delete_cookie("test_admin_session" if test_mode else "admin_session",
+                          path="/test" if test_mode else "/")
     return {"ok": True}
 
 
@@ -1491,7 +1577,8 @@ async def dashboard(request: Request):
         # The overview should remain accessible even while a source is down.
         pass
     pool = await state.db(required=False)
-    db_info = {"connected": pool is not None, "error": state.db_error if pool is None else None}
+    db_error = state.test_db_error if _test_environment.get() else state.db_error
+    db_info = {"connected": pool is not None, "error": db_error if pool is None else None}
     user_count = {"active": 0, "disabled": 0, "total": 0}
     device_limit_count = 0
     device_limit_errors = 0
@@ -2157,6 +2244,10 @@ def install(app: FastAPI):
     app.add_middleware(PanelSecurityMiddleware)
     app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="panel-static")
     app.include_router(router)
+    app.include_router(router, prefix="/test")
+    app.add_api_route("/test", test_page, methods=["GET"], response_class=HTMLResponse, include_in_schema=False)
+    app.add_api_route("/test/desktop", test_desktop_page, methods=["GET"], response_class=HTMLResponse, include_in_schema=False)
+    app.add_api_route("/test/mobile", test_mobile_page, methods=["GET"], response_class=HTMLResponse, include_in_schema=False)
     previous_lifespan = app.router.lifespan_context
 
     @asynccontextmanager

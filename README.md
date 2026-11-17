@@ -11,7 +11,7 @@ Create or update the Render Web Service from `render.yaml`. Set these environmen
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `SUBSCRIPTION_URL` | Yes for relay and admin sync | Provider subscription URL |
-| `SAS_SUBSCRIPTION_URL` | Yes for SAS server merge | SAS Render subscription URL; defaults in `render.yaml` to `https://sas-c3nt.onrender.com/` |
+| `SAS_SUBSCRIPTION_URL` | Yes for SAS server merge | SAS subscription source URL; a default is set in `render.yaml` |
 | `UPSTREAM_USER_AGENT` | No | Provider request User-Agent; panel uses `Happ` when empty |
 | `UPSTREAM_X_HWID` | No | Fixed authorized device identity |
 | `UPSTREAM_X_DEVICE_INFO` | No | Optional upstream device metadata |
@@ -47,12 +47,20 @@ On first successful database connection the service runs `schema.sql` idempotent
 
 The source is [`apps_script/Code.gs`](apps_script/Code.gs). Replace the contents of the existing Apps Script project with this file; keep the existing `updateSub` time trigger set to every five minutes as a recovery path.
 
-1. In Apps Script open **Project Settings → Script Properties** and add `RENDER_URL` with value `https://gayrat-hack.onrender.com` and `SYNC_KEY` with the same secret as the Render environment variable. Do not put either secret in `Code.gs`.
+1. In Apps Script open **Project Settings → Script Properties** and set `RENDER_URL` to the deployed service base address and `SYNC_KEY` to the same secret configured for the service. Do not put either value in `Code.gs`.
 2. Save the script, choose `setup` in the function selector, and run it once. It validates the properties and deliberately does not create or delete triggers.
 3. Run `updateSub()` once and approve the Google Drive and external request permissions. This initial run updates existing files and creates files for current users.
 4. In Apps Script click **Deploy → New deployment → Web app**. Set **Execute as** to your account and **Who has access** to **Anyone**, then deploy and approve access. Copy the Web App URL ending in `/exec`.
 5. In Render add `DRIVE_SYNC_URL` with that `/exec` URL and redeploy. `SYNC_KEY` must match the Script Property. The Web App checks this secret on every request; do not share the URL together with the key.
 6. Keep the existing `updateSub` trigger. Thereafter user, server, and profile setting changes made in `/admin` call the Web App immediately; no manual Apps Script run is needed. The trigger retries as a backup.
+
+### Test environment
+
+The `/test` panel uses the same interface and provider feeds as `/admin`, but stores users, servers, settings, and sync state in the separate PostgreSQL schema `secure_x_test`. The schema and its default settings are initialized automatically on the first connection. It does not seed or reuse the legacy production subscription. Test and production sessions use separate cookies.
+
+Create a dedicated Google Drive folder for test subscriptions and set its folder ID as the Apps Script Script Property `TEST_DRIVE_FOLDER_ID`. Do not use the folder that contains production subscriptions. The test panel sends test sync requests to Apps Script, which creates new test profiles only inside that folder; updates and revocations use the test profile's saved file ID. The existing `updateSub` trigger keeps production profiles current and also refreshes test profiles in the separate folder when its ID is configured. If Apps Script is busy during a test update, it queues that test sync for a later trigger.
+
+The test panel and generated subscription are visibly marked **ТЕСТ**. Each generated server key ends with `· ТЕСТ`, and new Drive files start with `ТЕСТ ·`. Test keys still connect to the configured provider servers, so use them to check profile formatting and delivery, not as a separate VPN network.
 
 When updating an already deployed script, use **Deploy → Manage deployments → Edit → New version → Deploy** so the existing `/exec` deployment URL remains the same. Revoking a profile updates the Drive file's media with Drive API v3 using the Apps Script user's OAuth token. Drive API v3 must be enabled in the Cloud project linked to this Apps Script project, and the script owner must authorize Drive access again if Google asks. The same Drive file ID and public URL are kept so Happ can fetch the revocation profile on its next refresh.
 
@@ -84,7 +92,7 @@ The admin UI has separate desktop and mobile pages. `/admin` selects a layout us
 1. Configure Render environment variables and deploy this version. Keep the current Apps Script running while Render builds; the public relay endpoints are unchanged.
 2. Confirm `/health` returns `ok`, then open `/admin` and confirm the database status is connected. If it is unavailable, use the Supabase Session Pooler URL.
 3. Confirm the dashboard reports a successful upstream snapshot and a nonzero server count. A failed/empty manifest is not sent to Apps Script as a valid user list, so it cannot overwrite the current Drive file.
-4. Replace the old Apps Script source, set the two Script Properties, run `setup()` and `updateSub()` once, then deploy it as a Web App and set its `/exec` URL in Render as `DRIVE_SYNC_URL`. The legacy subscriber continues writing to its existing Drive file; its Drive API URL does not change.
+4. Replace the old Apps Script source, set the Script Properties, run `setup()` and `updateSub()` once, then deploy it as a Web App and configure its `/exec` URL as `DRIVE_SYNC_URL`. The legacy subscriber continues writing to its existing Drive file; its Drive API URL does not change.
 5. Confirm the old Happ link still loads, then create additional users in the panel. Their Drive files and links are created immediately by the Web App.
 
 The project has no dependency on an Apps Script trigger recreation: the existing five-minute trigger name remains `updateSub`.
