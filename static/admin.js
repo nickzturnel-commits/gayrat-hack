@@ -3,6 +3,8 @@
 
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+  const testMode = window.location.pathname === '/test' || window.location.pathname.startsWith('/test/');
+  const panelUrl = path => testMode ? `/test${path}` : path;
   const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   })[char]);
@@ -13,6 +15,15 @@
   let deviceStatusPollTimer = null;
   let deviceStatusPollRounds = 0;
   let deviceLimitBounds = null;
+
+  if (testMode) {
+    document.body.classList.add('test-environment');
+    const banner = document.createElement('div');
+    banner.textContent = '🧪 ТЕСТОВАЯ СРЕДА · отдельные подписки и настройки';
+    banner.setAttribute('role', 'status');
+    banner.style.cssText = 'position:sticky;top:0;z-index:10000;padding:9px 14px;text-align:center;background:#9b4d12;color:#fff;font:700 13px system-ui;letter-spacing:.03em;box-shadow:0 2px 12px #0008';
+    document.body.prepend(banner);
+  }
 
   function toast(message) {
     const node = $('#toast');
@@ -30,7 +41,7 @@
       headers.set('Content-Type', 'application/json');
       options.body = JSON.stringify(options.body);
     }
-    const response = await fetch(path, { ...options, method, headers, credentials: 'same-origin' });
+    const response = await fetch(panelUrl(path), { ...options, method, headers, credentials: 'same-origin' });
     const raw = await response.text();
     let data;
     try { data = raw ? JSON.parse(raw) : null; } catch { data = raw; }
@@ -297,7 +308,7 @@
     openModal('QR-код подписки', driveQrLoadingContent());
     const body = $('#modalBody');
     try {
-      const response = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/${limited ? 'limited-qr.svg' : 'drive-qr.svg'}`, {
+      const response = await fetch(panelUrl(`/api/admin/users/${encodeURIComponent(userId)}/${limited ? 'limited-qr.svg' : 'drive-qr.svg'}`), {
         method: 'GET', cache: 'no-store', credentials: 'same-origin',
         headers: { Accept: 'image/svg+xml' },
       });

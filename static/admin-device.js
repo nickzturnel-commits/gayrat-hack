@@ -2,10 +2,12 @@
   'use strict';
   const query = window.matchMedia('(max-width: 760px), (pointer: coarse)');
   const current = document.body.classList.contains('mobile-ui') ? 'mobile' : 'desktop';
+  const testMode = window.location.pathname.startsWith('/test/');
   const redirectIfNeeded = () => {
     const desired = query.matches ? 'mobile' : 'desktop';
     if (desired !== current) {
-      window.location.replace(`/admin/${desired}${window.location.search}${window.location.hash}`);
+      const target = testMode ? `/test/${desired}` : `/admin/${desired}`;
+      window.location.replace(`${target}${window.location.search}${window.location.hash}`);
     }
   };
   redirectIfNeeded();
