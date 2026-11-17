@@ -399,7 +399,7 @@
           ? (user.limited_link ? 'QR с лимитом' : 'QR появится с Happ-ссылкой')
           : 'QR-код Drive';
         return `<article class="surface-card user-card" data-user-card data-user-name="${esc(`${user.name || ''} ${user.note || ''}`.toLowerCase())}" data-user-state="${state}" data-user-sas="${user.include_sas === false ? 'off' : 'on'}" data-user-limit="${hasLimit ? 'limited' : 'unlimited'}">
-          <div class="user-card-head"><div class="avatar-mark">${esc((user.name || '?').trim().slice(0, 1).toUpperCase())}</div><div class="user-main"><h2>${esc(user.name)}</h2><p>${esc(user.note || 'Без заметки')}</p></div><span class="badge ${tone}">${status}</span><span class="badge ${user.drive_file_id ? 'badge-good' : 'badge-muted'}">${user.drive_file_id ? 'Drive готов' : 'Ожидает Drive'}</span><span class="badge ${user.include_sas === false ? 'badge-muted' : 'source-sas'}">${user.include_sas === false ? 'Только Secure X' : 'Secure X + SAS'}</span>${user.hide_traffic_usage && user.slug !== 'legacy' ? '<span class="badge badge-muted">Счётчик скрыт</span>' : ''}${hasLimit ? `<span class="badge ${limitStatusTone}">Устройств: ${esc(user.device_limit)} · ${limitStatusLabel}</span>` : '<span class="badge badge-muted">Без лимита устройств</span>'}${testMode ? `<span class="badge ${user.geo_activated_at ? 'badge-good' : 'badge-muted'}">Geo ТЕСТ · ${user.geo_activated_at ? 'активировано' : 'ожидает'} · IP ${user.geoip_downloaded_at ? '✓' : '—'} / Sites ${user.geosite_downloaded_at ? '✓' : '—'} · запросов: ${Number(user.geo_download_requests) || 0}</span>` : ''}</div>
+          <div class="user-card-head"><div class="avatar-mark">${esc((user.name || '?').trim().slice(0, 1).toUpperCase())}</div><div class="user-main"><h2>${esc(user.name)}</h2><p>${esc(user.note || 'Без заметки')}</p></div><span class="badge ${tone}">${status}</span><span class="badge ${user.drive_file_id ? 'badge-good' : 'badge-muted'}">${user.drive_file_id ? 'Drive готов' : 'Ожидает Drive'}</span><span class="badge ${user.include_sas === false ? 'badge-muted' : 'source-sas'}">${user.include_sas === false ? 'Только Secure X' : 'Secure X + SAS'}</span>${user.hide_traffic_usage && user.slug !== 'legacy' ? '<span class="badge badge-muted">Счётчик скрыт</span>' : ''}${hasLimit ? `<span class="badge ${limitStatusTone}">Устройств: ${esc(user.device_limit)} · ${limitStatusLabel}</span>` : '<span class="badge badge-muted">Без лимита устройств</span>'}${testMode ? `<span class="badge ${user.geo_device_limit ? (user.geo_activated_at ? 'badge-good' : 'badge-muted') : 'badge-muted'}">Geo ТЕСТ · ${user.geo_device_limit ? `${user.geo_activated_at ? 'активировано' : 'ожидает'} · лимит ${esc(user.geo_device_limit)}` : 'выключено'} · IP ${Number(user.geoip_requests) || 0}/${esc(user.geo_device_limit || '—')} · Sites ${Number(user.geosite_requests) || 0}/${esc(user.geo_device_limit || '—')}</span>` : ''}</div>
           ${hasLimit && user.device_limit_error ? `<p class="tone-warn device-limit-error" role="status">${esc(user.device_limit_error)}</p>` : ''}
           <div class="user-meta"><span>Срок действия</span><strong>${esc(date(user.expires_at))}</strong></div>
           <div class="user-actions">
@@ -606,6 +606,7 @@
     const hideTraffic = isLegacy ? false : (user ? user.hide_traffic_usage === true : defaultHideTraffic);
     const includeSas = user ? user.include_sas !== false : defaultIncludeSas;
     const deviceLimitValue = user ? (user.device_limit ?? '') : (formSettings.settings?.device_limit_for_new_users ?? '');
+    const geoDeviceLimitValue = user?.geo_device_limit ?? '';
     const deviceStatus = user?.device_limit_status || (user?.limited_link ? 'ready' : user?.device_limit ? 'waiting' : 'none');
     const deviceStatusText = ({ready: 'Ссылка Happ готова.', waiting: 'Ссылка создастся автоматически после появления файла в Google Drive.', error: `Ошибка Happ: ${user?.device_limit_error || 'повторите создание ссылки в настройках лимита.'}`})[deviceStatus]
       || 'Без лимита. Ссылка Drive остаётся обычной.';
@@ -632,6 +633,9 @@
         <label>Максимальное количество устройств<input name="device_limit" type="number" min="${Number(bounds.min)}" max="${Number(bounds.max)}" step="1" inputmode="numeric" value="${esc(deviceLimitValue)}" placeholder="Без лимита" ${isLegacy ? 'disabled' : ''}><span class="field-hint">Пустое поле — без лимита. Допустимо от ${Number(bounds.min)} до ${Number(bounds.max)}. Новая или изменённая ссылка создаётся через Happ после появления файла в Drive.</span></label>
         ${isLegacy ? '<p class="setting-note"><b>Для основной (legacy) подписки лимит отключён</b><span>Её Drive-ссылка и профиль не изменяются этой функцией.</span></p>' : `<p class="device-limit-current ${deviceStatus === 'error' ? 'tone-warn' : ''}" role="status">${esc(deviceStatusText)}</p>`}
       </section>
+      ${testMode && !isLegacy ? `<section class="form-section device-limit-form-section"><p class="eyebrow">04 / GEO-ТЕСТ</p><h3>Лимит устройств через Geo-файлы · ТЕСТ</h3>
+        <label>Лимит запросов каждого geo-файла<input name="geo_device_limit" type="number" min="1" max="20" step="1" inputmode="numeric" value="${esc(geoDeviceLimitValue)}" placeholder="Не использовать geo-активацию"><span class="field-hint">Пустое поле отключает geo-активацию. При заданном лимите сначала будет один рабочий сервер. После успешной загрузки обоих файлов Drive сразу обновится и добавит остальные серверы. Считаются запросы geo-файлов, не уникальные HWID.</span></label>
+      </section>` : ''}
       <section class="form-section"><p class="eyebrow">05 / ВИД ПРОФИЛЯ</p><h3>Заголовок и сообщение</h3>
         <label>Заголовок профиля<input name="title_override" maxlength="200" value="${esc(user?.title_override || '')}" placeholder="Использовать название по умолчанию"></label>
         <label>Объявление<textarea name="announce_override" maxlength="4000" rows="3" placeholder="Оставьте пустым для общего объявления">${esc(user?.announce_override || '')}</textarea></label>
@@ -657,6 +661,13 @@
         toast(`Лимит должен быть целым числом от ${bounds.min} до ${bounds.max}`);
         return;
       }
+      const rawGeoLimit = String(values.get('geo_device_limit') || '').trim();
+      const requestedGeoDeviceLimit = rawGeoLimit === '' ? null : Number(rawGeoLimit);
+      if (testMode && requestedGeoDeviceLimit !== null && (!Number.isInteger(requestedGeoDeviceLimit)
+        || requestedGeoDeviceLimit < 1 || requestedGeoDeviceLimit > 20)) {
+        toast('Geo-лимит должен быть целым числом от 1 до 20');
+        return;
+      }
       const previousDeviceLimit = user?.device_limit ?? null;
       if (user && requestedDeviceLimit !== previousDeviceLimit) {
         const message = requestedDeviceLimit === null
@@ -679,7 +690,8 @@
           hide_traffic_usage: isLegacy ? false : values.has('hide_traffic_usage'),
           include_sas: values.get('include_sas') === 'with-sas',
           traffic_limit_bytes: user?.traffic_limit_bytes ?? null,
-          device_limit: requestedDeviceLimit
+          device_limit: requestedDeviceLimit,
+          ...(testMode ? { geo_device_limit: requestedGeoDeviceLimit } : {})
         };
         const result = await api(user ? `/api/admin/users/${user.id}` : '/api/admin/users', {
           method: user ? 'PUT' : 'POST', body
