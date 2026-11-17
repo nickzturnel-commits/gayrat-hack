@@ -698,17 +698,40 @@
   async function userServers(userId) {
     const result = await api(`/api/admin/users/${userId}/servers`);
     const rows = result.servers || [];
-    openModal('Серверы пользователя', rows.length ? `<div class="server-override-intro"><p>Личные настройки действуют только для этой подписки. Пустое имя наследует глобальное.</p></div><div class="card-list">${rows.map(server => `<article class="surface-card compact-card">
+    openModal(testMode ? 'Серверы пользователя · ТЕСТ' : 'Серверы пользователя', rows.length ? `<div class="server-override-intro"><p>Личные настройки действуют только для этой подписки. Пустое имя наследует глобальное.</p>${testMode ? '<button type="button" class="button button-primary" id="saveUserServerBatch" disabled>Готово · сохранить 0 изменений</button><small>🧪 ТЕСТ · все выбранные изменения отправятся одной синхронизацией</small>' : ''}</div><div class="card-list">${rows.map(server => `<article class="surface-card compact-card">
       <div class="list-title"><div><h3>${esc(server.user_name || server.global_name || server.original_name)}</h3><small>${server.source === 'sas' ? '<span class="source-inline">SAS</span> · ' : '<span class="source-inline source-securex">Secure X</span> · '}${esc(server.original_name)}${server.present_upstream ? '' : ' · отсутствует в апстриме'}</small></div></div>
       <div class="rename-row"><label>Имя для этой подписки<input data-us-name="${esc(server.id)}" value="${esc(server.user_name || '')}" placeholder="Использовать глобальное имя"></label><button type="button" class="button button-quiet" data-us-reset="${esc(server.id)}" ${server.user_name ? '' : 'disabled'}>Сбросить имя</button></div>
       <span class="field-hint">Пустое значение использует глобальное имя сервера.</span>
       <label class="switch-row"><input type="checkbox" data-us-hidden="${esc(server.id)}" ${server.user_hidden === true ? 'checked' : ''}><span class="switch"></span><span><b>Скрыть у этого пользователя</b></span></label>
-      <button class="button button-secondary" data-us-save="${esc(server.id)}">Сохранить и обновить Drive</button>
+      ${testMode ? '<span class="field-hint">🧪 Черновик · сохранится кнопкой «Готово»</span>' : `<button class="button button-secondary" data-us-save="${esc(server.id)}">Сохранить и обновить Drive</button>`}
     </article>`).join('')}</div>` : '<div class="empty-state"><h2>Список серверов пуст</h2><p>Обновите сервера в соответствующем разделе.</p></div>');
     $('#modalBody').onclick = async event => {
       const resetButton = event.target.closest('[data-us-reset]');
       const saveButton = event.target.closest('[data-us-save]');
       const button = resetButton || saveButton;
+      if (testMode && resetButton) {
+        const id = resetButton.dataset.usReset;
+        $(`[data-us-name="${CSS.escape(id)}"]`).value = '';
+        resetButton.disabled = true;
+        stageUserServer(id);
+        return;
+      }
+      if (testMode && event.target.closest('#saveUserServerBatch')) {
+        const button = $('#saveUserServerBatch');
+        if (!dirtyUserServers.size) return;
+        button.disabled = true;
+        try {
+          const payload = [...dirtyUserServers].map(id => ({
+            server_id: id,
+            hidden: $(`[data-us-hidden="${CSS.escape(id)}"]`).checked,
+            custom_name: $(`[data-us-name="${CSS.escape(id)}"]`).value.trim() || null
+          }));
+          const saved = await api(`/api/admin/users/${userId}/servers/batch`, { method: 'POST', body: { servers: payload } });
+          toast(resultText(saved, `Сохранено настроек: ${payload.length}`));
+          await userServers(userId);
+        } catch (failure) { button.disabled = false; toast(failure.message); }
+        return;
+      }
       if (!button) return;
       button.disabled = true;
       const serverId = button.dataset.usReset || button.dataset.usSave;
@@ -733,6 +756,24 @@
       if (!field) return;
       const reset = $(`[data-us-reset="${CSS.escape(field.dataset.usName)}"]`);
       if (reset) reset.disabled = !field.value.trim();
+      if (testMode) stageUserServer(field.dataset.usName);
+    };
+    const dirtyUserServers = new Set();
+    function stageUserServer(id) {
+      const server = rows.find(item => String(item.id) === id);
+      if (!server) return;
+      const name = $(`[data-us-name="${CSS.escape(id)}"]`).value.trim() || null;
+      const hidden = $(`[data-us-hidden="${CSS.escape(id)}"]`).checked;
+      if (name !== (server.user_name || null) || hidden !== (server.user_hidden === true)) dirtyUserServers.add(id);
+      else dirtyUserServers.delete(id);
+      const save = $('#saveUserServerBatch');
+      if (save) { save.disabled = dirtyUserServers.size === 0; save.textContent = `Готово · сохранить ${dirtyUserServers.size} изменений`; }
+      const card = $(`[data-us-name="${CSS.escape(id)}"]`).closest('.compact-card');
+      $('h3', card).textContent = name || server.global_name || server.original_name;
+    }
+    $('#modalBody').onchange = event => {
+      const input = event.target.closest('[data-us-hidden]');
+      if (testMode && input) stageUserServer(input.dataset.usHidden);
     };
   }
 
@@ -742,7 +783,7 @@
     const sasCount = list.filter(server => server.source === 'sas').length;
     const primaryCount = list.length - sasCount;
     const hiddenCount = list.filter(server => server.hidden).length;
-    root.innerHTML = pageHead('Серверы', `<button id="refreshServers" class="button button-secondary">${svg('refresh')}<span>Обновить источники</span></button>`)
+    root.innerHTML = pageHead(testMode ? 'Серверы · ТЕСТ' : 'Серверы', `${testMode ? '<button id="refreshTestCache" class="button button-secondary">🧹 Обновить кэш ТЕСТ</button>' : ''}<button id="refreshServers" class="button button-secondary">${svg('refresh')}<span>Обновить источники</span></button>`)
       + (list.length ? `<section class="server-overview surface-card"><div><p class="eyebrow">КАТАЛОГ СЕРВЕРОВ</p><strong>${list.length} <small>в профиле источников</small></strong><span>Названия сохраняются отдельно для Secure X и SAS.</span></div><div class="source-counts"><span class="source-count primary-count"><i></i> Secure X <b>${primaryCount}</b></span><span class="source-count sas-count"><i></i> SAS <b>${sasCount}</b></span><span class="source-count hidden-count"><i></i> Скрыты <b data-hidden-count>${hiddenCount}</b></span></div></section>
         <section class="server-toolbar surface-card">
           <label class="search-box"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/></svg><input id="serverSearch" type="search" autocomplete="off" placeholder="Поиск по имени сервера"></label>
@@ -753,7 +794,8 @@
             <button type="button" class="filter-chip" data-server-filter="visible" aria-pressed="false">Показываются <span data-visible-server-count>${list.length - hiddenCount}</span></button>
             <button type="button" class="filter-chip" data-server-filter="hidden" aria-pressed="false">Скрыты <span data-hidden-server-count>${hiddenCount}</span></button>
           </div>
-          <div class="bulk-server-bar"><label class="select-visible"><input id="selectVisibleServers" type="checkbox"><span class="check-ui"></span><b>Выбрать видимые</b></label><span id="selectedServerCount" class="selected-count">Выбрано: 0</span><div class="bulk-actions"><button type="button" class="button button-quiet" data-server-bulk="false" disabled>Показать</button><button type="button" class="button button-quiet" data-server-bulk="true" disabled>Скрыть</button></div></div>
+          <div class="bulk-server-bar"><label class="select-visible"><input id="selectVisibleServers" type="checkbox"><span class="check-ui"></span><b>Выбрать видимые</b></label><span id="selectedServerCount" class="selected-count">Выбрано: 0</span><div class="bulk-actions"><button type="button" class="button button-quiet" data-server-bulk="false" disabled>Показать</button><button type="button" class="button button-quiet" data-server-bulk="true" disabled>Скрыть</button></div>${testMode ? '<button type="button" id="saveServerBatch" class="button button-primary" disabled>Готово · сохранить 0 изменений</button>' : ''}</div>
+          ${testMode ? '<div class="bulk-server-bar"><label>Добавить к имени<input id="massNamePrefix" placeholder="Префикс"></label><label>Добавить в конец<input id="massNameSuffix" placeholder="Суффикс"></label><label>Найти<input id="massNameFind" placeholder="Текст"></label><label>Заменить на<input id="massNameReplace" placeholder="Новый текст"></label><button type="button" class="button button-quiet" id="massRename" disabled>Переименовать выбранные</button></div><small>🧪 ТЕСТ · изменения применятся только после нажатия «Готово»</small>' : ''}
         </section>
         <div class="result-caption"><span id="serverResultCount">${list.length} серверов</span><span>Массовые действия применяются к выбранным серверам</span></div>
         <div class="card-list" id="serverList">${list.map(server => `<article class="surface-card server-card" data-server-card data-server-source="${server.source === 'sas' ? 'sas' : 'primary'}" data-server-hidden="${server.hidden ? 'yes' : 'no'}" data-server-name="${esc(`${server.custom_name || ''} ${server.original_name || ''} ${server.id}`.toLocaleLowerCase('ru-RU'))}">
@@ -761,7 +803,7 @@
           <div class="server-card-head"><div class="server-mark">${svg('servers')}</div><div class="user-main"><h2>${esc(server.custom_name || server.original_name)}</h2><p>Исходное имя: ${esc(server.original_name)}</p></div><span class="badge ${server.source === 'sas' ? 'source-sas' : 'source-primary'}">${server.source === 'sas' ? 'SAS' : 'Secure X'}</span>${server.present_upstream ? '<span class="badge badge-good">Доступен</span>' : '<span class="badge badge-warn">Нет в источнике</span>'}</div>
           <div class="server-fields"><label>Глобальное имя<input data-name="${esc(server.id)}" value="${esc(server.custom_name || '')}" placeholder="Исходное имя"></label><label>Порядок в подписке<input data-order="${esc(server.id)}" type="number" value="${server.sort_order}" min="0"></label></div>
           <label class="switch-row server-visibility"><input data-hidden="${esc(server.id)}" type="checkbox" ${server.hidden ? 'checked' : ''}><span class="switch"></span><span><b>Скрыть этот сервер у всех</b><small>Личное исключение пользователя можно настроить в его подписке.</small></span></label>
-          <div class="server-card-actions"><button type="button" class="button button-quiet" data-reset-server-name="${esc(server.id)}" ${server.custom_name ? '' : 'disabled'}>Сбросить имя</button><button type="button" class="button button-secondary" data-save-server="${esc(server.id)}">Сохранить и обновить Drive</button></div>
+          <div class="server-card-actions"><button type="button" class="button button-quiet" data-reset-server-name="${esc(server.id)}" ${server.custom_name ? '' : 'disabled'}>Сбросить имя</button>${testMode ? '<span class="field-hint">🧪 Черновик · сохранится кнопкой «Готово»</span>' : `<button type="button" class="button button-secondary" data-save-server="${esc(server.id)}">Сохранить и обновить Drive</button>`}</div>
         </article>`).join('')}</div><div id="serverFilterEmpty" class="filter-empty hidden"><div class="empty-orbit">${svg('servers')}</div><h2>Серверы не найдены</h2><p>Поменяйте поисковый запрос или фильтр.</p></div>` : '<div class="empty-state"><div class="empty-orbit">'+svg('servers')+'</div><h2>Каталог пока пуст</h2><p>Обновите источники, чтобы загрузить серверы Secure X и SAS.</p></div>');
     $('#refreshServers').addEventListener('click', async event => {
       const button = event.currentTarget;
@@ -773,13 +815,44 @@
         await render();
       } catch (failure) { button.disabled = false; button.innerHTML = `${svg('refresh')}<span>Обновить источники</span>`; toast(failure.message); }
     });
+    if (testMode) $('#refreshTestCache').addEventListener('click', async event => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      button.textContent = 'Обновляю источники…';
+      try {
+        const refreshed = await api('/api/admin/cache/refresh', { method: 'POST', body: {} });
+        toast(resultText(refreshed, `Тестовый кэш обновлён · серверов: ${refreshed.count}`));
+        await render();
+      } catch (failure) { button.disabled = false; button.textContent = '🧹 Обновить кэш ТЕСТ'; toast(failure.message); }
+    });
     if (!list.length) return;
     const cards = $$('[data-server-card]', $('#serverList'));
+    const batchDirty = new Set();
+    const stageCard = card => {
+      const id = $('[data-select-server]', card).dataset.selectServer;
+      const original = list.find(item => String(item.id) === id);
+      const name = $(`[data-name="${CSS.escape(id)}"]`, card).value.trim() || null;
+      const order = Number($(`[data-order="${CSS.escape(id)}"]`, card).value);
+      const hidden = $(`[data-hidden="${CSS.escape(id)}"]`, card).checked;
+      if (name !== (original.custom_name || null) || order !== Number(original.sort_order) || hidden !== Boolean(original.hidden)) batchDirty.add(id);
+      else batchDirty.delete(id);
+      const save = $('#saveServerBatch');
+      if (save) { save.disabled = batchDirty.size === 0; save.textContent = `Готово · сохранить ${batchDirty.size} изменений`; }
+      $('h2', card).textContent = name || original.original_name;
+      card.dataset.serverHidden = hidden ? 'yes' : 'no';
+      card.dataset.serverName = `${name || ''} ${original.original_name || ''} ${id}`.toLocaleLowerCase('ru-RU');
+      const currentlyHidden = cards.filter(item => $(`[data-hidden="${CSS.escape($('[data-select-server]', item).dataset.selectServer)}"]`, item).checked).length;
+      $('[data-hidden-count]', root).textContent = String(currentlyHidden);
+      $('[data-hidden-server-count]', root).textContent = String(currentlyHidden);
+      $('[data-visible-server-count]', root).textContent = String(list.length - currentlyHidden);
+      applyServerFilters();
+    };
     const selectedCount = () => cards.filter(card => $('[data-select-server]', card).checked).length;
     const updateSelection = () => {
       const selected = selectedCount();
       $('#selectedServerCount').textContent = `Выбрано: ${selected}`;
       $$('[data-server-bulk]').forEach(button => { button.disabled = selected === 0; });
+      const rename = $('#massRename'); if (rename) rename.disabled = selected === 0;
       const visible = cards.filter(card => !card.hidden);
       const selectedVisible = visible.filter(card => $('[data-select-server]', card).checked).length;
       $('#selectVisibleServers').checked = visible.length > 0 && selectedVisible === visible.length;
@@ -821,18 +894,26 @@
     $('#serverList').addEventListener('change', event => {
       const checkbox = event.target.closest('[data-select-server]');
       if (checkbox) updateSelection();
+      if (testMode && (event.target.matches('[data-hidden]') || event.target.matches('[data-order]'))) stageCard(event.target.closest('[data-server-card]'));
     });
     $('#serverList').addEventListener('input', event => {
       const nameInput = event.target.closest('[data-name]');
       if (!nameInput) return;
       const reset = $(`[data-reset-server-name="${CSS.escape(nameInput.dataset.name)}"]`, root);
       if (reset) reset.disabled = !nameInput.value.trim();
+      if (testMode) stageCard(nameInput.closest('[data-server-card]'));
     });
     root.onclick = async event => {
       const bulkButton = event.target.closest('[data-server-bulk]');
       if (bulkButton) {
         const ids = cards.filter(card => $('[data-select-server]', card).checked).map(card => $('[data-select-server]', card).dataset.selectServer);
         if (!ids.length) return;
+        if (testMode) {
+          const hidden = bulkButton.dataset.serverBulk === 'true';
+          ids.forEach(id => { const card = cards.find(item => $('[data-select-server]', item).dataset.selectServer === id); $(`[data-hidden="${CSS.escape(id)}"]`, card).checked = hidden; stageCard(card); });
+          toast(`Черновик: ${hidden ? 'скрыть' : 'показать'} серверов: ${ids.length}. Нажмите «Готово».`);
+          return;
+        }
         bulkButton.disabled = true;
         try {
           const hidden = bulkButton.dataset.serverBulk === 'true';
@@ -843,6 +924,47 @@
         return;
       }
       const resetButton = event.target.closest('[data-reset-server-name]');
+      if (testMode && resetButton) {
+        const card = resetButton.closest('[data-server-card]');
+        $(`[data-name="${CSS.escape(resetButton.dataset.resetServerName)}"]`, card).value = '';
+        resetButton.disabled = true;
+        stageCard(card);
+        return;
+      }
+      if (testMode && event.target.closest('#massRename')) {
+        const prefix = $('#massNamePrefix').value;
+        const suffix = $('#massNameSuffix').value;
+        const find = $('#massNameFind').value;
+        const replacement = $('#massNameReplace').value;
+        const selected = cards.filter(card => $('[data-select-server]', card).checked);
+        selected.forEach(card => {
+          const id = $('[data-select-server]', card).dataset.selectServer;
+          const field = $(`[data-name="${CSS.escape(id)}"]`, card);
+          let name = field.value.trim() || list.find(item => String(item.id) === id).original_name;
+          if (find) name = name.split(find).join(replacement);
+          field.value = `${prefix}${name}${suffix}`;
+          const reset = $(`[data-reset-server-name="${CSS.escape(id)}"]`, card); if (reset) reset.disabled = !field.value;
+          stageCard(card);
+        });
+        toast(`Черновик переименования: ${selected.length} серверов. Нажмите «Готово».`);
+        return;
+      }
+      if (testMode && event.target.closest('#saveServerBatch')) {
+        const button = $('#saveServerBatch');
+        if (!batchDirty.size) return;
+        button.disabled = true;
+        try {
+          const payload = [...batchDirty].map(id => {
+            const card = cards.find(item => $('[data-select-server]', item).dataset.selectServer === id);
+            return { server_id: id, custom_name: $(`[data-name="${CSS.escape(id)}"]`, card).value.trim() || null,
+              hidden: $(`[data-hidden="${CSS.escape(id)}"]`, card).checked, sort_order: Number($(`[data-order="${CSS.escape(id)}"]`, card).value) };
+          });
+          const saved = await api('/api/admin/servers/batch', { method: 'POST', body: { servers: payload } });
+          toast(resultText(saved, `Сохранено серверов: ${payload.length}`));
+          await render();
+        } catch (failure) { button.disabled = false; toast(failure.message); }
+        return;
+      }
       const saveButton = event.target.closest('[data-save-server]');
       const button = resetButton || saveButton;
       if (!button) return;
@@ -876,6 +998,7 @@
       } catch (failure) { toast(failure.message); }
       finally { button.disabled = resetButton ? !server?.custom_name : false; }
     };
+    applyServerFilters();
   }
 
   async function settings(root) {
