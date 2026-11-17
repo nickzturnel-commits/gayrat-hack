@@ -2,6 +2,7 @@
 const SX = {
   PROP_URL: 'RENDER_URL',
   PROP_KEY: 'SYNC_KEY',
+  TEST_DRIVE_FOLDER: 'TEST_DRIVE_FOLDER_ID',
   CURSOR: 'SYNC_CURSOR',
   PENDING_SYNC: 'DRIVE_SYNC_PENDING',
   WEATHER_CACHE: 'ASHGABAT_WEATHER_V1',
@@ -30,14 +31,22 @@ function doPost(e) {
     const base = (props.getProperty(SX.PROP_URL) || '').trim().replace(/\/+$/, '');
     const key = (props.getProperty(SX.PROP_KEY) || '').trim();
     const data = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+    if (data.environment != null && data.environment !== 'main' && data.environment !== 'test') {
+      return json_({ ok: false, error: 'Неизвестная среда.' });
+    }
+    const environment = data.environment === 'test' ? 'test' : 'main';
     if (!base || !key || !constantTimeEquals_(String(data.sync_key || ''), key)) {
       return json_({ ok: false, error: 'Недействительные настройки или доступ.' });
     }
     if (data.action !== 'sync') return json_({ ok: false, error: 'Неизвестное действие.' });
-    const wasPending = props.getProperty(SX.PENDING_SYNC) === '1';
+    if (environment === 'test' && !(props.getProperty(SX.TEST_DRIVE_FOLDER) || '').trim()) {
+      return json_({ ok: false, error: 'Не задана папка Google Drive для тестовой среды.' });
+    }
+    const pendingKey = environmentKey_(SX.PENDING_SYNC, environment);
+    const wasPending = props.getProperty(pendingKey) === '1';
     // Remember this request before trying the lock. If another delivery or the
     // five-minute trigger is using Drive, it will be retried automatically.
-    props.setProperty(SX.PENDING_SYNC, '1');
+    props.setProperty(pendingKey, '1');
     lock = LockService.getScriptLock();
     if (!lock.tryLock(1500)) {
       Logger.log('Drive занят; запрос сохранён для автоматической синхронизации.');
@@ -53,10 +62,10 @@ function doPost(e) {
     // Coalesce edits that arrive while a Drive update is running. A second
     // pass reads the latest manifest; more changes remain queued for updateSub.
     while (pass < 2) {
-      props.deleteProperty(SX.PENDING_SYNC);
-      const manifest = fetchManifest_(base, key, userIds);
+      props.deleteProperty(pendingKey);
+      const manifest = fetchManifest_(base, key, userIds, environment);
       if (!manifest || !Array.isArray(manifest.users) || !manifest.users.length) {
-        props.setProperty(SX.PENDING_SYNC, '1');
+        props.setProperty(pendingKey, '1');
         return json_({ ok: false, pending: true, error: 'Манифест пуст или недоступен.' });
       }
       if (manifest.partial) {
@@ -68,7 +77,7 @@ function doPost(e) {
       let passError = '';
       users.forEach(user => {
         try {
-          processUserWithRetry_(base, key, user);
+          processUserWithRetry_(base, key, user, environment);
           processed++;
         } catch (err) {
           passFailed++;
@@ -77,8 +86,8 @@ function doPost(e) {
           Logger.log('Немедленная доставка не удалась для id=' + String(user && user.id) + ': ' + message);
           if (user && user.id != null) {
             try {
-              const rememberedId = props.getProperty('PENDING_FILE_' + user.id);
-              report_(base, key, user.id, user.drive_file_id || rememberedId || null, false, message);
+              const rememberedId = props.getProperty(pendingFileKey_(user.id, environment));
+              report_(base, key, user.id, user.drive_file_id || rememberedId || null, false, message, environment);
             } catch (reportErr) {
               Logger.log('Не удалось отправить отчёт для id=' + String(user.id) + '.');
             }
@@ -88,11 +97,11 @@ function doPost(e) {
       failed = passFailed;
       firstError = passError || firstError;
       pass++;
-      pending = manifest.partial || props.getProperty(SX.PENDING_SYNC) === '1';
+      pending = manifest.partial || passFailed > 0 || props.getProperty(pendingKey) === '1';
       if (!pending || manifest.partial || pass >= 2) break;
       userIds = null;
     }
-    if (pending) props.setProperty(SX.PENDING_SYNC, '1');
+    if (pending) props.setProperty(pendingKey, '1');
     Logger.log('Немедленная доставка: обработано ' + processed + ', ошибок ' + failed + (pending ? ', ожидает повторения.' : '.'));
     return json_({ ok: failed === 0, pending: pending, processed: processed, failed: failed, error: firstError || undefined });
   } catch (err) {
@@ -135,6 +144,9 @@ function updateSub() {
   // updateSub always fetches the complete current manifest, so it also drains
   // any request left queued when an immediate delivery found Drive busy.
   props.deleteProperty(SX.PENDING_SYNC);
+  if ((props.getProperty(SX.TEST_DRIVE_FOLDER) || '').trim()) {
+    props.setProperty(environmentKey_(SX.PENDING_SYNC, 'test'), '1');
+  }
 
   const manifest = fetchManifest_(base, key);
   if (!manifest || !Array.isArray(manifest.users) || manifest.users.length === 0) {
@@ -159,7 +171,7 @@ function updateSub() {
       Logger.log('Сбой пользователя id=' + String(user && user.id) + ': ' + message);
       if (user && user.id != null) {
         try {
-          const rememberedId = PropertiesService.getScriptProperties().getProperty('PENDING_FILE_' + user.id);
+          const rememberedId = PropertiesService.getScriptProperties().getProperty(pendingFileKey_(user.id, 'main'));
           report_(base, key, user.id, user.drive_file_id || rememberedId || null, false, message);
         } catch (reportErr) {
           Logger.log('Не удалось отправить отчёт для id=' + String(user.id) + ': ' + safeError_(reportErr));
@@ -175,14 +187,72 @@ function updateSub() {
     Logger.log('Остановлено по бюджету времени; продолжение начнётся с элемента ' + next + '.');
   }
   Logger.log('Синхронизация завершена: обработано ' + processed + ' из ' + users.length + '.');
+  updatePendingTest_(base, key, started, props);
   } finally {
     lock.releaseLock();
   }
 }
 
-function fetchManifest_(base, key, userIds) {
+function updatePendingTest_(base, key, started, props) {
+  const pendingKey = environmentKey_(SX.PENDING_SYNC, 'test');
+  if (props.getProperty(pendingKey) !== '1' || Date.now() - started > 5 * 60 * 1000) return;
+  const manifest = fetchManifest_(base, key, null, 'test');
+  if (!manifest || !Array.isArray(manifest.users)) return;
+  if (!manifest.users.length) {
+    props.deleteProperty(environmentKey_(SX.CURSOR, 'test'));
+    props.deleteProperty(pendingKey);
+    return;
+  }
+  const users = manifest.users;
+  let cursor = Math.max(0, parseInt(props.getProperty(environmentKey_(SX.CURSOR, 'test')) || '0', 10) || 0) % users.length;
+  let processed = 0;
+  let next = cursor;
+  let failed = false;
+  for (let offset = 0; offset < users.length; offset++) {
+    if (Date.now() - started > 5 * 60 * 1000) break;
+    const index = (cursor + offset) % users.length;
+    const user = users[index];
+    next = (index + 1) % users.length;
+    try {
+      processUser_(base, key, user, 'test');
+    } catch (err) {
+      failed = true;
+      const message = safeError_(err);
+      Logger.log('Сбой тестового пользователя id=' + String(user && user.id) + ': ' + message);
+      if (user && user.id != null) {
+        try {
+          const rememberedId = props.getProperty(pendingFileKey_(user.id, 'test'));
+          report_(base, key, user.id, user.drive_file_id || rememberedId || null, false, message, 'test');
+        } catch (reportErr) {
+          Logger.log('Не удалось отправить отчёт по тестовой подписке id=' + String(user.id) + '.');
+        }
+      }
+    }
+    processed++;
+  }
+  if (processed >= users.length && !failed) {
+    props.deleteProperty(environmentKey_(SX.CURSOR, 'test'));
+    props.deleteProperty(pendingKey);
+  } else {
+    props.setProperty(environmentKey_(SX.CURSOR, 'test'), String(next));
+    props.setProperty(pendingKey, '1');
+  }
+  Logger.log('Повтор тестовой синхронизации: обработано ' + processed + ' из ' + users.length + '.');
+}
+
+function environmentKey_(key, environment) {
+  return environment === 'test' ? key + '_TEST' : key;
+}
+
+function pendingFileKey_(userId, environment) {
+  return 'PENDING_FILE_' + (environment === 'test' ? 'TEST_' : '') + userId;
+}
+
+function fetchManifest_(base, key, userIds, environment) {
+  environment = environment || 'main';
   const suffix = userIds && userIds.length ? '?user_ids=' + encodeURIComponent(userIds.map(String).join(',')) : '';
-  const url = base + '/api/sync/manifest' + suffix;
+  const prefix = environment === 'test' ? '/test' : '';
+  const url = base + prefix + '/api/sync/manifest' + suffix;
   const weatherHeader = Utilities.base64EncodeWebSafe(JSON.stringify(fetchAshgabatWeather_()));
   let lastStatus = 0;
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -269,17 +339,19 @@ function fetchAshgabatWeather_() {
   }
 }
 
-function processUser_(base, key, user) {
+function processUser_(base, key, user, environment) {
+  environment = environment || 'main';
   if (!user || user.id == null || !user.slug) throw new Error('Некорректная запись пользователя в манифесте.');
   const props = PropertiesService.getScriptProperties();
-  let fileId = user.drive_file_id || props.getProperty('PENDING_FILE_' + user.id) || null;
+  const fileKey = pendingFileKey_(user.id, environment);
+  let fileId = user.drive_file_id || props.getProperty(fileKey) || null;
   if (user.status === 'pending_delete') {
     // Keep the public Drive URL alive and replace its content with a valid
     // one-node profile. Deleting the file makes Happ retain its last imported
     // servers when its next refresh gets a 404.
-    if (fileId) replaceDriveFileWithRevocation_(fileId);
-    report_(base, key, user.id, fileId, true, null);
-    props.deleteProperty('PENDING_FILE_' + user.id);
+    if (fileId) replaceDriveFileWithRevocation_(fileId, environment);
+    report_(base, key, user.id, fileId, true, null, environment);
+    props.deleteProperty(fileKey);
     Logger.log('Подписка пользователя id=' + user.id + ' отозвана: Drive-ссылка обновлена заглушкой.');
     return;
   }
@@ -290,10 +362,16 @@ function processUser_(base, key, user) {
   if (fileId) {
     file = DriveApp.getFileById(fileId);
   } else {
-    file = DriveApp.createFile(String(user.name || user.slug), user.content, MimeType.PLAIN_TEXT);
+    if (environment === 'test') {
+      const folderId = (props.getProperty(SX.TEST_DRIVE_FOLDER) || '').trim();
+      if (!folderId) throw new Error('TEST_DRIVE_FOLDER_ID не задан; тестовый файл не создан.');
+      file = DriveApp.getFolderById(folderId).createFile('ТЕСТ · ' + String(user.name || user.slug), user.content, MimeType.PLAIN_TEXT);
+    } else {
+      file = DriveApp.createFile(String(user.name || user.slug), user.content, MimeType.PLAIN_TEXT);
+    }
     fileId = file.getId();
     // Preserve the new ID in case reporting to Render fails; avoid duplicate files on retry.
-    props.setProperty('PENDING_FILE_' + user.id, fileId);
+    props.setProperty(fileKey, fileId);
   }
   if (newFile) {
     file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
@@ -301,16 +379,16 @@ function processUser_(base, key, user) {
   if (file.getBlob().getDataAsString('UTF-8') !== user.content) {
     file.setContent(user.content);
   }
-  report_(base, key, user.id, fileId, true, null);
-  props.deleteProperty('PENDING_FILE_' + user.id);
+  report_(base, key, user.id, fileId, true, null, environment);
+  props.deleteProperty(fileKey);
   Logger.log('Пользователь id=' + user.id + ': файл синхронизирован.');
 }
 
-function processUserWithRetry_(base, key, user) {
+function processUserWithRetry_(base, key, user, environment) {
   let lastError;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      processUser_(base, key, user);
+      processUser_(base, key, user, environment);
       return;
     } catch (err) {
       lastError = err;
@@ -324,24 +402,25 @@ function base64Utf8_(value) {
   return Utilities.base64Encode(String(value), Utilities.Charset.UTF_8);
 }
 
-function revokedProfile_() {
-  const title = 'Подписка отключена';
-  const announce = '⛔ Подписка отключена администратором. Обратитесь в поддержку.';
+function revokedProfile_(environment) {
+  const test = environment === 'test';
+  const title = test ? '🧪 ТЕСТ · Подписка отключена' : 'Подписка отключена';
+  const announce = test ? '🧪 ТЕСТ · Тестовая подписка отключена администратором.' : '⛔ Подписка отключена администратором. Обратитесь в поддержку.';
   return [
     '#profile-title: base64:' + base64Utf8_(title),
     '#profile-update-interval: 1',
     '#subscription-userinfo: upload=0; download=0; total=0; expire=0',
     '#announce: base64:' + base64Utf8_(announce),
     '#support-url: https://t.me/moserrr1',
-    'vless://00000000-0000-4000-8000-000000000000@127.0.0.1:1?encryption=none&type=tcp#' + encodeURIComponent(title),
+    'vless://00000000-0000-4000-8000-000000000000@127.0.0.1:1?encryption=none&type=tcp#' + encodeURIComponent(test ? 'Подписка отключена · ТЕСТ' : title),
     ''
   ].join('\n');
 }
 
 // Replace the file's media while preserving its ID and public link. A 404
 // means the link is already unusable, so the pending deletion can be completed.
-function replaceDriveFileWithRevocation_(fileId) {
-  const content = revokedProfile_();
+function replaceDriveFileWithRevocation_(fileId, environment) {
+  const content = revokedProfile_(environment);
   try {
     const existing = DriveApp.getFileById(String(fileId));
     if (existing.getBlob().getDataAsString('UTF-8') === content) return;
@@ -366,10 +445,11 @@ function replaceDriveFileWithRevocation_(fileId) {
   }
 }
 
-function report_(base, key, userId, fileId, ok, error) {
+function report_(base, key, userId, fileId, ok, error, environment) {
+  const prefix = environment === 'test' ? '/test' : '';
   const payload = { user_id: Number(userId), drive_file_id: fileId || null, ok: Boolean(ok) };
   if (!ok && error) payload.error = String(error).slice(0, 700);
-  const response = UrlFetchApp.fetch(base + '/api/sync/report', {
+  const response = UrlFetchApp.fetch(base + prefix + '/api/sync/report', {
     method: 'post',
     contentType: 'application/json',
     payload: JSON.stringify(payload),
