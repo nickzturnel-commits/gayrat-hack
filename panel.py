@@ -513,7 +513,40 @@ def is_excluded_sas_server(uri: str) -> bool:
 
 
 class PanelState:
+    _FEED_CACHE_FIELDS = frozenset({
+        "upstream_body", "upstream_headers", "upstream_fetched_at", "upstream_success_at",
+        "upstream_attempt_at", "upstream_warning", "sas_body", "sas_fetched_at",
+        "sas_success_at", "sas_attempt_at", "sas_warning", "combined_body",
+        "combined_fetched_at", "combined_success_at", "drive_push_last", "drive_push_error",
+    })
+
+    def __getattribute__(self, name):
+        if name in PanelState._FEED_CACHE_FIELDS:
+            values = object.__getattribute__(self, "__dict__").get("_feed_caches")
+            if values is not None:
+                env = "test" if _test_environment.get() else "main"
+                return values[env][name]
+        return object.__getattribute__(self, name)
+
+    def __setattr__(self, name, value):
+        if name in PanelState._FEED_CACHE_FIELDS:
+            values = object.__getattribute__(self, "__dict__").get("_feed_caches")
+            if values is not None:
+                env = "test" if _test_environment.get() else "main"
+                values[env][name] = value
+                return
+        object.__setattr__(self, name, value)
+
     def __init__(self):
+        defaults = {
+            "upstream_body": None, "upstream_headers": {}, "upstream_fetched_at": 0.0,
+            "upstream_success_at": None, "upstream_attempt_at": 0.0, "upstream_warning": None,
+            "sas_body": None, "sas_fetched_at": 0.0, "sas_success_at": None,
+            "sas_attempt_at": 0.0, "sas_warning": None, "combined_body": None,
+            "combined_fetched_at": 0.0, "combined_success_at": None,
+            "drive_push_last": 0.0, "drive_push_error": None,
+        }
+        self._feed_caches = {env: dict(defaults) for env in ("main", "test")}
         self.pool = None
         self.test_pool = None
         self.db_error = "База ещё не проверялась"
@@ -521,26 +554,10 @@ class PanelState:
         self.db_last_attempt = 0.0
         self.test_db_last_attempt = 0.0
         self.upstream_client: httpx.AsyncClient | None = None
-        self.upstream_body: bytes | None = None
-        self.upstream_headers: dict[str, str] = {}
-        self.upstream_fetched_at = 0.0
-        self.upstream_success_at: float | None = None
-        self.upstream_attempt_at = 0.0
-        self.upstream_warning: str | None = None
-        self.sas_body: bytes | None = None
-        self.sas_fetched_at = 0.0
-        self.sas_success_at: float | None = None
-        self.sas_attempt_at = 0.0
-        self.sas_warning: str | None = None
-        self.combined_body: bytes | None = None
-        self.combined_fetched_at = 0.0
-        self.combined_success_at: float | None = None
         self.upstream_lock = asyncio.Lock()
         self.announce_cache: tuple[tuple, str] | None = None
         self.announce_quote: str | None = None
         self.login_fails: dict[str, tuple[int, float]] = {}
-        self.drive_push_last: float = 0.0
-        self.drive_push_error: str | None = None
         self.happ_tasks: set[asyncio.Task] = set()
 
     @property
@@ -922,6 +939,27 @@ class ServerBody(BaseModel):
 class UserServerBody(BaseModel):
     hidden: bool | None = None
     custom_name: str | None = Field(default=None, max_length=200)
+
+
+class ServerBatchItem(BaseModel):
+    server_id: str = Field(min_length=1, max_length=200)
+    custom_name: str | None = Field(default=None, max_length=200)
+    hidden: bool
+    sort_order: int = Field(ge=-100000, le=100000)
+
+
+class ServerBatchBody(BaseModel):
+    servers: list[ServerBatchItem] = Field(min_length=1, max_length=500)
+
+
+class UserServerBatchItem(BaseModel):
+    server_id: str = Field(min_length=1, max_length=200)
+    hidden: bool | None = None
+    custom_name: str | None = Field(default=None, max_length=200)
+
+
+class UserServerBatchBody(BaseModel):
+    servers: list[UserServerBatchItem] = Field(min_length=1, max_length=500)
 
 
 class SettingsBody(BaseModel):
@@ -1407,7 +1445,8 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
     if web_url:
         lines.append("#profile-web-page-url: " + web_url)
     if active:
-        global_rows = await conn.fetch("SELECT id,original_name,custom_name,hidden,sort_order,source FROM servers WHERE present_upstream=TRUE ORDER BY sort_order,id")
+        order_sql = "CASE WHEN source='sas' THEN 1 ELSE 0 END,sort_order,id" if test_mode else "sort_order,id"
+        global_rows = await conn.fetch(f"SELECT id,original_name,custom_name,hidden,sort_order,source FROM servers WHERE present_upstream=TRUE ORDER BY {order_sql}")
         upstream_by_id = {server["id"]: server for server in servers}
         overrides = await conn.fetch("SELECT server_id,hidden,custom_name FROM user_servers WHERE user_id=$1", user["id"])
         overrides_by_id = {row["server_id"]: row for row in overrides}
@@ -1947,7 +1986,8 @@ async def servers_list(request: Request):
     pool = await state.db()
     async with pool.acquire() as conn:
         await _sync_servers(conn, body, primary_body=state.upstream_body, sas_body=state.sas_body)
-        rows = await conn.fetch("SELECT * FROM servers WHERE present_upstream=TRUE ORDER BY sort_order,id")
+        order_sql = "CASE WHEN source='sas' THEN 1 ELSE 0 END,sort_order,id" if _test_environment.get() else "sort_order,id"
+        rows = await conn.fetch(f"SELECT * FROM servers WHERE present_upstream=TRUE ORDER BY {order_sql}")
     return {"servers": [_serialize(r) for r in rows]}
 
 
@@ -1964,6 +2004,26 @@ async def servers_update(server_id: str, data: ServerBody, request: Request):
 class BulkServerBody(BaseModel):
     server_ids: list[str] = Field(min_length=1, max_length=500)
     hidden: bool
+
+
+@router.post("/api/admin/servers/batch")
+async def servers_batch(data: ServerBatchBody, request: Request):
+    _auth(request, csrf=True)
+    if not _test_environment.get():
+        raise HTTPException(404, "Пакетное редактирование доступно только в тестовой среде")
+    ids = [item.server_id for item in data.servers]
+    if len(ids) != len(set(ids)):
+        raise HTTPException(422, "В пакете есть повторяющиеся серверы")
+    pool = await state.db()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for item in data.servers:
+                row = await conn.fetchrow("""UPDATE servers SET custom_name=$2,hidden=$3,sort_order=$4
+                    WHERE id=$1 AND present_upstream=TRUE RETURNING id""",
+                    item.server_id, item.custom_name, item.hidden, item.sort_order)
+                if not row:
+                    raise HTTPException(409, "Один из серверов уже отсутствует в источнике. Обновите каталог и повторите.")
+    return {"ok": True, "updated": len(data.servers), "drive_sync": await state.push_drive_sync()}
 
 
 @router.post("/api/admin/servers/bulk")
@@ -1985,6 +2045,29 @@ async def servers_refresh(request: Request):
     return {"count": len(servers), "drive_sync": await state.push_drive_sync()}
 
 
+@router.post("/api/admin/cache/refresh")
+async def test_cache_refresh(request: Request):
+    _auth(request, csrf=True)
+    if not _test_environment.get():
+        raise HTTPException(404, "Обновление тестового кэша доступно только в тестовой среде")
+    fields = state._FEED_CACHE_FIELDS
+    cache = state._feed_caches["test"]
+    previous = {key: cache[key] for key in fields}
+    try:
+        body, _, stale = await state.fetch_upstream(force=True, force_sas=True)
+        if stale:
+            raise HTTPException(502, "Один из источников не обновился. Сохранён последний рабочий кэш; подписки не изменены.")
+        pool = await state.db()
+        async with pool.acquire() as conn:
+            servers = await _sync_servers(conn, body, primary_body=state.upstream_body, sas_body=state.sas_body)
+    except Exception:
+        warnings = {key: cache[key] for key in ("upstream_attempt_at", "upstream_warning", "sas_attempt_at", "sas_warning")}
+        cache.update(previous)
+        cache.update(warnings)
+        raise
+    return {"ok": True, "count": len(servers), "drive_sync": await state.push_drive_sync()}
+
+
 @router.put("/api/admin/users/{user_id}/servers/{server_id}")
 async def user_server_update(user_id: int, server_id: str, data: UserServerBody, request: Request):
     _auth(request, csrf=True)
@@ -1999,6 +2082,29 @@ async def user_server_update(user_id: int, server_id: str, data: UserServerBody,
     return {"ok": True, "drive_sync": await state.push_drive_sync([user_id])}
 
 
+@router.post("/api/admin/users/{user_id}/servers/batch")
+async def user_servers_batch(user_id: int, data: UserServerBatchBody, request: Request):
+    _auth(request, csrf=True)
+    if not _test_environment.get():
+        raise HTTPException(404, "Пакетное редактирование доступно только в тестовой среде")
+    ids = [item.server_id for item in data.servers]
+    if len(ids) != len(set(ids)):
+        raise HTTPException(422, "В пакете есть повторяющиеся серверы")
+    pool = await state.db()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            if not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)", user_id):
+                raise HTTPException(404, "Пользователь не найден")
+            for item in data.servers:
+                exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM servers WHERE id=$1 AND present_upstream=TRUE)", item.server_id)
+                if not exists:
+                    raise HTTPException(409, "Один из серверов отсутствует в источнике. Обновите список и повторите.")
+                await conn.execute("""INSERT INTO user_servers(user_id,server_id,hidden,custom_name) VALUES($1,$2,$3,$4)
+                    ON CONFLICT(user_id,server_id) DO UPDATE SET hidden=EXCLUDED.hidden,custom_name=EXCLUDED.custom_name""",
+                    user_id, item.server_id, item.hidden, item.custom_name)
+    return {"ok": True, "updated": len(data.servers), "drive_sync": await state.push_drive_sync([user_id])}
+
+
 @router.get("/api/admin/users/{user_id}/servers")
 async def user_servers_list(user_id: int, request: Request):
     _auth(request)
@@ -2010,10 +2116,11 @@ async def user_servers_list(user_id: int, request: Request):
         if not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)", user_id):
             raise HTTPException(404, "Пользователь не найден")
         await _sync_servers(conn, body, primary_body=state.upstream_body, sas_body=state.sas_body)
-        rows = await conn.fetch("""SELECT s.id,s.original_name,s.custom_name AS global_name,s.hidden AS global_hidden,
+        order_prefix = "CASE WHEN s.source='sas' THEN 1 ELSE 0 END," if _test_environment.get() else ""
+        rows = await conn.fetch(f"""SELECT s.id,s.original_name,s.custom_name AS global_name,s.hidden AS global_hidden,
             s.source,s.sort_order,s.present_upstream,us.hidden AS user_hidden,us.custom_name AS user_name
             FROM servers s LEFT JOIN user_servers us ON us.server_id=s.id AND us.user_id=$1
-            WHERE s.present_upstream=TRUE ORDER BY s.sort_order,s.id""", user_id)
+            WHERE s.present_upstream=TRUE ORDER BY {order_prefix}s.sort_order,s.id""", user_id)
     return {"servers": [_serialize(row) for row in rows]}
 
 
