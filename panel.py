@@ -24,7 +24,7 @@ from urllib.parse import quote, unquote, urlencode, urlsplit
 import asyncpg
 import httpx
 import qrcode
-from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
+from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, StrictInt
@@ -44,6 +44,7 @@ ASHGABAT_LONGITUDE = 58.3261
 ASHGABAT_WEATHER_UNAVAILABLE = "🌡 Ашхабад: текущая погода временно недоступна"
 UPSTREAM_TIMEOUT_SECONDS = 20.0
 PANEL_CACHE_TTL_SECONDS = 300
+GEO_FILE_CACHE_TTL_SECONDS = 24 * 60 * 60
 SESSION_SECONDS = 12 * 60 * 60
 DB_HINT = ("Не удалось подключиться к базе. Если используется прямой хост db.*.supabase.co, "
            "возьмите в Supabase (Connect → Session pooler) строку подключения и поставьте её в DATABASE_URL")
@@ -554,6 +555,8 @@ class PanelState:
         self.db_last_attempt = 0.0
         self.test_db_last_attempt = 0.0
         self.upstream_client: httpx.AsyncClient | None = None
+        self.test_geo_file_cache: dict[str, tuple[bytes, float]] = {}
+        self.test_geo_file_lock = asyncio.Lock()
         self.upstream_lock = asyncio.Lock()
         self.announce_cache: tuple[tuple, str] | None = None
         self.announce_quote: str | None = None
@@ -622,6 +625,13 @@ class PanelState:
             async with self.test_pool.acquire() as conn:
                 schema = open(os.path.join(os.path.dirname(__file__), "schema.sql"), encoding="utf-8").read()
                 await conn.execute(schema)
+                await conn.execute("""CREATE TABLE IF NOT EXISTS test_geo_state (
+                    user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    geoip_downloaded_at TIMESTAMPTZ,
+                    geosite_downloaded_at TIMESTAMPTZ,
+                    download_requests INTEGER NOT NULL DEFAULT 0,
+                    activated_at TIMESTAMPTZ
+                )""")
                 await self.seed(conn, include_legacy=False)
             self.test_db_error = ""
             log.info("Test panel database schema initialized")
@@ -1402,8 +1412,16 @@ async def _sync_servers(conn, body: bytes, *, primary_body: bytes | None = None,
     return parsed
 
 
+def _test_geo_signature(user_id: int) -> str:
+    secret = os.getenv("SESSION_SECRET", "")
+    if len(secret) < 32:
+        raise HTTPException(503, "Тестовый доступ к геофайлам не настроен")
+    return hmac.new(secret.encode(), f"secure-x-test-geo:{user_id}".encode(), hashlib.sha256).hexdigest()
+
+
 async def build_manifest_content(conn, user, body: bytes, headers: dict, settings: dict,
-                                 announce: str | None = None, servers: list[dict] | None = None) -> str:
+                                 announce: str | None = None, servers: list[dict] | None = None,
+                                 public_base_url: str | None = None) -> str:
     if servers is None:
         servers = await _sync_servers(conn, body)
     now = datetime.now(timezone.utc)
@@ -1445,6 +1463,33 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
     if web_url:
         lines.append("#profile-web-page-url: " + web_url)
     if active:
+        geo_locked = False
+        if test_mode:
+            geo_state = await conn.fetchrow("SELECT activated_at FROM test_geo_state WHERE user_id=$1", user["id"])
+            geo_locked = not geo_state or geo_state["activated_at"] is None
+            if geo_locked:
+                base_url = (public_base_url or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
+                if not base_url:
+                    raise HTTPException(503, "Не удалось определить адрес тестового сервиса для геофайлов")
+                signature = _test_geo_signature(int(user["id"]))
+                geo_root = f"{base_url}/test/geo/{int(user['id'])}/{signature}"
+                routing = {
+                    "Name": f"Secure X · ТЕСТ · geo {user['id']}",
+                    "Geoipurl": geo_root + "/geoip.dat",
+                    "Geositeurl": geo_root + "/geosite.dat",
+                    "LastUpdated": str(int(time.time())),
+                    "DnsHosts": {}, "DirectSites": [], "DirectIp": [],
+                    "ProxySites": [], "ProxyIp": [], "BlockSites": [], "BlockIp": [],
+                    "DomainStrategy": "AsIs", "FakeDNS": "false",
+                }
+                routing64 = base64.urlsafe_b64encode(json.dumps(routing, ensure_ascii=False).encode()).decode().rstrip("=")
+                lines.append("happ://routing/add/" + routing64)
+        if geo_locked:
+            placeholder = "Скачать geo-файлы · ТЕСТ"
+            waiting_announcement = "🧪 ТЕСТ · Загрузка геофайлов. После их загрузки обновите подписку в Happ, чтобы получить серверы."
+            lines[2] = "#announce: base64:" + base64.b64encode(waiting_announcement.encode()).decode()
+            lines.append("vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?type=tcp&encryption=none#" + quote(placeholder, safe=""))
+            return "\n".join(lines) + "\n"
         order_sql = "CASE WHEN source='sas' THEN 1 ELSE 0 END,sort_order,id" if test_mode else "sort_order,id"
         global_rows = await conn.fetch(f"SELECT id,original_name,custom_name,hidden,sort_order,source FROM servers WHERE present_upstream=TRUE ORDER BY {order_sql}")
         upstream_by_id = {server["id"]: server for server in servers}
@@ -1678,7 +1723,12 @@ async def users_list(request: Request):
     _auth(request)
     pool = await state.db()
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM users ORDER BY created_at,id")
+        if _test_environment.get():
+            rows = await conn.fetch("""SELECT u.*,g.download_requests AS geo_download_requests,
+                g.geoip_downloaded_at,g.geosite_downloaded_at,g.activated_at AS geo_activated_at
+                FROM users u LEFT JOIN test_geo_state g ON g.user_id=u.id ORDER BY u.created_at,u.id""")
+        else:
+            rows = await conn.fetch("SELECT * FROM users ORDER BY created_at,id")
     api_key_configured = bool(os.getenv("DRIVE_API_KEY", ""))
     users = []
     for row in rows:
@@ -1784,7 +1834,8 @@ async def users_preview(user_id: int, request: Request):
     body, headers, _ = await state.fetch_upstream(allow_sas_failure=not _user_needs_sas(user))
     async with pool.acquire() as conn:
         servers = await _sync_servers(conn, body, primary_body=state.upstream_body, sas_body=state.sas_body)
-        content = await build_manifest_content(conn, user, body, headers, settings, servers=servers)
+        content = await build_manifest_content(conn, user, body, headers, settings, servers=servers,
+                                               public_base_url=str(request.base_url).rstrip("/"))
     return PlainTextResponse(content, headers={"Cache-Control": "no-store"})
 
 
@@ -2314,7 +2365,9 @@ async def sync_manifest(request: Request):
         announce = await _announce(settings, weather_payload) if settings.get("announce_enabled", True) else ""
         manifest = []
         for user in rows:
-            content = "" if user["status"] == "pending_delete" else await build_manifest_content(conn, user, body, headers, settings, announce, servers)
+            content = "" if user["status"] == "pending_delete" else await build_manifest_content(
+                conn, user, body, headers, settings, announce, servers,
+                public_base_url=str(request.base_url).rstrip("/"))
             manifest.append({"id": user["id"], "slug": user["slug"], "status": user["status"], "enabled": user["enabled"],
                              "drive_file_id": user["drive_file_id"], "name": user["name"], "content": content})
     log.info("Apps Script manifest generated: users=%d stale-cache=%s", len(manifest), "yes" if _stale else "no")
@@ -2347,11 +2400,77 @@ async def sync_report(data: SyncReport, request: Request):
     return {"ok": True}
 
 
+GEO_FILE_SOURCES = {
+    "geoip.dat": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+    "geosite.dat": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
+}
+
+
+async def _sync_activated_test_subscription(user_id: int):
+    token = _test_environment.set(True)
+    try:
+        delivery = await state.push_drive_sync([user_id])
+        log.info("Test subscription geo activation: user_id=%d, drive_sync_ok=%s", user_id, bool(delivery.get("ok")))
+    finally:
+        _test_environment.reset(token)
+
+
+async def test_geo_file(user_id: int, signature: str, filename: str, request: Request,
+                        background_tasks: BackgroundTasks):
+    if not _test_environment.get():
+        raise HTTPException(404, "Not found")
+    if filename not in GEO_FILE_SOURCES or not hmac.compare_digest(signature, _test_geo_signature(user_id)):
+        raise HTTPException(404, "Not found")
+    pool = await state.db()
+    async with pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT id FROM users WHERE id=$1 AND status='active' AND enabled=TRUE", user_id)
+    if not user:
+        raise HTTPException(404, "Not found")
+    try:
+        async with state.test_geo_file_lock:
+            cached = state.test_geo_file_cache.get(filename)
+            if cached and time.monotonic() - cached[1] < GEO_FILE_CACHE_TTL_SECONDS:
+                content = cached[0]
+            else:
+                async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(90.0, connect=15.0)) as client:
+                    response = await client.get(GEO_FILE_SOURCES[filename], headers={"User-Agent": "Happ"})
+                content = response.content
+                if response.status_code >= 400 or len(content) < 1024 or len(content) > 50_000_000:
+                    raise ValueError("Источник геофайла вернул некорректный файл")
+                if content.lstrip()[:64].lower().startswith((b"<!doctype html", b"<html", b"{\"message\"")):
+                    raise ValueError("Источник вместо геофайла вернул текстовую страницу")
+                state.test_geo_file_cache[filename] = (content, time.monotonic())
+    except Exception as exc:
+        log.warning("Test geo-file fetch failed (user_id=%d, file=%s, error=%s)", user_id, filename, type(exc).__name__)
+        raise HTTPException(502, "Не удалось получить тестовый геофайл") from exc
+
+    column = "geoip_downloaded_at" if filename == "geoip.dat" else "geosite_downloaded_at"
+    activated_now = False
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(f"""INSERT INTO test_geo_state(user_id,{column},download_requests)
+                VALUES($1,now(),1) ON CONFLICT(user_id) DO UPDATE SET
+                {column}=COALESCE(test_geo_state.{column},now()),
+                download_requests=test_geo_state.download_requests+1""", user_id)
+            activated_now = bool(await conn.fetchval("""UPDATE test_geo_state SET activated_at=now()
+                WHERE user_id=$1 AND activated_at IS NULL
+                  AND geoip_downloaded_at IS NOT NULL AND geosite_downloaded_at IS NOT NULL
+                RETURNING TRUE""", user_id))
+    if activated_now:
+        background_tasks.add_task(_sync_activated_test_subscription, user_id)
+    return Response(content=content, media_type="application/octet-stream", headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate", "Content-Length": str(len(content)),
+        "Content-Disposition": f'attachment; filename="{filename}"',
+    })
+
+
 def install(app: FastAPI):
     app.add_middleware(PanelSecurityMiddleware)
     app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="panel-static")
     app.include_router(router)
     app.include_router(router, prefix="/test")
+    app.add_api_route("/test/geo/{user_id}/{signature}/{filename}", test_geo_file,
+                      methods=["GET"], include_in_schema=False)
     app.add_api_route("/test", test_page, methods=["GET"], response_class=HTMLResponse, include_in_schema=False)
     app.add_api_route("/test/desktop", test_desktop_page, methods=["GET"], response_class=HTMLResponse, include_in_schema=False)
     app.add_api_route("/test/mobile", test_mobile_page, methods=["GET"], response_class=HTMLResponse, include_in_schema=False)
