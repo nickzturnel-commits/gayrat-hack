@@ -627,11 +627,18 @@ class PanelState:
                 await conn.execute(schema)
                 await conn.execute("""CREATE TABLE IF NOT EXISTS test_geo_state (
                     user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    geo_device_limit INTEGER CHECK (geo_device_limit IS NULL OR geo_device_limit BETWEEN 1 AND 20),
                     geoip_downloaded_at TIMESTAMPTZ,
                     geosite_downloaded_at TIMESTAMPTZ,
+                    geoip_requests INTEGER NOT NULL DEFAULT 0,
+                    geosite_requests INTEGER NOT NULL DEFAULT 0,
                     download_requests INTEGER NOT NULL DEFAULT 0,
                     activated_at TIMESTAMPTZ
                 )""")
+                await conn.execute("""ALTER TABLE test_geo_state ADD COLUMN IF NOT EXISTS geo_device_limit INTEGER
+                    CHECK (geo_device_limit IS NULL OR geo_device_limit BETWEEN 1 AND 20)""")
+                await conn.execute("ALTER TABLE test_geo_state ADD COLUMN IF NOT EXISTS geoip_requests INTEGER NOT NULL DEFAULT 0")
+                await conn.execute("ALTER TABLE test_geo_state ADD COLUMN IF NOT EXISTS geosite_requests INTEGER NOT NULL DEFAULT 0")
                 await self.seed(conn, include_legacy=False)
             self.test_db_error = ""
             log.info("Test panel database schema initialized")
@@ -934,6 +941,7 @@ class UserBody(BaseModel):
     hide_traffic_usage: bool | None = None
     include_sas: bool | None = None
     device_limit: StrictInt | None = Field(default=None, ge=happ_limit.MIN_LIMIT, le=happ_limit.MAX_LIMIT)
+    geo_device_limit: StrictInt | None = Field(default=None, ge=1, le=20)
 
 
 class DeviceLimitActionBody(BaseModel):
@@ -1465,9 +1473,10 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
     if active:
         geo_locked = False
         if test_mode:
-            geo_state = await conn.fetchrow("SELECT activated_at FROM test_geo_state WHERE user_id=$1", user["id"])
-            geo_locked = not geo_state or geo_state["activated_at"] is None
-            if geo_locked:
+            geo_state = await conn.fetchrow("SELECT activated_at,geo_device_limit FROM test_geo_state WHERE user_id=$1", user["id"])
+            geo_enabled = bool(geo_state and geo_state["geo_device_limit"] is not None)
+            geo_locked = geo_enabled and geo_state["activated_at"] is None
+            if geo_enabled:
                 base_url = (public_base_url or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
                 if not base_url:
                     raise HTTPException(503, "Не удалось определить адрес тестового сервиса для геофайлов")
@@ -1484,18 +1493,13 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
                 }
                 routing64 = base64.urlsafe_b64encode(json.dumps(routing, ensure_ascii=False).encode()).decode().rstrip("=")
                 lines.append("happ://routing/add/" + routing64)
-        if geo_locked:
-            placeholder = "Скачать geo-файлы · ТЕСТ"
-            waiting_announcement = "🧪 ТЕСТ · Загрузка геофайлов. После их загрузки обновите подписку в Happ, чтобы получить серверы."
-            lines[2] = "#announce: base64:" + base64.b64encode(waiting_announcement.encode()).decode()
-            lines.append("vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1?type=tcp&encryption=none#" + quote(placeholder, safe=""))
-            return "\n".join(lines) + "\n"
         order_sql = "CASE WHEN source='sas' THEN 1 ELSE 0 END,sort_order,id" if test_mode else "sort_order,id"
         global_rows = await conn.fetch(f"SELECT id,original_name,custom_name,hidden,sort_order,source FROM servers WHERE present_upstream=TRUE ORDER BY {order_sql}")
         upstream_by_id = {server["id"]: server for server in servers}
         overrides = await conn.fetch("SELECT server_id,hidden,custom_name FROM user_servers WHERE user_id=$1", user["id"])
         overrides_by_id = {row["server_id"]: row for row in overrides}
         server_lines = []
+        first_visible_uri = None
         for global_row in global_rows:
             server = upstream_by_id.get(global_row["id"])
             if not server:
@@ -1515,10 +1519,18 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
             if test_mode:
                 name = re.sub(r"(?: · ТЕСТ)+$", "", name, flags=re.I) + " · ТЕСТ"
             server_lines.append(rename_server_uri(server["uri"], name))
+            if first_visible_uri is None:
+                first_visible_uri = server["uri"]
         if not server_lines:
             # Do not let Apps Script replace a working Drive profile with a
             # metadata-only file that Happ rejects as having no server links.
             raise HTTPException(502, "Для этой подписки нет доступных серверов. Обновите список серверов и проверьте, что они не скрыты.")
+        if geo_locked:
+            waiting_announcement = "🧪 ТЕСТ · Загрузите geo-файлы, затем обновите подписку в Happ, чтобы получить все серверы."
+            lines[2] = "#announce: base64:" + base64.b64encode(waiting_announcement.encode()).decode()
+            if not first_visible_uri:
+                raise HTTPException(502, "Нет рабочего тестового сервера для начальной подписки")
+            server_lines = [rename_server_uri(first_visible_uri, "Скачать geo-файлы · ТЕСТ")]
         lines.extend(server_lines)
     else:
         reason = "Время подписки закончилось" if expired else "Подписка отключена"
@@ -1724,7 +1736,8 @@ async def users_list(request: Request):
     pool = await state.db()
     async with pool.acquire() as conn:
         if _test_environment.get():
-            rows = await conn.fetch("""SELECT u.*,g.download_requests AS geo_download_requests,
+            rows = await conn.fetch("""SELECT u.*,g.geo_device_limit,g.geoip_requests,g.geosite_requests,
+                g.download_requests AS geo_download_requests,
                 g.geoip_downloaded_at,g.geosite_downloaded_at,g.activated_at AS geo_activated_at
                 FROM users u LEFT JOIN test_geo_state g ON g.user_id=u.id ORDER BY u.created_at,u.id""")
         else:
@@ -1772,6 +1785,8 @@ async def users_create(data: UserBody, request: Request):
             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *""", data.name.strip(), slug, data.note, data.enabled,
             _expiry_utc(data.expires_at), data.title_override, data.announce_override, data.traffic_limit_bytes, hide_traffic, include_sas,
             device_limit, device_status)
+        if _test_environment.get() and data.geo_device_limit is not None:
+            await conn.execute("INSERT INTO test_geo_state(user_id,geo_device_limit) VALUES($1,$2)", row["id"], data.geo_device_limit)
     if row["device_limit"] is not None:
         _schedule_limited_link(row["id"])
     drive_sync = await state.push_drive_sync([row["id"]])
@@ -1805,6 +1820,14 @@ async def users_update(user_id: int, data: UserBody, request: Request):
             data.name.strip(), data.note, data.enabled, _expiry_utc(data.expires_at), data.title_override, data.announce_override,
             data.traffic_limit_bytes, data.hide_traffic_usage, LEGACY_DRIVE_FILE_ID, data.include_sas,
             limit_supplied, data.device_limit, limit_changed)
+        if _test_environment.get() and "geo_device_limit" in data.model_fields_set:
+            geo_state = await conn.fetchrow("SELECT geo_device_limit FROM test_geo_state WHERE user_id=$1", user_id)
+            previous_geo_limit = geo_state["geo_device_limit"] if geo_state else None
+            if previous_geo_limit != data.geo_device_limit:
+                await conn.execute("DELETE FROM test_geo_state WHERE user_id=$1", user_id)
+                if data.geo_device_limit is not None:
+                    await conn.execute("INSERT INTO test_geo_state(user_id,geo_device_limit) VALUES($1,$2)",
+                                       user_id, data.geo_device_limit)
     if not row: raise HTTPException(404, "Пользователь не найден")
     if row["device_limit"] is not None:
         _schedule_limited_link(user_id)
@@ -2423,9 +2446,14 @@ async def test_geo_file(user_id: int, signature: str, filename: str, request: Re
         raise HTTPException(404, "Not found")
     pool = await state.db()
     async with pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT id FROM users WHERE id=$1 AND status='active' AND enabled=TRUE", user_id)
-    if not user:
+        user = await conn.fetchrow("""SELECT u.id,g.geo_device_limit,g.geoip_requests,g.geosite_requests
+            FROM users u JOIN test_geo_state g ON g.user_id=u.id
+            WHERE u.id=$1 AND u.status='active' AND u.enabled=TRUE AND g.geo_device_limit IS NOT NULL""", user_id)
+    if not user or user["geo_device_limit"] is None:
         raise HTTPException(404, "Not found")
+    request_column = "geoip_requests" if filename == "geoip.dat" else "geosite_requests"
+    if user[request_column] >= user["geo_device_limit"]:
+        raise HTTPException(429, "Тестовый лимит запросов geo-файла исчерпан")
     try:
         async with state.test_geo_file_lock:
             cached = state.test_geo_file_cache.get(filename)
@@ -2448,10 +2476,12 @@ async def test_geo_file(user_id: int, signature: str, filename: str, request: Re
     activated_now = False
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute(f"""INSERT INTO test_geo_state(user_id,{column},download_requests)
-                VALUES($1,now(),1) ON CONFLICT(user_id) DO UPDATE SET
-                {column}=COALESCE(test_geo_state.{column},now()),
-                download_requests=test_geo_state.download_requests+1""", user_id)
+            slot = await conn.fetchrow(f"""UPDATE test_geo_state SET {request_column}={request_column}+1,
+                {column}=COALESCE({column},now()), download_requests=download_requests+1
+                WHERE user_id=$1 AND geo_device_limit IS NOT NULL AND {request_column}<geo_device_limit
+                RETURNING user_id""", user_id)
+            if not slot:
+                raise HTTPException(429, "Тестовый лимит запросов geo-файла исчерпан")
             activated_now = bool(await conn.fetchval("""UPDATE test_geo_state SET activated_at=now()
                 WHERE user_id=$1 AND activated_at IS NULL
                   AND geoip_downloaded_at IS NOT NULL AND geosite_downloaded_at IS NOT NULL
