@@ -19,7 +19,7 @@
   if (testMode) {
     document.body.classList.add('test-environment');
     const banner = document.createElement('div');
-    banner.textContent = '🧪 ТЕСТОВАЯ СРЕДА · данные изолированы';
+    banner.textContent = 'ТЕСТОВАЯ СРЕДА / ДАННЫЕ ИЗОЛИРОВАНЫ';
     banner.className = 'environment-banner test-banner';
     banner.setAttribute('role', 'status');
     document.body.prepend(banner);

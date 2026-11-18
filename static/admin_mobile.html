@@ -3,27 +3,26 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="color-scheme" content="light">
-  <meta name="theme-color" content="#f3f2ec">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0c1110">
   <title>Secure X — мобильная панель</title>
-  <link rel="stylesheet" href="/static/admin.css?v=20261118-2">
+  <link rel="stylesheet" href="/static/admin.css?v=20261118-3">
   <script src="/static/admin-device.js?v=20261025-1" defer></script>
   <script src="/static/admin-actions.js?v=20261029-2" defer></script>
-  <script src="/static/admin.js?v=20261118-2" defer></script>
+  <script src="/static/admin.js?v=20261118-3" defer></script>
 </head>
 <body class="mobile-ui">
   <div class="ambient ambient-a" aria-hidden="true"></div>
   <div class="ambient ambient-b" aria-hidden="true"></div>
   <header class="mobile-header">
     <a class="brand-lockup" href="/admin" aria-label="Secure X, главная" data-home-link>
-      <span class="brand-symbol"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M16 3 27 9v14l-11 6L5 23V9L16 3Z"/><path d="m11 16 3.2 3.2L21.5 12"/></svg></span>
-      <span><b>Secure X</b><small>УПРАВЛЕНИЕ</small></span>
+      <span><b>Secure X</b><small>CONTROL / ADMIN</small></span>
     </a>
     <button id="logout" class="button button-quiet hidden">Выйти</button>
   </header>
 
   <section id="loginView" class="mobile-login">
-    <div class="mobile-login-mark"><div class="login-emblem"><svg viewBox="0 0 64 64" aria-hidden="true"><path d="M32 6 54 18v28L32 58 10 46V18L32 6Z"/><path d="m23 32 6 6 13-14"/></svg></div></div>
+    <div class="mobile-login-mark" aria-hidden="true"></div>
     <div class="login-card surface-card">
       <p class="eyebrow">ДОСТУП АДМИНИСТРАТОРА</p><h1>Войти в панель</h1><p class="muted">Введите имя пользователя и пароль администратора.</p>
       <form id="loginForm" class="form-grid">
