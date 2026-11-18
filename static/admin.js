@@ -394,26 +394,25 @@
         // the primary share action while Happ is still building its link.
         const mainLink = testActivation ? activationLink : hasLimit ? (user.limited_link || '') : (user.drive_link || '');
         const mainLinkLabel = testActivation
-          ? (activationLink ? 'Ссылка активации · ТЕСТ' : 'Ссылка активации готовится')
+          ? (activationLink ? 'Render-ссылка · ТЕСТ' : 'Render-ссылка готовится')
           : hasLimit
           ? (user.limited_link ? 'Копировать Happ' : 'Happ-ссылка готовится')
           : 'Копировать Drive';
         const mainLinkTitle = testActivation
-          ? 'Клиент сначала зарегистрирует браузер, затем получит кнопку импорта в Happ'
+          ? 'Уникальный адрес этой подписки: Happ сначала покажет заглушку, подтверждение откроет сайт, а Render выдаст отдельную ссылку для импорта'
           : hasLimit
           ? (user.limited_link
             ? `Скопировать зашифрованную подписку Happ с лимитом ${user.device_limit} устройств`
             : 'Зашифрованная ссылка Happ ещё создаётся')
           : 'Скопировать обычную ссылку Google Drive без лимита устройств';
         const mainQrLabel = testActivation
-          ? (activationLink ? 'QR страницы · ТЕСТ' : 'QR появится со ссылкой')
+          ? (activationLink ? 'QR Render-ссылки · ТЕСТ' : 'QR появится со ссылкой')
           : hasLimit
           ? (user.limited_link ? 'QR с лимитом' : 'QR появится с Happ-ссылкой')
           : 'QR-код Drive';
         return `<article class="surface-card user-card" data-user-card data-user-name="${esc(`${user.name || ''} ${user.note || ''}`.toLowerCase())}" data-user-state="${state}" data-user-sas="${user.include_sas === false ? 'off' : 'on'}" data-user-limit="${hasLimit ? 'limited' : 'unlimited'}">
           <div class="user-card-head"><div class="avatar-mark">${esc((user.name || '?').trim().slice(0, 1).toUpperCase())}</div><div class="user-main"><h2>${esc(user.name)}</h2><p>${esc(user.note || 'Без заметки')}</p></div><span class="badge ${tone}">${status}</span><span class="badge ${user.drive_file_id ? 'badge-good' : 'badge-muted'}">${user.drive_file_id ? 'Drive готов' : 'Ожидает Drive'}</span><span class="badge ${user.include_sas === false ? 'badge-muted' : 'source-sas'}">${user.include_sas === false ? 'Только Secure X' : 'Secure X + SAS'}</span>${user.hide_traffic_usage && user.slug !== 'legacy' ? '<span class="badge badge-muted">Счётчик скрыт</span>' : ''}${hasLimit ? `<span class="badge ${limitStatusTone}">Устройств: ${esc(user.device_limit)} · ${limitStatusLabel}</span>` : '<span class="badge badge-muted">Без лимита устройств</span>'}${testMode ? `${user.test_activation_enabled ? `<span class="badge ${user.test_activation_at ? 'badge-good' : 'badge-warn'}">Активация ТЕСТ · ${user.test_activation_at ? 'подтверждена' : 'ожидает'} · ID ${esc(user.test_activation_id || '—')}</span>` : ''}<span class="badge ${user.geo_device_limit ? (user.geo_activated_at ? 'badge-good' : 'badge-muted') : 'badge-muted'}">Geo ТЕСТ · ${user.geo_device_limit ? `${user.geo_activated_at ? 'активировано' : 'ожидает'} · лимит ${esc(user.geo_device_limit)}` : 'выключено'} · IP ${Number(user.geoip_requests) || 0}/${esc(user.geo_device_limit || '—')} · Sites ${Number(user.geosite_requests) || 0}/${esc(user.geo_device_limit || '—')}</span>` : ''}</div>
           ${hasLimit && user.device_limit_error ? `<p class="tone-warn device-limit-error" role="status">${esc(user.device_limit_error)}</p>` : ''}
-          ${testActivation && user.test_activation_error ? `<p class="tone-warn device-limit-error" role="status">Не удалось подготовить зашифрованную Happ-ссылку · ТЕСТ: ${esc(user.test_activation_error)}</p>` : ''}
           <div class="user-meta"><span>Срок действия</span><strong>${esc(date(user.expires_at))}</strong></div>
           <div class="user-actions">
             <button class="button button-secondary" data-edit="${user.id}">${svg('edit')}<span>Изменить</span></button>
@@ -423,7 +422,6 @@
             <button class="button button-secondary user-qr-action" data-action="qr" data-limited="${testActivation ? 'no' : user.limited_link ? 'yes' : 'no'}" data-activation-qr="${testActivation ? 'yes' : 'no'}" data-user-id="${user.id}" ${mainLink ? '' : 'disabled'}>${svg('qr')}<span>${mainQrLabel}</span></button>
             ${testActivation && user.test_activation_url ? `<button class="button button-secondary" data-action="copy-link" data-link="${esc(user.test_activation_url)}" data-user-id="${user.id}">${svg('link')}<span>Ссылка подтверждения · ТЕСТ</span></button>` : ''}
             ${testActivation ? `<button class="button button-secondary" data-test-activation-reset="${user.id}">${svg('refresh')}<span>Сбросить подтверждение</span></button>` : ''}
-            ${testActivation && user.test_activation_error ? `<button class="button button-secondary" data-test-activation-retry="${user.id}">${svg('refresh')}<span>Повторить шифрование</span></button>` : ''}
             ${hasLimit && user.drive_link && !testActivation ? `<button class="button button-secondary" data-action="copy-link" data-link="${esc(user.drive_link)}" data-user-id="${user.id}">${svg('link')}<span>Drive без лимита</span></button>` : ''}
             ${user.slug !== 'legacy' && !testActivation ? `<button class="button button-secondary" data-devices="${user.id}">${svg('users')}<span>Лимит устройств</span></button>` : ''}
             <button class="button button-danger" data-delete="${user.id}" ${user.status === 'pending_delete' ? 'disabled' : ''}>${svg('trash')}<span>Удалить</span></button>
@@ -468,9 +466,9 @@
     root.onclick = event => handleUserAction(event, list);
     const hasPendingLimit = list.some(user => user.device_limit !== null && user.device_limit !== undefined
       && user.device_limit_status === 'waiting' && user.status === 'active' && user.enabled !== false);
-    const hasPendingActivationLink = testMode && list.some(user => user.test_activation_enabled
-      && !user.test_activation_link_ready && !user.test_activation_error && user.status === 'active' && user.enabled !== false);
-    if (!hasPendingLimit && !hasPendingActivationLink) {
+    const hasPendingActivationDrive = testMode && list.some(user => user.test_activation_enabled
+      && !user.drive_file_id && user.status === 'active' && user.enabled !== false);
+    if (!hasPendingLimit && !hasPendingActivationDrive) {
       clearTimeout(deviceStatusPollTimer);
       deviceStatusPollTimer = null;
       deviceStatusPollRounds = 0;
@@ -488,21 +486,21 @@
     const data = await api('/api/admin/test-activations');
     const activations = data.activations || [];
     root.innerHTML = pageHead('Активация · ТЕСТ', `<button type="button" id="refreshActivations" class="button button-secondary">${svg('refresh')}<span>Обновить статус</span></button>`)
-      + `<div class="setting-note activation-intro"><b>Ссылки-приглашения и браузерные регистрации</b><span>Лимит сайта и Happ Limited Link синхронизируются. Новая регистрация блокируется после заполнения слотов; тот же браузер распознаётся по cookie. Физические устройства Happ дополнительно считает по своему HWID.</span></div>`
+      + `<div class="setting-note activation-intro"><b>Уникальная ссылка на каждую подписку</b><span>Ссылку можно добавить в Happ: сначала появится тестовая заглушка с кнопкой подтверждения. После подтверждения Render выдаст отдельную зашифрованную ссылку этому браузерному слоту. Счётчик ведёт Render; ключи и счётчики Happ Provider API не используются.</span></div>`
       + (activations.length ? `<div class="card-list activation-list">${activations.map(item => {
         const count = Number(item.registered_count) || 0;
         const limit = Number(item.device_limit) || 1;
         const status = item.status !== 'active' || !item.enabled ? 'Отключена' : item.expires_at && new Date(item.expires_at).getTime() <= Date.now() ? 'Истекла' : 'Активна';
         const tone = status === 'Активна' ? 'badge-good' : 'badge-warn';
-        const devices = item.devices?.length ? `<div class="activation-device-list">${item.devices.map(device => `<div class="activation-device-row"><div><b>${esc(device.platform_label || 'Устройство')}</b><span>${esc(device.browser || 'Браузер не определён')}${device.language ? ` · ${esc(device.language)}` : ''}</span></div><small>Добавлено ${esc(date(device.registered_at))}<br>Последний вход ${esc(date(device.last_seen_at))}</small></div>`).join('')}</div>` : '<p class="field-hint">Пока нет зарегистрированных браузеров.</p>';
+        const devices = item.devices?.length ? `<div class="activation-device-list">${item.devices.map(device => `<div class="activation-device-row"><div><b>${esc(device.platform_label || 'Устройство')}</b><span>${esc(device.browser || 'Браузер не определён')}${device.language ? ` · ${esc(device.language)}` : ''} · ${device.import_link_ready ? 'ссылка Happ готова' : 'ссылка создастся при подтверждении'}</span></div><small>Добавлено ${esc(date(device.registered_at))}<br>Последний вход ${esc(date(device.last_seen_at))}</small></div>`).join('')}</div>` : '<p class="field-hint">Пока нет зарегистрированных браузеров.</p>';
         return `<article class="surface-card activation-card" data-activation-card="${item.id}">
           <div class="activation-card-head"><div><p class="eyebrow">${esc(item.activation_id)} · ТЕСТ</p><h2>${esc(item.name)}</h2></div><span class="badge ${tone}">${status}</span></div>
-          <div class="activation-meter"><strong>${count} <span>/ ${limit}</span></strong><small>браузерных регистраций · Happ проверяет лимит установки отдельно</small></div>
-          ${item.activation_error ? `<div class="alert-card">${esc(item.activation_error)}</div>` : !item.happ_link_ready ? '<div class="device-limit-current tone-warn">Зашифрованная ограниченная ссылка Happ ещё не подготовлена. До готовности кнопка импорта у клиента не появится.</div>' : ''}
-          <label class="activation-link-field">Уникальная ссылка для клиента<input data-activation-url readonly value="${esc(item.activation_url)}" autocapitalize="off" autocomplete="off" spellcheck="false"></label>
+          <div class="activation-meter"><strong>${count} <span>/ ${limit}</span></strong><small>слотов браузера · готовых зашифрованных ссылок: ${Number(item.render_links_ready) || 0}</small></div>
+          <label class="activation-link-field">Уникальная ссылка этой подписки · можно добавить в Happ<input data-activation-url readonly value="${esc(item.activation_url)}" autocapitalize="off" autocomplete="off" spellcheck="false"></label>
+          <p class="field-hint">В Happ сначала появится тестовая заглушка. Откройте в профиле кнопку «Подтвердить устройство», затем нажмите на сайте «Открыть и добавить в Happ».</p>
           <div class="activation-actions"><button type="button" class="button button-secondary" data-copy-activation>${svg('copy')}<span>Копировать ссылку</span></button><label>Лимит устройств<input data-activation-limit type="number" min="1" max="20" step="1" value="${limit}"></label><button type="button" class="button button-primary" data-save-activation-limit>${svg('edit')}<span>Сохранить лимит</span></button><button type="button" class="button button-danger" data-reset-activation>${svg('refresh')}<span>Сбросить регистрации</span></button></div>
           <section class="activation-devices"><div class="section-heading"><h3>Зарегистрированные браузеры</h3><span>${count} занято · лимит ${limit}</span></div>${devices}</section>
-          <p class="field-hint">Сброс выдаст новый адрес и создаст новый счётчик Happ. Старые счётчики Happ нельзя отключить из Secure X; ранее добавленные профили получат заглушку после обновления Drive.</p>
+          <p class="field-hint">Сброс создаёт новый адрес, удаляет регистрации и отзывает все старые Render-ссылки для этой тестовой подписки.</p>
         </article>`;
       }).join('')}</div>` : '<div class="empty-state"><div class="empty-orbit">Т</div><h2>Пока нет ссылок активации</h2><p>Включите «Браузерная активация · ТЕСТ» при создании или изменении тестовой подписки.</p><button type="button" class="button button-primary" data-go-users>Открыть подписки</button></div>');
     root.onclick = async event => {
@@ -526,13 +524,13 @@
           if (!Number.isInteger(limit) || limit < 1 || limit > 20) return toast('Лимит должен быть целым числом от 1 до 20');
           button.disabled = true;
           const result = await api(`/api/admin/users/${userId}/test-activation/limit`, {method:'PUT', body:{limit}});
-          toast(result.changed ? `Лимит ${result.limit} сохранён · Happ Link обновляется`
-            : `Лимит ${result.limit} без изменений · проверил готовность Happ Link`);
+          toast(result.changed ? `Лимит Render ${result.limit} сохранён`
+            : `Лимит Render ${result.limit} без изменений`);
           await testActivations(root);
           return;
         }
         if (button.dataset.resetActivation !== undefined) {
-          if (!confirm('Сбросить все браузерные регистрации и выдать новый адрес активации? Будет создан новый счётчик Happ. Старый счётчик в Happ нельзя отключить из панели.')) return;
+          if (!confirm('Сбросить регистрации, отозвать старые Render-ссылки и выдать новый адрес активации?')) return;
           button.disabled = true;
           const result = await api(`/api/admin/users/${userId}/test-activation/reset`, {method:'POST', body:{}});
           toast(resultText(result, 'Ссылка обновлена, регистрации очищены'));
@@ -565,7 +563,7 @@
       } else if (button.dataset.preview) {
         const result = await api(`/api/admin/users/${button.dataset.preview}/preview`);
         openModal('Предпросмотр профиля', `<pre class="preview">${esc(result)}</pre>`);
-      } else if (button.dataset.testActivationReset && confirm('Сбросить регистрации и выдать новый адрес? Drive-профиль станет заглушкой до новой активации, для Happ будет создан новый счётчик. Старый счётчик нельзя отозвать из панели.')) {
+      } else if (button.dataset.testActivationReset && confirm('Сбросить регистрации и выдать новый адрес? Drive-профиль станет заглушкой до новой активации. Все старые Render-ссылки этой тестовой подписки перестанут работать.')) {
         button.disabled = true;
         const result = await api(`/api/admin/users/${button.dataset.testActivationReset}/test-activation/reset`, { method: 'POST', body: {} });
         toast(resultText(result, 'Тестовое подтверждение сброшено'));
@@ -718,18 +716,18 @@
           <label class="switch-row access-switch"><input name="enabled" type="checkbox" ${user?.enabled === false ? '' : 'checked'}><span class="switch"></span><span><b>Подписка включена</b><small>При отключении ссылка покажет заглушку.</small></span></label></div>
         ${isLegacy ? '<div class="setting-note"><b>Счётчик трафика всегда виден</b><span>Это основная подписка; Happ показывает общий расход аккаунта провайдера.</span></div>' : `<label class="switch-row"><input name="hide_traffic_usage" type="checkbox" ${hideTraffic ? 'checked' : ''}><span class="switch"></span><span><b>Скрыть счётчик трафика</b><small>Управляет отображением общих данных провайдера в Happ.</small></span></label>`}
       </section>
-      <section class="form-section device-limit-form-section"><p class="eyebrow">04 / УСТРОЙСТВА</p><h3>Лимит устройств Happ</h3>
-        <label>Максимальное количество устройств<input name="device_limit" type="number" min="${Number(bounds.min)}" max="${Number(bounds.max)}" step="1" inputmode="numeric" value="${esc(deviceLimitValue)}" placeholder="Без лимита" ${(isLegacy || testMode && testActivationEnabled) ? 'disabled' : ''}><span class="field-hint">${testMode && testActivationEnabled ? 'Сейчас лимит синхронизирован с разделом «Активация · ТЕСТ».' : `Пустое поле — без лимита. Допустимо от ${Number(bounds.min)} до ${Number(bounds.max)}. Новая или изменённая ссылка создаётся через Happ после появления файла в Drive.`}</span></label>
+      <section class="form-section device-limit-form-section"><p class="eyebrow">04 / УСТРОЙСТВА</p><h3>${testMode && testActivationEnabled ? 'Лимит устройств Render' : 'Лимит устройств Happ'}</h3>
+        <label>Максимальное количество устройств<input name="device_limit" type="number" min="${Number(bounds.min)}" max="${Number(bounds.max)}" step="1" inputmode="numeric" value="${esc(deviceLimitValue)}" placeholder="Без лимита" ${(isLegacy || testMode && testActivationEnabled) ? 'disabled' : ''}><span class="field-hint">${testMode && testActivationEnabled ? 'Лимит задаётся ниже и применяется на Render. Happ Provider API и его ключи для этой тестовой подписки не используются.' : `Пустое поле — без лимита. Допустимо от ${Number(bounds.min)} до ${Number(bounds.max)}. Новая или изменённая ссылка создаётся через Happ после появления файла в Drive.`}</span></label>
         ${isLegacy ? '<p class="setting-note"><b>Для основной (legacy) подписки лимит отключён</b><span>Её Drive-ссылка и профиль не изменяются этой функцией.</span></p>' : `<p class="device-limit-current ${deviceStatus === 'error' ? 'tone-warn' : ''}" role="status">${esc(deviceStatusText)}</p>`}
       </section>
       ${testMode && !isLegacy ? `<section class="form-section device-limit-form-section"><p class="eyebrow">05 / GEO-ТЕСТ</p><h3>Лимит устройств через Geo-файлы · ТЕСТ</h3>
         <label>Лимит запросов каждого geo-файла<input name="geo_device_limit" type="number" min="1" max="20" step="1" inputmode="numeric" value="${esc(geoDeviceLimitValue)}" placeholder="Не использовать geo-активацию"><span class="field-hint">Пустое поле отключает geo-активацию. При заданном лимите сначала будет один рабочий сервер. После успешной загрузки обоих файлов Drive сразу обновится и добавит остальные серверы. Считаются запросы geo-файлов, не уникальные HWID.</span></label>
       </section>` : ''}
       ${testMode && !isLegacy ? `<section class="form-section test-activation-section"><p class="eyebrow">06 / АКТИВАЦИЯ · ТЕСТ</p><h3>Ссылка активации и устройства</h3>
-        <label class="switch-row"><input name="test_activation_enabled" type="checkbox" ${testActivationEnabled ? 'checked' : ''}><span class="switch"></span><span><b>Выдавать клиенту ссылку активации · ТЕСТ</b><small>Сначала открывается сайт, затем клиент выбирает платформу, подтверждает браузер и нажимает «Открыть в Happ». До первой регистрации профиль содержит только заглушку.</small></span></label>
-        <label>Максимум браузерных регистраций<input name="test_activation_limit" type="number" min="1" max="20" step="1" inputmode="numeric" value="${esc(activationLimitValue)}"><span class="field-hint">От 1 до 20. Это значение синхронизируется с настоящим Happ Limited Link. Кнопка импорта не появится, пока Happ-ссылка и Drive-профиль не подготовлены.</span></label>
-        <div class="setting-note"><b>Что запоминается</b><span>Случайный cookie, выбранная платформа, язык, семейство и версия браузера. Cookie узнаёт браузер, а не физическое устройство; Happ отдельно применяет install limit по HWID. Очистка cookie/другой браузер может занять ещё один сайт-слот. IP и скрытый fingerprint не собираются.</span></div>
-        ${testActivationEnabled ? `<p class="device-limit-current" role="status">ID ${esc(user?.test_activation_id || 'создаётся')} · занято браузеров ${Number(user?.test_activation_devices_count) || 0}/${esc(user?.test_activation_limit || activationLimitValue)} · ${user?.test_activation_at ? 'профиль активирован' : 'ожидается регистрация'} · ${user?.test_activation_link_ready ? 'Happ Link готов' : 'Happ Link готовится'}${user?.test_activation_error ? ` · ${esc(user.test_activation_error)}` : ''}</p>` : ''}
+        <label class="switch-row"><input name="test_activation_enabled" type="checkbox" ${testActivationEnabled ? 'checked' : ''}><span class="switch"></span><span><b>Лимитировать доступ через Render · ТЕСТ</b><small>Каждая подписка получает собственный URL. Его можно добавить в Happ: сначала будет заглушка, кнопка информации откроет страницу подтверждения, после чего сайт предложит импортировать персональную ссылку.</small></span></label>
+        <label>Лимит регистраций<input name="test_activation_limit" type="number" min="1" max="20" step="1" inputmode="numeric" value="${esc(activationLimitValue)}"><span class="field-hint">От 1 до 20 браузерных регистраций. Render выдаёт каждому подтверждённому слоту отдельный зашифрованный адрес подписки. Ключи и счётчик Happ Provider API не нужны.</span></label>
+        <div class="setting-note"><b>Как распознаётся слот</b><span>Случайный cookie этого браузера и выбранная платформа. Если очистить cookie или открыть ссылку в другом браузере, это будет новый слот. Это не аппаратный отпечаток и не гарантирует распознавание физического устройства. IP и скрытый fingerprint не собираются.</span></div>
+        ${testActivationEnabled ? `<p class="device-limit-current" role="status">ID ${esc(user?.test_activation_id || 'создаётся')} · занято слотов ${Number(user?.test_activation_devices_count) || 0}/${esc(user?.test_activation_limit || activationLimitValue)} · ${Number(user?.test_activation_links_count) || 0} зашифрованных Render-ссылок готово</p>` : ''}
       </section>` : ''}
       <section class="form-section"><p class="eyebrow">${testMode && !isLegacy ? '07' : '05'} / ВИД ПРОФИЛЯ</p><h3>Заголовок и сообщение</h3>
         <label>Заголовок профиля<input name="title_override" maxlength="200" value="${esc(user?.title_override || '')}" placeholder="Использовать название по умолчанию"></label>
@@ -769,7 +767,7 @@
         toast('Лимит активации должен быть целым числом от 1 до 20');
         return;
       }
-      const effectiveDeviceLimit = testActivationEnabled ? requestedActivationLimit : requestedDeviceLimit;
+      const effectiveDeviceLimit = testActivationEnabled ? null : requestedDeviceLimit;
       const rawGeoLimit = String(values.get('geo_device_limit') || '').trim();
       const requestedGeoDeviceLimit = rawGeoLimit === '' ? null : Number(rawGeoLimit);
       if (testMode && requestedGeoDeviceLimit !== null && (!Number.isInteger(requestedGeoDeviceLimit)
@@ -778,7 +776,7 @@
         return;
       }
       const previousDeviceLimit = user?.device_limit ?? null;
-      if (user && effectiveDeviceLimit !== previousDeviceLimit) {
+      if (user && !testActivationEnabled && effectiveDeviceLimit !== previousDeviceLimit) {
         const message = effectiveDeviceLimit === null
           ? 'Убрать лимит в панели? Счётчик останется активным в Happ, поэтому ранее выданные ссылки продолжат работать.'
           : previousDeviceLimit !== null
@@ -787,7 +785,7 @@
         if (!confirm(message)) return;
       }
       if (testMode && user?.test_activation_enabled && !values.has('test_activation_enabled')
-        && !confirm('Выключить браузерное подтверждение? После синхронизации этот тестовый Drive-файл станет полной подпиской.')) return;
+        && !confirm('Выключить проверку слотов Render? После синхронизации тестовый Drive-файл станет полной подпиской без этого ограничения.')) return;
       form.dataset.busy = '1'; submit.disabled = true;
       submit.innerHTML = `<span class="spinner"></span><span>${user ? 'Сохраняю изменения…' : 'Создаю профиль…'}</span>`;
       const expiryValue = values.get('expires_at');
