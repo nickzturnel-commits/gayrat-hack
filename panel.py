@@ -3844,7 +3844,7 @@ async def _activation_get_current(activation_id: str, token: str, request: Reque
         page = _test_activation_page("Подписка недоступна", "Эта подписка отключена или срок её действия закончился.",
                                      activation_id, token, tone="error", test_mode=test_mode)
     elif not row["drive_file_id"]:
-        page = _test_activation_page("Профиль готовится", "Файл подписки ещё не создан в Google Drive. Откройте эту ссылку позже.",
+        page = _test_activation_page("Профиль готовится", "Файл подписки ещё не создан. Откройте эту ссылку позже.",
                                      activation_id, token, tone="error", test_mode=test_mode)
     elif full:
         page = _test_activation_page("Лимит устройств достигнут",
