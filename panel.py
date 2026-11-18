@@ -1420,6 +1420,24 @@ async def _sync_servers(conn, body: bytes, *, primary_body: bytes | None = None,
     return parsed
 
 
+async def _reset_server_order(conn, servers: list[dict]) -> None:
+    """Restore each provider's incoming order without changing server settings."""
+    groups = {
+        "primary": list(dict.fromkeys(str(server["id"]) for server in servers
+                                       if server.get("source") != "sas")),
+        "sas": list(dict.fromkeys(str(server["id"]) for server in servers
+                                  if server.get("source") == "sas")),
+    }
+    async with conn.transaction():
+        for ids in groups.values():
+            if not ids:
+                continue
+            await conn.execute("""UPDATE servers AS server
+                SET sort_order=ordered.ordinality::INTEGER-1
+                FROM unnest($1::text[]) WITH ORDINALITY AS ordered(id, ordinality)
+                WHERE server.id=ordered.id AND server.present_upstream=TRUE""", ids)
+
+
 def _test_geo_signature(user_id: int) -> str:
     secret = os.getenv("SESSION_SECRET", "")
     if len(secret) < 32:
@@ -2065,6 +2083,37 @@ async def servers_list(request: Request):
     return {"servers": [_serialize(r) for r in rows]}
 
 
+async def _refresh_server_catalog() -> tuple[list[dict], dict[str, int]]:
+    fields = state._FEED_CACHE_FIELDS
+    environment = "test" if _test_environment.get() else "main"
+    cache = state._feed_caches[environment]
+    previous = {key: cache[key] for key in fields}
+    try:
+        body, _, stale = await state.fetch_upstream(force=True, force_sas=True)
+        if stale:
+            raise HTTPException(502, "Не удалось обновить один из источников. Сохранён последний рабочий кэш; каталог и подписки не изменены.")
+        pool = await state.db()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                servers = await _sync_servers(
+                    conn, body, primary_body=state.upstream_body, sas_body=state.sas_body)
+                await _reset_server_order(conn, servers)
+    except Exception:
+        warnings = {key: cache[key] for key in (
+            "upstream_attempt_at", "upstream_warning", "sas_attempt_at", "sas_warning")}
+        cache.update(previous)
+        cache.update(warnings)
+        raise
+
+    source_counts = {
+        "secure_x": sum(server.get("source") != "sas" for server in servers),
+        "sas": sum(server.get("source") == "sas" for server in servers),
+    }
+    log.info("Admin server catalog refreshed (environment=%s; Secure X=%d; SAS=%d)",
+             environment, source_counts["secure_x"], source_counts["sas"])
+    return servers, source_counts
+
+
 @router.put("/api/admin/servers/{server_id}")
 async def servers_update(server_id: str, data: ServerBody, request: Request):
     _auth(request, csrf=True)
@@ -2110,32 +2159,17 @@ async def servers_bulk(data: BulkServerBody, request: Request):
 @router.post("/api/admin/servers/refresh")
 async def servers_refresh(request: Request):
     _auth(request, csrf=True)
-    body, _, _ = await state.fetch_upstream(force=True)
-    pool = await state.db()
-    async with pool.acquire() as conn:
-        servers = await _sync_servers(conn, body, primary_body=state.upstream_body, sas_body=state.sas_body)
-    return {"count": len(servers), "drive_sync": await state.push_drive_sync()}
+    servers, source_counts = await _refresh_server_catalog()
+    return {"count": len(servers), "source_counts": source_counts, "order_reset": True,
+            "drive_sync": await state.push_drive_sync()}
 
 
 @router.post("/api/admin/cache/refresh")
 async def admin_cache_refresh(request: Request):
     _auth(request, csrf=True)
-    fields = state._FEED_CACHE_FIELDS
-    cache = state._feed_caches["test" if _test_environment.get() else "main"]
-    previous = {key: cache[key] for key in fields}
-    try:
-        body, _, stale = await state.fetch_upstream(force=True, force_sas=True)
-        if stale:
-            raise HTTPException(502, "Не удалось обновить один из источников. Сохранён последний рабочий кэш; подписки не изменены.")
-        pool = await state.db()
-        async with pool.acquire() as conn:
-            servers = await _sync_servers(conn, body, primary_body=state.upstream_body, sas_body=state.sas_body)
-    except Exception:
-        warnings = {key: cache[key] for key in ("upstream_attempt_at", "upstream_warning", "sas_attempt_at", "sas_warning")}
-        cache.update(previous)
-        cache.update(warnings)
-        raise
-    return {"ok": True, "count": len(servers), "drive_sync": await state.push_drive_sync()}
+    servers, source_counts = await _refresh_server_catalog()
+    return {"ok": True, "count": len(servers), "source_counts": source_counts, "order_reset": True,
+            "drive_sync": await state.push_drive_sync()}
 
 
 @router.put("/api/admin/users/{user_id}/servers/{server_id}")
