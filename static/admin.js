@@ -796,7 +796,8 @@
     const sasCount = list.filter(server => server.source === 'sas').length;
     const primaryCount = list.length - sasCount;
     const hiddenCount = list.filter(server => server.hidden).length;
-    root.innerHTML = pageHead(testMode ? 'Серверы · ТЕСТ' : 'Серверы', `${testMode ? '<button id="refreshTestCache" class="button button-secondary">🧹 Обновить кэш ТЕСТ</button>' : ''}<button id="refreshServers" class="button button-secondary">${svg('refresh')}<span>Обновить источники</span></button>`)
+    const serverActions = `<div class="page-actions server-page-actions">${testMode ? `<button id="refreshTestCache" class="button button-secondary">${svg('refresh')}<span>Обновить кэш · ТЕСТ</span></button>` : ''}<button id="refreshServers" class="button button-secondary">${svg('refresh')}<span>Обновить источники</span></button></div>`;
+    root.innerHTML = pageHead(testMode ? 'Серверы · ТЕСТ' : 'Серверы', serverActions)
       + (list.length ? `<section class="server-overview surface-card"><div><p class="eyebrow">КАТАЛОГ СЕРВЕРОВ</p><strong>${list.length} <small>в профиле источников</small></strong><span>Названия сохраняются отдельно для Secure X и SAS.</span></div><div class="source-counts"><span class="source-count primary-count"><i></i> Secure X <b>${primaryCount}</b></span><span class="source-count sas-count"><i></i> SAS <b>${sasCount}</b></span><span class="source-count hidden-count"><i></i> Скрыты <b data-hidden-count>${hiddenCount}</b></span></div></section>
         <section class="server-toolbar surface-card">
           <label class="search-box"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/></svg><input id="serverSearch" type="search" autocomplete="off" placeholder="Поиск по имени сервера"></label>
@@ -807,8 +808,8 @@
             <button type="button" class="filter-chip" data-server-filter="visible" aria-pressed="false">Показываются <span data-visible-server-count>${list.length - hiddenCount}</span></button>
             <button type="button" class="filter-chip" data-server-filter="hidden" aria-pressed="false">Скрыты <span data-hidden-server-count>${hiddenCount}</span></button>
           </div>
-          <div class="bulk-server-bar"><label class="select-visible"><input id="selectVisibleServers" type="checkbox"><span class="check-ui"></span><b>Выбрать видимые</b></label><span id="selectedServerCount" class="selected-count">Выбрано: 0</span><div class="bulk-actions"><button type="button" class="button button-quiet" data-server-bulk="false" disabled>Показать</button><button type="button" class="button button-quiet" data-server-bulk="true" disabled>Скрыть</button></div>${testMode ? '<button type="button" id="saveServerBatch" class="button button-primary" disabled>Готово · сохранить 0 изменений</button>' : ''}</div>
-          ${testMode ? '<div class="bulk-server-bar"><label>Добавить к имени<input id="massNamePrefix" placeholder="Префикс"></label><label>Добавить в конец<input id="massNameSuffix" placeholder="Суффикс"></label><label>Найти<input id="massNameFind" placeholder="Текст"></label><label>Заменить на<input id="massNameReplace" placeholder="Новый текст"></label><button type="button" class="button button-quiet" id="massRename" disabled>Переименовать выбранные</button></div><small>🧪 ТЕСТ · изменения применятся только после нажатия «Готово»</small>' : ''}
+          <div class="bulk-server-bar bulk-selection-bar"><label class="select-visible"><input id="selectVisibleServers" type="checkbox"><span class="check-ui"></span><b>Выбрать видимые</b></label><span id="selectedServerCount" class="selected-count">Выбрано: 0</span><div class="bulk-actions"><button type="button" class="button button-quiet" data-server-bulk="false" disabled>Показать</button><button type="button" class="button button-quiet" data-server-bulk="true" disabled>Скрыть</button></div>${testMode ? '<button type="button" id="saveServerBatch" class="button button-primary" disabled>Готово · сохранить 0 изменений</button>' : ''}</div>
+          ${testMode ? '<div class="bulk-server-bar bulk-rename-bar"><label>Добавить к имени<input id="massNamePrefix" placeholder="Префикс"></label><label>Добавить в конец<input id="massNameSuffix" placeholder="Суффикс"></label><label>Найти<input id="massNameFind" placeholder="Текст"></label><label>Заменить на<input id="massNameReplace" placeholder="Новый текст"></label><button type="button" class="button button-quiet" id="massRename" disabled>Переименовать выбранные</button></div><small>ТЕСТ · изменения применятся только после нажатия «Готово»</small>' : ''}
         </section>
         <div class="result-caption"><span id="serverResultCount">${list.length} серверов</span><span>Массовые действия применяются к выбранным серверам</span></div>
         <div class="card-list" id="serverList">${list.map(server => `<article class="surface-card server-card" data-server-card data-server-source="${server.source === 'sas' ? 'sas' : 'primary'}" data-server-hidden="${server.hidden ? 'yes' : 'no'}" data-server-name="${esc(`${server.custom_name || ''} ${server.original_name || ''} ${server.id}`.toLocaleLowerCase('ru-RU'))}">
@@ -831,12 +832,12 @@
     if (testMode) $('#refreshTestCache').addEventListener('click', async event => {
       const button = event.currentTarget;
       button.disabled = true;
-      button.textContent = 'Обновляю источники…';
+      button.innerHTML = '<span class="spinner"></span><span>Обновляю кэш…</span>';
       try {
         const refreshed = await api('/api/admin/cache/refresh', { method: 'POST', body: {} });
         toast(resultText(refreshed, `Тестовый кэш обновлён · серверов: ${refreshed.count}`));
         await render();
-      } catch (failure) { button.disabled = false; button.textContent = '🧹 Обновить кэш ТЕСТ'; toast(failure.message); }
+      } catch (failure) { button.disabled = false; button.innerHTML = `${svg('refresh')}<span>Обновить кэш · ТЕСТ</span>`; toast(failure.message); }
     });
     if (!list.length) return;
     const cards = $$('[data-server-card]', $('#serverList'));
