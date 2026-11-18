@@ -305,11 +305,12 @@
     return '<div class="qr-only"><div class="drive-qr-frame qr-loading" aria-label="Загрузка QR-кода"><span class="spinner" aria-hidden="true"></span></div></div>';
   }
 
-  async function showDriveQr(userId, limited = false) {
+  async function showDriveQr(userId, limited = false, activation = false) {
     openModal('QR-код подписки', driveQrLoadingContent());
     const body = $('#modalBody');
     try {
-      const response = await fetch(panelUrl(`/api/admin/users/${encodeURIComponent(userId)}/${limited ? 'limited-qr.svg' : 'drive-qr.svg'}`), {
+      const route = activation ? 'test-activation-qr.svg' : limited ? 'limited-qr.svg' : 'drive-qr.svg';
+      const response = await fetch(panelUrl(`/api/admin/users/${encodeURIComponent(userId)}/${route}`), {
         method: 'GET', cache: 'no-store', credentials: 'same-origin',
         headers: { Accept: 'image/svg+xml' },
       });
@@ -382,34 +383,41 @@
         const [status, tone] = userStatus(user);
         const state = status === 'Включена' ? 'active' : 'inactive';
         const hasLimit = user.device_limit !== null && user.device_limit !== undefined;
+        const testActivation = testMode && user.test_activation_enabled === true;
+        const activationLink = testActivation && !hasLimit ? (user.test_activation_link || '') : '';
         const limitStatus = hasLimit ? (user.device_limit_status || (user.limited_link ? 'ready' : 'waiting')) : 'none';
         const limitStatusLabel = ({ready: 'Ссылка с лимитом готова', waiting: 'Ссылка ожидает создания', error: 'Ошибка Happ'})[limitStatus] || 'Без лимита';
         const limitStatusTone = limitStatus === 'ready' ? 'badge-good' : limitStatus === 'error' ? 'badge-warn' : 'badge-muted';
         // When a limit is configured, never present the unlimited Drive URL as
         // the primary share action while Happ is still building its link.
-        const mainLink = hasLimit ? (user.limited_link || '') : (user.drive_link || '');
+        const mainLink = hasLimit ? (user.limited_link || '') : (testActivation ? activationLink : (user.drive_link || ''));
         const mainLinkLabel = hasLimit
           ? (user.limited_link ? 'Копировать Happ' : 'Happ-ссылка готовится')
-          : 'Копировать Drive';
+          : testActivation ? (activationLink ? 'Копировать Happ · ТЕСТ' : 'Happ-ссылка готовится') : 'Копировать Drive';
         const mainLinkTitle = hasLimit
           ? (user.limited_link
             ? `Скопировать зашифрованную подписку Happ с лимитом ${user.device_limit} устройств`
             : 'Зашифрованная ссылка Happ ещё создаётся')
-          : 'Скопировать обычную ссылку Google Drive без лимита устройств';
+          : testActivation ? 'Зашифрованная тестовая Happ-ссылка открывает заглушку до браузерного подтверждения'
+            : 'Скопировать обычную ссылку Google Drive без лимита устройств';
         const mainQrLabel = hasLimit
           ? (user.limited_link ? 'QR с лимитом' : 'QR появится с Happ-ссылкой')
-          : 'QR-код Drive';
+          : testActivation ? (activationLink ? 'QR Happ · ТЕСТ' : 'QR появится после шифрования') : 'QR-код Drive';
         return `<article class="surface-card user-card" data-user-card data-user-name="${esc(`${user.name || ''} ${user.note || ''}`.toLowerCase())}" data-user-state="${state}" data-user-sas="${user.include_sas === false ? 'off' : 'on'}" data-user-limit="${hasLimit ? 'limited' : 'unlimited'}">
-          <div class="user-card-head"><div class="avatar-mark">${esc((user.name || '?').trim().slice(0, 1).toUpperCase())}</div><div class="user-main"><h2>${esc(user.name)}</h2><p>${esc(user.note || 'Без заметки')}</p></div><span class="badge ${tone}">${status}</span><span class="badge ${user.drive_file_id ? 'badge-good' : 'badge-muted'}">${user.drive_file_id ? 'Drive готов' : 'Ожидает Drive'}</span><span class="badge ${user.include_sas === false ? 'badge-muted' : 'source-sas'}">${user.include_sas === false ? 'Только Secure X' : 'Secure X + SAS'}</span>${user.hide_traffic_usage && user.slug !== 'legacy' ? '<span class="badge badge-muted">Счётчик скрыт</span>' : ''}${hasLimit ? `<span class="badge ${limitStatusTone}">Устройств: ${esc(user.device_limit)} · ${limitStatusLabel}</span>` : '<span class="badge badge-muted">Без лимита устройств</span>'}${testMode ? `<span class="badge ${user.geo_device_limit ? (user.geo_activated_at ? 'badge-good' : 'badge-muted') : 'badge-muted'}">Geo ТЕСТ · ${user.geo_device_limit ? `${user.geo_activated_at ? 'активировано' : 'ожидает'} · лимит ${esc(user.geo_device_limit)}` : 'выключено'} · IP ${Number(user.geoip_requests) || 0}/${esc(user.geo_device_limit || '—')} · Sites ${Number(user.geosite_requests) || 0}/${esc(user.geo_device_limit || '—')}</span>` : ''}</div>
+          <div class="user-card-head"><div class="avatar-mark">${esc((user.name || '?').trim().slice(0, 1).toUpperCase())}</div><div class="user-main"><h2>${esc(user.name)}</h2><p>${esc(user.note || 'Без заметки')}</p></div><span class="badge ${tone}">${status}</span><span class="badge ${user.drive_file_id ? 'badge-good' : 'badge-muted'}">${user.drive_file_id ? 'Drive готов' : 'Ожидает Drive'}</span><span class="badge ${user.include_sas === false ? 'badge-muted' : 'source-sas'}">${user.include_sas === false ? 'Только Secure X' : 'Secure X + SAS'}</span>${user.hide_traffic_usage && user.slug !== 'legacy' ? '<span class="badge badge-muted">Счётчик скрыт</span>' : ''}${hasLimit ? `<span class="badge ${limitStatusTone}">Устройств: ${esc(user.device_limit)} · ${limitStatusLabel}</span>` : '<span class="badge badge-muted">Без лимита устройств</span>'}${testMode ? `${user.test_activation_enabled ? `<span class="badge ${user.test_activation_at ? 'badge-good' : 'badge-warn'}">Активация ТЕСТ · ${user.test_activation_at ? 'подтверждена' : 'ожидает'} · ID ${esc(user.test_activation_id || '—')}</span>` : ''}<span class="badge ${user.geo_device_limit ? (user.geo_activated_at ? 'badge-good' : 'badge-muted') : 'badge-muted'}">Geo ТЕСТ · ${user.geo_device_limit ? `${user.geo_activated_at ? 'активировано' : 'ожидает'} · лимит ${esc(user.geo_device_limit)}` : 'выключено'} · IP ${Number(user.geoip_requests) || 0}/${esc(user.geo_device_limit || '—')} · Sites ${Number(user.geosite_requests) || 0}/${esc(user.geo_device_limit || '—')}</span>` : ''}</div>
           ${hasLimit && user.device_limit_error ? `<p class="tone-warn device-limit-error" role="status">${esc(user.device_limit_error)}</p>` : ''}
+          ${testActivation && user.test_activation_error ? `<p class="tone-warn device-limit-error" role="status">Не удалось подготовить зашифрованную Happ-ссылку · ТЕСТ: ${esc(user.test_activation_error)}</p>` : ''}
           <div class="user-meta"><span>Срок действия</span><strong>${esc(date(user.expires_at))}</strong></div>
           <div class="user-actions">
             <button class="button button-secondary" data-edit="${user.id}">${svg('edit')}<span>Изменить</span></button>
             <button class="button button-secondary" data-servers="${user.id}">${svg('servers')}<span>Серверы</span></button>
             <button class="button button-secondary" data-preview="${user.id}">${svg('eye')}<span>Предпросмотр</span></button>
             <button class="button button-secondary" aria-label="${esc(mainLinkTitle)}" title="${esc(mainLinkTitle)}" data-action="copy-link" data-link="${esc(mainLink)}" data-user-id="${user.id}" ${mainLink ? '' : 'disabled'}>${svg('link')}<span>${mainLinkLabel}</span></button>
-            <button class="button button-secondary user-qr-action" data-action="qr" data-limited="${user.limited_link ? 'yes' : 'no'}" data-user-id="${user.id}" ${mainLink ? '' : 'disabled'}>${svg('qr')}<span>${mainQrLabel}</span></button>
-            ${hasLimit && user.drive_link ? `<button class="button button-secondary" data-action="copy-link" data-link="${esc(user.drive_link)}" data-user-id="${user.id}">${svg('link')}<span>Drive без лимита</span></button>` : ''}
+            <button class="button button-secondary user-qr-action" data-action="qr" data-limited="${user.limited_link ? 'yes' : 'no'}" data-activation-qr="${testActivation && !hasLimit ? 'yes' : 'no'}" data-user-id="${user.id}" ${mainLink ? '' : 'disabled'}>${svg('qr')}<span>${mainQrLabel}</span></button>
+            ${testActivation && user.test_activation_url ? `<button class="button button-secondary" data-action="copy-link" data-link="${esc(user.test_activation_url)}" data-user-id="${user.id}">${svg('link')}<span>Ссылка подтверждения · ТЕСТ</span></button>` : ''}
+            ${testActivation ? `<button class="button button-secondary" data-test-activation-reset="${user.id}">${svg('refresh')}<span>Сбросить подтверждение</span></button>` : ''}
+            ${testActivation && user.test_activation_error ? `<button class="button button-secondary" data-test-activation-retry="${user.id}">${svg('refresh')}<span>Повторить шифрование</span></button>` : ''}
+            ${hasLimit && user.drive_link && !testActivation ? `<button class="button button-secondary" data-action="copy-link" data-link="${esc(user.drive_link)}" data-user-id="${user.id}">${svg('link')}<span>Drive без лимита</span></button>` : ''}
             ${user.slug !== 'legacy' ? `<button class="button button-secondary" data-devices="${user.id}">${svg('users')}<span>Лимит устройств</span></button>` : ''}
             <button class="button button-danger" data-delete="${user.id}" ${user.status === 'pending_delete' ? 'disabled' : ''}>${svg('trash')}<span>Удалить</span></button>
           </div>
@@ -453,7 +461,9 @@
     root.onclick = event => handleUserAction(event, list);
     const hasPendingLimit = list.some(user => user.device_limit !== null && user.device_limit !== undefined
       && user.device_limit_status === 'waiting' && user.status === 'active' && user.enabled !== false);
-    if (!hasPendingLimit) {
+    const hasPendingActivationLink = testMode && list.some(user => user.test_activation_enabled
+      && !user.test_activation_link && !user.test_activation_error && user.status === 'active' && user.enabled !== false);
+    if (!hasPendingLimit && !hasPendingActivationLink) {
       clearTimeout(deviceStatusPollTimer);
       deviceStatusPollTimer = null;
       deviceStatusPollRounds = 0;
@@ -472,7 +482,7 @@
     const shareAction = window.PanelAdminActions.resolveUserAction(button);
     try {
       if (shareAction?.kind === 'qr') {
-        await showDriveQr(shareAction.userId, button.dataset.limited === 'yes');
+        await showDriveQr(shareAction.userId, button.dataset.limited === 'yes', button.dataset.activationQr === 'yes');
       } else if (shareAction?.kind === 'copy-link') {
         const copied = copyText(shareAction.link);
         Promise.resolve(copied).then(ok => {
@@ -489,6 +499,16 @@
       } else if (button.dataset.preview) {
         const result = await api(`/api/admin/users/${button.dataset.preview}/preview`);
         openModal('Предпросмотр профиля', `<pre class="preview">${esc(result)}</pre>`);
+      } else if (button.dataset.testActivationReset && confirm('Сбросить браузерное подтверждение? Текущий тестовый Drive-файл снова станет заглушкой до следующего подтверждения.')) {
+        button.disabled = true;
+        const result = await api(`/api/admin/users/${button.dataset.testActivationReset}/test-activation/reset`, { method: 'POST', body: {} });
+        toast(resultText(result, 'Тестовое подтверждение сброшено'));
+        await render();
+      } else if (button.dataset.testActivationRetry) {
+        button.disabled = true;
+        const result = await api(`/api/admin/users/${button.dataset.testActivationRetry}/test-activation/retry`, { method: 'POST', body: {} });
+        toast(result.message || 'Повторное шифрование запущено');
+        setTimeout(() => { if (page === 'users') render(); }, 900);
       } else if (button.dataset.delete && confirm('Отключить подписку и убрать пользователя из панели? Ссылка Drive останется, но при обновлении покажет один нерабочий сервер. Уже загруженные в клиент серверы могут работать до обновления подписки.')) {
         button.disabled = true;
         const result = await api(`/api/admin/users/${button.dataset.delete}`, { method: 'DELETE', body: {} });
@@ -523,7 +543,7 @@
         <span>${esc(statusText)}</span>
       </div>
       ${user.limited_link ? `<label class="device-limited-link-label">Основная ссылка с лимитом<input data-dl-url readonly value="${esc(user.limited_link)}" autocapitalize="off" autocomplete="off" spellcheck="false" aria-label="Зашифрованная ссылка Happ"></label>` : ''}
-      ${user.limited_link && user.drive_link ? `<p class="field-hint">Обычная ссылка Drive без ограничений доступна отдельно в карточке подписки.</p>` : ''}
+      ${user.limited_link && user.drive_link && !(testMode && user.test_activation_enabled) ? `<p class="field-hint">Обычная ссылка Drive без ограничений доступна отдельно в карточке подписки.</p>` : ''}
       <div class="drive-share-actions">
         ${hasLimit && user.slug !== 'legacy' ? `<button class="button button-secondary" type="button" data-dl-edit>${svg('edit')}<span>Изменить лимит</span></button>` : ''}
         ${hasLimit && status !== 'ready' ? `<button class="button button-primary" type="button" data-dl-retry ${!user.drive_file_id || !user.enabled || user.status !== 'active' ? 'disabled' : ''}>${svg('refresh')}<span>Повторить создание ссылки</span></button>` : ''}
@@ -608,6 +628,7 @@
     const includeSas = user ? user.include_sas !== false : defaultIncludeSas;
     const deviceLimitValue = user ? (user.device_limit ?? '') : (formSettings.settings?.device_limit_for_new_users ?? '');
     const geoDeviceLimitValue = user?.geo_device_limit ?? '';
+    const testActivationEnabled = user?.test_activation_enabled === true;
     const deviceStatus = user?.device_limit_status || (user?.limited_link ? 'ready' : user?.device_limit ? 'waiting' : 'none');
     const deviceStatusText = ({ready: 'Ссылка Happ готова.', waiting: 'Ссылка создастся автоматически после появления файла в Google Drive.', error: `Ошибка Happ: ${user?.device_limit_error || 'повторите создание ссылки в настройках лимита.'}`})[deviceStatus]
       || 'Без лимита. Ссылка Drive остаётся обычной.';
@@ -637,7 +658,12 @@
       ${testMode && !isLegacy ? `<section class="form-section device-limit-form-section"><p class="eyebrow">05 / GEO-ТЕСТ</p><h3>Лимит устройств через Geo-файлы · ТЕСТ</h3>
         <label>Лимит запросов каждого geo-файла<input name="geo_device_limit" type="number" min="1" max="20" step="1" inputmode="numeric" value="${esc(geoDeviceLimitValue)}" placeholder="Не использовать geo-активацию"><span class="field-hint">Пустое поле отключает geo-активацию. При заданном лимите сначала будет один рабочий сервер. После успешной загрузки обоих файлов Drive сразу обновится и добавит остальные серверы. Считаются запросы geo-файлов, не уникальные HWID.</span></label>
       </section>` : ''}
-      <section class="form-section"><p class="eyebrow">${testMode && !isLegacy ? '06' : '05'} / ВИД ПРОФИЛЯ</p><h3>Заголовок и сообщение</h3>
+      ${testMode && !isLegacy ? `<section class="form-section test-activation-section"><p class="eyebrow">06 / ПОДТВЕРЖДЕНИЕ · ТЕСТ</p><h3>Заглушка до подключения браузера</h3>
+        <label class="switch-row"><input name="test_activation_enabled" type="checkbox" ${testActivationEnabled ? 'checked' : ''}><span class="switch"></span><span><b>Включить браузерное подтверждение · ТЕСТ</b><small>У подписки будут свой ID и персональная ссылка. До подтверждения Happ получит один нерабочий сервер; затем тот же файл Drive обновится. Если включён Geo-лимит, после этого нужно скачать оба geo-файла.</small></span></label>
+        <div class="setting-note"><b>Ограничение этого теста</b><span>Cookie различает браузер, но не является HWID Happ. После активации общий Drive-профиль сможет открыть любой, у кого есть ссылка. Для строгого лимита устройств нужен счётчик Happ.</span></div>
+        ${testActivationEnabled ? `<p class="device-limit-current" role="status">ID ${esc(user?.test_activation_id || 'создаётся')} · ${user?.test_activation_at ? 'браузер подтверждён' : 'ожидается подтверждение'} · ${user?.test_activation_link ? 'Happ-ссылка готова' : 'Happ-ссылка создаётся'}${user?.test_activation_error ? ` · ${esc(user.test_activation_error)}` : ''}</p>` : ''}
+      </section>` : ''}
+      <section class="form-section"><p class="eyebrow">${testMode && !isLegacy ? '07' : '05'} / ВИД ПРОФИЛЯ</p><h3>Заголовок и сообщение</h3>
         <label>Заголовок профиля<input name="title_override" maxlength="200" value="${esc(user?.title_override || '')}" placeholder="Использовать название по умолчанию"></label>
         <label>Объявление<textarea name="announce_override" maxlength="4000" rows="3" placeholder="Оставьте пустым для общего объявления">${esc(user?.announce_override || '')}</textarea></label>
       </section>
@@ -678,6 +704,8 @@
             : `Создать новый счётчик Happ на ${requestedDeviceLimit} устройств?`;
         if (!confirm(message)) return;
       }
+      if (testMode && user?.test_activation_enabled && !values.has('test_activation_enabled')
+        && !confirm('Выключить браузерное подтверждение? После синхронизации этот тестовый Drive-файл станет полной подпиской.')) return;
       form.dataset.busy = '1'; submit.disabled = true;
       submit.innerHTML = `<span class="spinner"></span><span>${user ? 'Сохраняю изменения…' : 'Создаю профиль…'}</span>`;
       const expiryValue = values.get('expires_at');
@@ -692,7 +720,10 @@
           include_sas: values.get('include_sas') === 'with-sas',
           traffic_limit_bytes: user?.traffic_limit_bytes ?? null,
           device_limit: requestedDeviceLimit,
-          ...(testMode ? { geo_device_limit: requestedGeoDeviceLimit } : {})
+          ...(testMode && !isLegacy ? {
+            geo_device_limit: requestedGeoDeviceLimit,
+            test_activation_enabled: values.has('test_activation_enabled')
+          } : {})
         };
         const result = await api(user ? `/api/admin/users/${user.id}` : '/api/admin/users', {
           method: user ? 'PUT' : 'POST', body
