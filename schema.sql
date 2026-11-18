@@ -88,6 +88,31 @@ CREATE TABLE IF NOT EXISTS app_state (
     value JSONB NOT NULL
 );
 
+-- Main environment's Render-based browser activation slots. The test
+-- environment keeps its own copy of these tables in the isolated schema.
+CREATE TABLE IF NOT EXISTS subscription_activation (
+    user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    token_nonce TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    activated_at TIMESTAMPTZ,
+    drive_ready_at TIMESTAMPTZ,
+    device_limit INTEGER NOT NULL DEFAULT 1 CHECK (device_limit BETWEEN 1 AND 20),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS activation_devices (
+    user_id BIGINT NOT NULL REFERENCES subscription_activation(user_id) ON DELETE CASCADE,
+    device_hash TEXT NOT NULL,
+    subscription_token_hash TEXT,
+    encrypted_link TEXT,
+    platform TEXT NOT NULL DEFAULT 'unknown',
+    browser TEXT NOT NULL DEFAULT 'unknown',
+    language TEXT NOT NULL DEFAULT '',
+    registered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id,device_hash)
+);
+
 -- One-time state backfill for databases that already had the original
 -- device_limit/happ_install_code/limited_link columns from the reference build.
 UPDATE users SET device_limit_status = CASE
