@@ -90,6 +90,38 @@ DEFAULT_SETTINGS = {
     "quotes": QUOTE_DEFAULTS, "footers": FOOTER_DEFAULTS, "days": DAY_DEFAULTS,
 }
 
+# Applied only to test subscriptions. Happ accepts custom color-profile metadata
+# and subscription pinning in the profile body; the palette keeps the app UI
+# near-black while retaining readable text and a restrained green accent.
+TEST_HAPP_COLOR_PROFILE = {
+    "backgroundGradientRotationAngle": 0,
+    "serverRowBackgroundColor": "#111415F2",
+    "subsHeaderColor": "#080A0BFF",
+    "profileWebPageIconColor": "#B7D19BFF",
+    "selectedServerRowColor": "#26332BFF",
+    "disclosureSubHeaderTextColor": "#B7C0BAFF",
+    "buttonTextColor": "#080A09FF",
+    "buttonTimerColor": "#E7ECE7FF",
+    "subscriptionInfoBackgroundColor": "#111516FF",
+    "backgroundColors": ["#030404FF", "#070909FF", "#0A0C0DFF"],
+    "disclosureHeaderTextColor": "#F2F5F2FF",
+    "backgroundGradientColorIntensity": 1,
+    "additionalOptionsButtonColor": "#E2E8E3FF",
+    "buttonImageType": "light",
+    "serverRowSubTitleTextColor": "#AAB3ACFF",
+    "supportIconColor": "#EAF0EAFF",
+    "topBarButtonsColor": "#EAF0EAFF",
+    "subscriptionTrafficBackgroundColor": "#26312AFF",
+    "subHeaderButtonColor": "#EAF0EAFF",
+    "buttonColor": "#B7D19BFF",
+    "powerIconColor": "#B7D19BFF",
+    "subscriptionInfoTextColor": "#E4E8E4FF",
+    "serverRowTitleTextColor": "#F1F3F1FF",
+    "backgroundImageType": "system",
+    "elipseColors": ["#A1C181FF", "#CDD99AFF", "#E2B862FF"],
+    "serverRowChevronColor": "#DCE2DDFF",
+}
+
 
 def parse_database_url(value: str) -> dict:
     """Parse PostgreSQL URLs without letting urllib confuse @/spaces in passwords."""
@@ -2313,9 +2345,20 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
              f"#profile-update-interval: {int(settings.get('update_interval', 1))}",
              "#announce: base64:" + base64.b64encode(announcement.encode()).decode(),
              "#support-url: " + str(settings.get("support_url", "https://t.me/moserrr1"))]
-    provider_id = "" if test_mode else os.getenv("HAPP_PROVIDER_ID", "").strip()
+    if test_mode:
+        # Let /test use its own Happ provider when configured. Existing
+        # deployments can reuse HAPP_PROVIDER_ID until a separate test ID is
+        # available; these directives are still emitted only for /test.
+        provider_id = os.getenv("TEST_HAPP_PROVIDER_ID", "").strip()
+        if not provider_id:
+            provider_id = os.getenv("HAPP_PROVIDER_ID", "").strip()
+    else:
+        provider_id = os.getenv("HAPP_PROVIDER_ID", "").strip()
     if re.fullmatch(r"[A-Za-z0-9]{8}", provider_id):
         lines.append("#providerid " + provider_id)
+        if test_mode:
+            lines.append("#color-profile: " + json.dumps(TEST_HAPP_COLOR_PROFILE, separators=(",", ":")))
+            lines.append("#subscription-pin: true")
     is_legacy = user.get("slug") == "legacy" or user.get("drive_file_id") == LEGACY_DRIVE_FILE_ID
     if is_legacy or not bool(user.get("hide_traffic_usage", False)):
         expiry = int(user["expires_at"].timestamp()) if user.get("expires_at") else None

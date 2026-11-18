@@ -50,3 +50,5 @@ services:
         sync: false
       - key: HAPP_PROVIDER_ID
         sync: false
+      - key: TEST_HAPP_PROVIDER_ID
+        sync: false
