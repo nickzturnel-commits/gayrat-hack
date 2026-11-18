@@ -1493,7 +1493,7 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
                 }
                 routing64 = base64.urlsafe_b64encode(json.dumps(routing, ensure_ascii=False).encode()).decode().rstrip("=")
                 lines.append("happ://routing/add/" + routing64)
-        order_sql = "CASE WHEN source='sas' THEN 1 ELSE 0 END,sort_order,id" if test_mode else "sort_order,id"
+        order_sql = "CASE WHEN source='sas' THEN 1 ELSE 0 END,sort_order,id"
         global_rows = await conn.fetch(f"SELECT id,original_name,custom_name,hidden,sort_order,source FROM servers WHERE present_upstream=TRUE ORDER BY {order_sql}")
         upstream_by_id = {server["id"]: server for server in servers}
         overrides = await conn.fetch("SELECT server_id,hidden,custom_name FROM user_servers WHERE user_id=$1", user["id"])
@@ -2060,7 +2060,7 @@ async def servers_list(request: Request):
     pool = await state.db()
     async with pool.acquire() as conn:
         await _sync_servers(conn, body, primary_body=state.upstream_body, sas_body=state.sas_body)
-        order_sql = "CASE WHEN source='sas' THEN 1 ELSE 0 END,sort_order,id" if _test_environment.get() else "sort_order,id"
+        order_sql = "CASE WHEN source='sas' THEN 1 ELSE 0 END,sort_order,id"
         rows = await conn.fetch(f"SELECT * FROM servers WHERE present_upstream=TRUE ORDER BY {order_sql}")
     return {"servers": [_serialize(r) for r in rows]}
 
@@ -2083,8 +2083,6 @@ class BulkServerBody(BaseModel):
 @router.post("/api/admin/servers/batch")
 async def servers_batch(data: ServerBatchBody, request: Request):
     _auth(request, csrf=True)
-    if not _test_environment.get():
-        raise HTTPException(404, "Пакетное редактирование доступно только в тестовой среде")
     ids = [item.server_id for item in data.servers]
     if len(ids) != len(set(ids)):
         raise HTTPException(422, "В пакете есть повторяющиеся серверы")
@@ -2120,17 +2118,15 @@ async def servers_refresh(request: Request):
 
 
 @router.post("/api/admin/cache/refresh")
-async def test_cache_refresh(request: Request):
+async def admin_cache_refresh(request: Request):
     _auth(request, csrf=True)
-    if not _test_environment.get():
-        raise HTTPException(404, "Обновление тестового кэша доступно только в тестовой среде")
     fields = state._FEED_CACHE_FIELDS
-    cache = state._feed_caches["test"]
+    cache = state._feed_caches["test" if _test_environment.get() else "main"]
     previous = {key: cache[key] for key in fields}
     try:
         body, _, stale = await state.fetch_upstream(force=True, force_sas=True)
         if stale:
-            raise HTTPException(502, "Один из источников не обновился. Сохранён последний рабочий кэш; подписки не изменены.")
+            raise HTTPException(502, "Не удалось обновить один из источников. Сохранён последний рабочий кэш; подписки не изменены.")
         pool = await state.db()
         async with pool.acquire() as conn:
             servers = await _sync_servers(conn, body, primary_body=state.upstream_body, sas_body=state.sas_body)
@@ -2159,8 +2155,6 @@ async def user_server_update(user_id: int, server_id: str, data: UserServerBody,
 @router.post("/api/admin/users/{user_id}/servers/batch")
 async def user_servers_batch(user_id: int, data: UserServerBatchBody, request: Request):
     _auth(request, csrf=True)
-    if not _test_environment.get():
-        raise HTTPException(404, "Пакетное редактирование доступно только в тестовой среде")
     ids = [item.server_id for item in data.servers]
     if len(ids) != len(set(ids)):
         raise HTTPException(422, "В пакете есть повторяющиеся серверы")
@@ -2190,7 +2184,7 @@ async def user_servers_list(user_id: int, request: Request):
         if not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)", user_id):
             raise HTTPException(404, "Пользователь не найден")
         await _sync_servers(conn, body, primary_body=state.upstream_body, sas_body=state.sas_body)
-        order_prefix = "CASE WHEN s.source='sas' THEN 1 ELSE 0 END," if _test_environment.get() else ""
+        order_prefix = "CASE WHEN s.source='sas' THEN 1 ELSE 0 END,"
         rows = await conn.fetch(f"""SELECT s.id,s.original_name,s.custom_name AS global_name,s.hidden AS global_hidden,
             s.source,s.sort_order,s.present_upstream,us.hidden AS user_hidden,us.custom_name AS user_name
             FROM servers s LEFT JOIN user_servers us ON us.server_id=s.id AND us.user_id=$1
