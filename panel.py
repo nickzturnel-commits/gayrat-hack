@@ -1095,8 +1095,28 @@ class PanelState:
                     encrypted_link TEXT,
                     encrypted_for_file_id TEXT,
                     encryption_error TEXT,
+                    device_limit INTEGER NOT NULL DEFAULT 1 CHECK (device_limit BETWEEN 1 AND 20),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )""")
+                await conn.execute("""ALTER TABLE test_subscription_activation
+                    ADD COLUMN IF NOT EXISTS device_limit INTEGER NOT NULL DEFAULT 1
+                    CHECK (device_limit BETWEEN 1 AND 20)""")
+                await conn.execute("""CREATE TABLE IF NOT EXISTS test_activation_devices (
+                    user_id BIGINT NOT NULL REFERENCES test_subscription_activation(user_id) ON DELETE CASCADE,
+                    device_hash TEXT NOT NULL,
+                    platform TEXT NOT NULL DEFAULT 'unknown',
+                    browser TEXT NOT NULL DEFAULT 'unknown',
+                    language TEXT NOT NULL DEFAULT '',
+                    registered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (user_id,device_hash)
+                )""")
+                # Existing one-browser confirmations occupy one slot after the migration.
+                await conn.execute("""INSERT INTO test_activation_devices(user_id,device_hash,platform,browser,registered_at)
+                    SELECT user_id,browser_hash,'unknown','existing',COALESCE(activated_at,now())
+                    FROM test_subscription_activation WHERE browser_hash IS NOT NULL
+                    ON CONFLICT(user_id,device_hash) DO NOTHING""")
+                await conn.execute("UPDATE test_subscription_activation SET browser_hash=NULL WHERE browser_hash IS NOT NULL")
                 await self.seed(conn, include_legacy=False)
             self.test_db_error = ""
             log.info("Test panel database schema initialized")
@@ -1401,6 +1421,11 @@ class UserBody(BaseModel):
     device_limit: StrictInt | None = Field(default=None, ge=happ_limit.MIN_LIMIT, le=happ_limit.MAX_LIMIT)
     geo_device_limit: StrictInt | None = Field(default=None, ge=1, le=20)
     test_activation_enabled: bool | None = None
+    test_activation_limit: StrictInt | None = Field(default=None, ge=1, le=20)
+
+
+class TestActivationLimitBody(BaseModel):
+    limit: StrictInt = Field(ge=1, le=20)
 
 
 class DeviceLimitActionBody(BaseModel):
@@ -2001,6 +2026,41 @@ def _test_activation_csrf(token_hash: str, cookie_value: str) -> str:
     return hmac.new(_test_activation_secret(), message.encode(), hashlib.sha256).hexdigest()
 
 
+TEST_ACTIVATION_PLATFORMS = {
+    "ios": "iPhone / iPad", "android": "Android", "windows": "Windows",
+    "macos": "macOS", "linux": "Linux", "android_tv": "Android TV",
+    "appletv": "Apple TV / tvOS", "visionos": "Apple Vision", "chromeos": "ChromeOS",
+    "other": "Другое устройство", "unknown": "Не определено",
+}
+TEST_ACTIVATION_INSTALL_LINKS = {
+    "ios": "https://apps.apple.com/us/app/happ-proxy-utility/id6504287215",
+    "android": "https://github.com/Happ-proxy/happ-android/releases/latest",
+    "windows": "https://github.com/Happ-proxy/happ-desktop/releases/latest",
+    "macos": "https://github.com/Happ-proxy/happ-desktop/releases/latest",
+    "linux": "https://github.com/Happ-proxy/happ-desktop/releases/latest",
+    "android_tv": "https://github.com/Happ-proxy/happ-android/releases/latest",
+    "appletv": "https://apps.apple.com/us/app/happ-proxy-utility-for-tv/id6748297274",
+    "visionos": "https://apps.apple.com/us/app/happ-proxy-utility/id6504287215",
+    "chromeos": "https://github.com/Happ-proxy/happ-android/releases/latest",
+    "other": "https://github.com/Happ-proxy/happ-desktop",
+    "unknown": "https://github.com/Happ-proxy/happ-desktop",
+}
+
+
+def _test_activation_browser_name(user_agent: str) -> str:
+    """Store a coarse browser label only; never retain the raw user agent."""
+    value = user_agent or ""
+    match = re.search(r"(Edg|Edge|OPR|CriOS|Chrome|Firefox|FxiOS|Version)/([0-9]{1,3})", value, re.I)
+    if match:
+        family = {"edg": "Edge", "edge": "Edge", "opr": "Opera", "crios": "Chrome iOS",
+                  "chrome": "Chrome", "firefox": "Firefox", "fxios": "Firefox iOS",
+                  "version": "Safari"}.get(match.group(1).lower(), "Browser")
+        return f"{family} {match.group(2)}"
+    if "safari" in value.lower():
+        return "Safari"
+    return "unknown"
+
+
 def _public_service_base_url(fallback: str | None = None) -> str:
     candidate = (os.getenv("RENDER_EXTERNAL_URL", "").strip() or str(fallback or "").strip()).rstrip("/")
     if candidate and "://" not in candidate:
@@ -2011,15 +2071,41 @@ def _public_service_base_url(fallback: str | None = None) -> str:
     return candidate
 
 
-def _test_activation_page(title: str, message: str, activation_id: str, token: str, csrf: str | None = None,
-                          *, button_text: str | None = None, tone: str = "normal") -> str:
+def _test_activation_page(title: str, message: str, activation_id: str, token: str,
+                          csrf: str | None = None, *, limit: int = 1, registered: int = 0,
+                          selected_platform: str = "", device_registered: bool = False,
+                          happ_link: str | None = None, tone: str = "normal") -> str:
     title_html = html.escape(title)
     message_html = html.escape(message)
-    action = ""
-    if csrf and button_text:
-        action = (f'<form method="post" action="/test/activate/{html.escape(activation_id, quote=True)}/{html.escape(token, quote=True)}">'
-                  f'<input type="hidden" name="csrf" value="{html.escape(csrf, quote=True)}">'
-                  f'<button type="submit">{html.escape(button_text)}</button></form>')
+    safe_selected = selected_platform if selected_platform in TEST_ACTIVATION_PLATFORMS else ""
+    options = ''.join(
+        f'<option value="{html.escape(key, quote=True)}"{(" selected" if key == safe_selected else "")}>{html.escape(label)}</option>'
+        for key, label in TEST_ACTIVATION_PLATFORMS.items() if key != "unknown")
+    activation_form = ""
+    if csrf:
+        action_url = f'/test/activate/{html.escape(activation_id, quote=True)}/{html.escape(token, quote=True)}'
+        activation_form = (f'<form method="post" action="{action_url}" id="activationForm">'
+            f'<input type="hidden" name="csrf" value="{html.escape(csrf, quote=True)}">'
+            f'<div class="device-detect" id="deviceDetect">Определяем устройство…</div>'
+            f'<button type="button" class="back-button" id="manualDevice">Это другое устройство</button>'
+            f'<label class="device-picker" id="devicePicker" hidden>Выберите устройство<select name="platform" required>{options}</select></label>'
+            f'<button type="submit" id="confirmDevice">{("Продолжить на этом устройстве" if device_registered else "Подтвердить устройство")}</button>'
+            f'</form>')
+    happ_action = ""
+    if happ_link:
+        if safe_selected == "appletv":
+            happ_action = (f'<section class="tv-import"><b>Перенос на Apple TV · ТЕСТ</b>'
+                '<p class="foot">На Apple TV откройте Happ → Web Import. На телефоне откройте tv.happ.su, введите временный код с экрана телевизора и отправьте туда эту зашифрованную ссылку.</p>'
+                f'<label>Зашифрованная ссылка для переноса<textarea id="subscriptionLink" readonly rows="3">{html.escape(happ_link)}</textarea></label>'
+                '<button type="button" id="copySubscription">Скопировать ссылку</button></section>')
+        else:
+            happ_action = (f'<a class="app-button" href="{html.escape(happ_link, quote=True)}" rel="noreferrer">'
+                           'Открыть и добавить в Happ</a><p class="foot">Откройте приложение по кнопке. Если браузер спросит подтверждение перехода — разрешите его.</p>')
+    install_url = TEST_ACTIVATION_INSTALL_LINKS.get(safe_selected or "unknown", TEST_ACTIVATION_INSTALL_LINKS["unknown"])
+    install_action = (f'<a class="install-link" id="installLink" href="{install_url}" target="_blank" rel="noopener noreferrer">'
+                      'Установить Happ для этого устройства</a>')
+    links_json = json.dumps(TEST_ACTIVATION_INSTALL_LINKS, ensure_ascii=True)
+    meter = f'<div class="slot-meter"><b>{min(registered, limit)} / {limit}</b><span>занято устройств</span></div>'
     return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="color-scheme" content="dark"><meta name="robots" content="noindex,nofollow">
@@ -2028,10 +2114,14 @@ def _test_activation_page(title: str, message: str, activation_id: str, token: s
 *{{box-sizing:border-box}}body{{margin:0;min-height:100dvh;display:grid;place-items:center;padding:24px;background:linear-gradient(145deg,#111c17,#090d0c 65%)}}
 main{{width:min(100%,520px);border:1px solid #34453c;background:#111a16;padding:clamp(24px,6vw,40px);box-shadow:0 24px 70px #0008}}
 .tag{{margin:0 0 18px;color:#e8b967;font-size:12px;font-weight:800;letter-spacing:.16em}}h1{{margin:0 0 14px;font-size:clamp(25px,6vw,34px);line-height:1.15;letter-spacing:-.035em}}p{{margin:0;color:#bbc8bf}}.notice{{border-left:3px solid {('#de8276' if tone == 'error' else '#dfb45d')};padding:12px 14px;margin:22px 0;background:#ffffff08}}
-button{{width:100%;min-height:50px;margin-top:20px;border:1px solid #d6a84e;background:#d6a84e;color:#15140f;font:700 15px system-ui;cursor:pointer;padding:12px 18px}}button:hover{{background:#edc572}}button:focus-visible{{outline:3px solid #f4d991;outline-offset:3px}}
-.foot{{margin-top:24px;color:#829087;font-size:13px}}@media(prefers-reduced-motion:no-preference){{main{{animation:appear .28s ease-out}}@keyframes appear{{from{{opacity:0;transform:translateY(8px)}}to{{opacity:1;transform:none}}}}}}
+button{{width:100%;min-height:50px;margin-top:16px;border:1px solid #d6a84e;background:#d6a84e;color:#15140f;font:700 15px system-ui;cursor:pointer;padding:12px 18px}}button:hover{{background:#edc572}}button:focus-visible,a:focus-visible,select:focus-visible{{outline:3px solid #f4d991;outline-offset:3px}}
+select{{width:100%;min-height:48px;margin-top:8px;padding:10px 12px;border:1px solid #43564b;background:#0b100e;color:#edf2ed;font:inherit}}textarea{{width:100%;margin-top:8px;padding:10px 12px;border:1px solid #43564b;background:#0b100e;color:#edf2ed;font:12px/1.5 ui-monospace,monospace;overflow-wrap:anywhere;resize:vertical}}label{{display:block;margin-top:14px;color:#c9d4cd;font-size:13px;font-weight:700}}.device-detect{{padding:12px 14px;border:1px solid #33443a;background:#0d1511;color:#c7d5cc;font-size:14px}}.back-button{{min-height:40px;border:0;background:transparent;color:#c8d7ce;text-decoration:underline}}.back-button:hover{{background:#ffffff0a}}.slot-meter{{display:flex;align-items:baseline;gap:9px;margin:15px 0;color:#a9b8ae}}.slot-meter b{{color:#e8bd72;font:600 18px ui-monospace,monospace}}.app-button{{display:block;margin-top:16px;padding:14px 18px;background:#d6a84e;color:#15140f;text-align:center;text-decoration:none;font-weight:800}}.install-link{{display:inline-block;margin-top:16px;color:#b8dfc4}}.foot{{margin-top:12px;color:#829087;font-size:13px}}.privacy{{margin-top:22px;padding-top:14px;border-top:1px solid #293a31;color:#829087;font-size:12px}}[hidden]{{display:none!important}}
+@media(max-width:520px){{body{{padding:12px}}main{{padding:24px 20px}}}}
+@media(prefers-reduced-motion:no-preference){{main{{animation:appear .28s ease-out}}@keyframes appear{{from{{opacity:0;transform:translateY(8px)}}to{{opacity:1;transform:none}}}}}}
 </style></head><body><main><p class="tag">ТЕСТОВАЯ СРЕДА · SECURE X</p><h1>{title_html}</h1>
-<p class="notice">{message_html}</p>{action}<p class="foot">После подтверждения вернитесь в Happ и обновите тестовую подписку.</p></main></body></html>"""
+<p class="notice">{message_html}</p>{meter}{activation_form}{install_action}{happ_action}
+<p class="privacy">Для запоминания регистрации используется случайный cookie этого браузера. В панели сохраняются выбранная платформа, язык браузера и его тип/версия. IP-адрес и скрытый отпечаток устройства не сохраняются. Очистка cookies или другой браузер считаются новым устройством.</p>
+<script>(()=>{{const names={json.dumps(TEST_ACTIVATION_PLATFORMS, ensure_ascii=False)};const links={links_json};const select=document.querySelector('select[name="platform"]');const picker=document.getElementById('devicePicker');const detect=document.getElementById('deviceDetect');const manual=document.getElementById('manualDevice');const install=document.getElementById('installLink');if(!select)return;const copyButton=document.getElementById('copySubscription');if(copyButton)copyButton.addEventListener('click',async()=>{{const input=document.getElementById('subscriptionLink');try{{if(!navigator.clipboard?.writeText)throw new Error('clipboard');await navigator.clipboard.writeText(input.value);copyButton.textContent='Скопировано';}}catch{{input.focus();input.select();copyButton.textContent='Ссылка выделена для копирования';}}}});let ua=navigator.userAgent||'';let platform='';if(/AppleTV|tvOS/i.test(ua))platform='appletv';else if(/Vision/i.test(ua))platform='visionos';else if(/CrOS/i.test(ua))platform='chromeos';else if(/Android/i.test(ua)&&/TV|Leanback/i.test(ua))platform='android_tv';else if(/iPhone|iPad|iPod/i.test(ua)||(/Macintosh/i.test(ua)&&navigator.maxTouchPoints>1))platform='ios';else if(/Android/i.test(ua))platform='android';else if(/Windows/i.test(ua))platform='windows';else if(/Macintosh|Mac OS X/i.test(ua))platform='macos';else if(/Linux|X11/i.test(ua))platform='linux';const preset={json.dumps(safe_selected)};if(preset)platform=preset;if(platform&&[...select.options].some(o=>o.value===platform)){{select.value=platform;detect.textContent='Устройство: '+names[platform]+(preset?' · это устройство уже подтверждено':' · определено браузером');picker.hidden=true;manual.textContent='Определено неверно? Выбрать вручную';}}else{{select.value='';picker.hidden=false;detect.textContent='Не удалось определить устройство. Выберите платформу вручную.';manual.hidden=true;}}function syncLink(){{const key=select.value||'unknown';install.href=links[key]||links.unknown;install.textContent='Установить Happ · '+(names[key]||names.unknown);}}manual.addEventListener('click',()=>{{picker.hidden=false;select.focus();manual.hidden=true;detect.textContent='Выберите платформу вручную. Это не меняет лимит регистрации.';}});select.addEventListener('change',syncLink);syncLink();}})();</script></main></body></html>"""
 
 
 async def build_manifest_content(conn, user, body: bytes, headers: dict, settings: dict,
@@ -2363,9 +2453,11 @@ async def users_list(request: Request):
                 g.geoip_downloaded_at,g.geosite_downloaded_at,g.activated_at AS geo_activated_at,
                 (a.user_id IS NOT NULL) AS test_activation_enabled,a.token_nonce AS test_activation_nonce,
                 a.token_hash AS test_activation_hash,a.activated_at AS test_activation_at,
+                a.device_limit AS test_activation_limit,
+                (SELECT count(*) FROM test_activation_devices d WHERE d.user_id=a.user_id) AS test_activation_devices_count,
                 a.browser_hash AS test_activation_browser_hash,
-                CASE WHEN a.encrypted_for_file_id=u.drive_file_id AND a.encryption_error IS NULL
-                    THEN a.encrypted_link ELSE NULL END AS test_activation_link,
+                (a.encrypted_link IS NOT NULL AND a.encrypted_for_file_id=u.drive_file_id
+                    AND a.encryption_error IS NULL) AS test_activation_link_ready,
                 CASE WHEN a.encrypted_for_file_id IS NOT DISTINCT FROM u.drive_file_id
                     THEN a.encryption_error ELSE NULL END AS test_activation_error
                 FROM users u LEFT JOIN test_geo_state g ON g.user_id=u.id
@@ -2382,23 +2474,93 @@ async def users_list(request: Request):
                               if user.get("drive_file_id") and api_key_configured else None)
         if _test_environment.get():
             nonce = user.pop("test_activation_nonce", None)
-            token_hash = user.pop("test_activation_hash", None)
+            user.pop("test_activation_hash", None)
             user["test_activation_id"] = _test_activation_id(int(user["id"])) if user.get("test_activation_enabled") else None
             user["test_activation_url"] = None
             if user.get("test_activation_enabled") and nonce:
                 user["test_activation_url"] = _test_activation_url(
                     int(user["id"]), nonce, str(request.base_url).rstrip("/"))
-            browser_hash = user.pop("test_activation_browser_hash", None)
-            user["test_activation_browser_hint"] = browser_hash[:8] if browser_hash else None
+            user.pop("test_activation_browser_hash", None)
         users.append(user)
     return {"users": users, "device_limit_bounds": {"min": happ_limit.MIN_LIMIT, "max": happ_limit.MAX_LIMIT}}
+
+
+@router.get("/api/admin/test-activations")
+async def test_activations_list(request: Request):
+    _auth(request)
+    if not _test_environment.get():
+        raise HTTPException(404, "Not found")
+    pool = await state.db()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""SELECT u.id,u.name,u.status,u.enabled,u.expires_at,u.drive_file_id,
+            u.device_limit_status,u.device_limit_error,a.token_nonce,a.device_limit,a.activated_at,
+            a.encrypted_link,a.encrypted_for_file_id,a.encryption_error
+            FROM test_subscription_activation a JOIN users u ON u.id=a.user_id
+            ORDER BY u.created_at,u.id""")
+        devices = await conn.fetch("""SELECT d.user_id,d.device_hash,d.platform,d.browser,d.language,
+            d.registered_at,d.last_seen_at FROM test_activation_devices d
+            JOIN test_subscription_activation a ON a.user_id=d.user_id
+            ORDER BY d.registered_at,d.device_hash""")
+    devices_by_user: dict[int, list[dict]] = {}
+    for row in devices:
+        item = _serialize(row)
+        item.pop("device_hash", None)
+        item["platform_label"] = TEST_ACTIVATION_PLATFORMS.get(row["platform"], "Другое устройство")
+        devices_by_user.setdefault(int(row["user_id"]), []).append(item)
+    result = []
+    base = str(request.base_url).rstrip("/")
+    for row in rows:
+        user = _serialize(row)
+        user["activation_id"] = _test_activation_id(int(row["id"]))
+        user["activation_url"] = _test_activation_url(int(row["id"]), row["token_nonce"], base)
+        user["devices"] = devices_by_user.get(int(row["id"]), [])
+        user["registered_count"] = len(user["devices"])
+        user["happ_link_ready"] = bool(row["encrypted_link"]
+                                       and row["encrypted_for_file_id"] == row["drive_file_id"]
+                                       and not row["encryption_error"])
+        user["activation_error"] = row["encryption_error"]
+        user.pop("token_nonce", None)
+        user.pop("encrypted_link", None)
+        user.pop("encrypted_for_file_id", None)
+        result.append(user)
+    return {"activations": result, "limit": {"min": 1, "max": 20}}
+
+
+@router.put("/api/admin/users/{user_id}/test-activation/limit")
+async def test_activation_limit_update(user_id: int, data: TestActivationLimitBody, request: Request):
+    _auth(request, csrf=True)
+    if not _test_environment.get():
+        raise HTTPException(404, "Not found")
+    pool = await state.db()
+    changed = False
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            activation = await conn.fetchrow("""SELECT device_limit FROM test_subscription_activation
+                WHERE user_id=$1 FOR UPDATE""", user_id)
+            if not activation:
+                raise HTTPException(404, "Тестовая активация не включена")
+            changed = int(activation["device_limit"]) != data.limit
+            if changed:
+                # If the administrator lowers the cap, retain the oldest registrations
+                # up to the new limit so a previously registered browser cannot bypass it.
+                await conn.execute("""DELETE FROM test_activation_devices WHERE user_id=$1 AND device_hash IN (
+                    SELECT device_hash FROM test_activation_devices WHERE user_id=$1
+                    ORDER BY registered_at,device_hash OFFSET $2)""", user_id, data.limit)
+                await conn.execute("""UPDATE test_subscription_activation SET device_limit=$2,
+                    encrypted_link=NULL,encrypted_for_file_id=NULL,encryption_error=NULL,updated_at=now()
+                    WHERE user_id=$1""", user_id, data.limit)
+                await conn.execute("""UPDATE users SET device_limit=$2,happ_install_code=NULL,limited_link=NULL,
+                    device_limit_status='waiting',device_limit_error=NULL,updated_at=now() WHERE id=$1""",
+                    user_id, data.limit)
+    await _ensure_test_activation_encrypted_link(user_id)
+    return {"ok": True, "limit": data.limit, "changed": changed}
 
 
 @router.post("/api/admin/users")
 async def users_create(data: UserBody, request: Request):
     _auth(request, csrf=True)
     test_mode = _test_environment.get()
-    if not test_mode and data.test_activation_enabled is not None:
+    if not test_mode and (data.test_activation_enabled is not None or data.test_activation_limit is not None):
         raise HTTPException(422, "Подтверждение браузера доступно только в тестовой панели")
     if data.title_override and any(ord(c) < 32 for c in data.title_override):
         raise HTTPException(422, "Заголовок профиля не должен содержать переносы строк")
@@ -2414,6 +2576,10 @@ async def users_create(data: UserBody, request: Request):
         include_sas = bool(data.include_sas if data.include_sas is not None
                            else settings.get("include_sas_for_new_users", True))
         device_limit = data.device_limit if "device_limit" in data.model_fields_set else settings.get("device_limit_for_new_users")
+        if test_mode and data.test_activation_enabled:
+            if data.test_activation_limit is None:
+                raise HTTPException(422, "Укажите лимит браузерной активации от 1 до 20")
+            device_limit = data.test_activation_limit
         if device_limit is not None:
             try:
                 if isinstance(device_limit, bool) or (isinstance(device_limit, float) and not device_limit.is_integer()):
@@ -2432,9 +2598,9 @@ async def users_create(data: UserBody, request: Request):
             await conn.execute("INSERT INTO test_geo_state(user_id,geo_device_limit) VALUES($1,$2)", row["id"], data.geo_device_limit)
         if test_mode and data.test_activation_enabled:
             nonce, token_hash = _new_test_activation_credentials(int(row["id"]))
-            await conn.execute("""INSERT INTO test_subscription_activation(user_id,token_nonce,token_hash)
-                VALUES($1,$2,$3)""", row["id"], nonce, token_hash)
-    if row["device_limit"] is not None:
+            await conn.execute("""INSERT INTO test_subscription_activation(user_id,token_nonce,token_hash,device_limit)
+                VALUES($1,$2,$3,$4)""", row["id"], nonce, token_hash, data.test_activation_limit)
+    if row["device_limit"] is not None and not (test_mode and data.test_activation_enabled):
         _schedule_limited_link(row["id"])
     drive_sync = await state.push_drive_sync([row["id"]])
     if test_mode and data.test_activation_enabled:
@@ -2446,7 +2612,7 @@ async def users_create(data: UserBody, request: Request):
 async def users_update(user_id: int, data: UserBody, request: Request):
     _auth(request, csrf=True)
     test_mode = _test_environment.get()
-    if not test_mode and data.test_activation_enabled is not None:
+    if not test_mode and (data.test_activation_enabled is not None or data.test_activation_limit is not None):
         raise HTTPException(422, "Подтверждение браузера доступно только в тестовой панели")
     if data.title_override and any(ord(c) < 32 for c in data.title_override):
         raise HTTPException(422, "Заголовок профиля не должен содержать переносы строк")
@@ -2456,9 +2622,15 @@ async def users_update(user_id: int, data: UserBody, request: Request):
         if not old_limit:
             raise HTTPException(404, "Пользователь не найден")
         limit_supplied = "device_limit" in data.model_fields_set
-        if limit_supplied and (old_limit["slug"] == "legacy" or old_limit["drive_file_id"] == LEGACY_DRIVE_FILE_ID) and data.device_limit is not None:
+        effective_device_limit = data.device_limit
+        if test_mode and data.test_activation_enabled:
+            if data.test_activation_limit is None:
+                raise HTTPException(422, "Укажите лимит браузерной активации от 1 до 20")
+            effective_device_limit = data.test_activation_limit
+            limit_supplied = True
+        if limit_supplied and (old_limit["slug"] == "legacy" or old_limit["drive_file_id"] == LEGACY_DRIVE_FILE_ID) and effective_device_limit is not None:
             raise HTTPException(409, "Основная (legacy) подписка всегда остаётся без лимита устройств")
-        limit_changed = limit_supplied and data.device_limit != old_limit["device_limit"]
+        limit_changed = limit_supplied and effective_device_limit != old_limit["device_limit"]
         row = await conn.fetchrow("""UPDATE users SET name=$2,note=$3,enabled=$4,expires_at=$5,title_override=$6,
             announce_override=$7,traffic_limit_bytes=$8,
             hide_traffic_usage=CASE WHEN slug='legacy' OR drive_file_id=$10 THEN FALSE ELSE COALESCE($9,hide_traffic_usage) END,
@@ -2471,7 +2643,7 @@ async def users_update(user_id: int, data: UserBody, request: Request):
             updated_at=now() WHERE id=$1 AND status='active' RETURNING *""", user_id,
             data.name.strip(), data.note, data.enabled, _expiry_utc(data.expires_at), data.title_override, data.announce_override,
             data.traffic_limit_bytes, data.hide_traffic_usage, LEGACY_DRIVE_FILE_ID, data.include_sas,
-            limit_supplied, data.device_limit, limit_changed)
+            limit_supplied, effective_device_limit, limit_changed)
         if _test_environment.get() and "geo_device_limit" in data.model_fields_set:
             geo_state = await conn.fetchrow("SELECT geo_device_limit FROM test_geo_state WHERE user_id=$1", user_id)
             previous_geo_limit = geo_state["geo_device_limit"] if geo_state else None
@@ -2482,13 +2654,24 @@ async def users_update(user_id: int, data: UserBody, request: Request):
                                        user_id, data.geo_device_limit)
         if test_mode and "test_activation_enabled" in data.model_fields_set:
             if data.test_activation_enabled:
+                if limit_changed and effective_device_limit is not None and old_limit["device_limit"] is not None \
+                        and effective_device_limit < old_limit["device_limit"]:
+                    await conn.execute("""DELETE FROM test_activation_devices WHERE user_id=$1 AND device_hash IN (
+                        SELECT device_hash FROM test_activation_devices WHERE user_id=$1
+                        ORDER BY registered_at,device_hash OFFSET $2)""", user_id, effective_device_limit)
                 nonce, token_hash = _new_test_activation_credentials(user_id)
-                await conn.execute("""INSERT INTO test_subscription_activation(user_id,token_nonce,token_hash)
-                    VALUES($1,$2,$3) ON CONFLICT(user_id) DO NOTHING""", user_id, nonce, token_hash)
+                await conn.execute("""INSERT INTO test_subscription_activation(user_id,token_nonce,token_hash,device_limit)
+                    VALUES($1,$2,$3,$4) ON CONFLICT(user_id) DO UPDATE SET
+                    device_limit=EXCLUDED.device_limit,
+                    encrypted_link=CASE WHEN test_subscription_activation.device_limit<>EXCLUDED.device_limit THEN NULL ELSE test_subscription_activation.encrypted_link END,
+                    encrypted_for_file_id=CASE WHEN test_subscription_activation.device_limit<>EXCLUDED.device_limit THEN NULL ELSE test_subscription_activation.encrypted_for_file_id END,
+                    encryption_error=CASE WHEN test_subscription_activation.device_limit<>EXCLUDED.device_limit THEN NULL ELSE test_subscription_activation.encryption_error END,
+                    updated_at=now()""",
+                    user_id, nonce, token_hash, data.test_activation_limit)
             else:
                 await conn.execute("DELETE FROM test_subscription_activation WHERE user_id=$1", user_id)
     if not row: raise HTTPException(404, "Пользователь не найден")
-    if row["device_limit"] is not None:
+    if row["device_limit"] is not None and not (test_mode and data.test_activation_enabled):
         _schedule_limited_link(user_id)
     drive_sync = await state.push_drive_sync([user_id])
     if test_mode and data.test_activation_enabled:
@@ -2677,16 +2860,45 @@ async def _ensure_test_activation_encrypted_link(user_id: int) -> None:
         pool = await state.db()
         async with pool.acquire() as conn:
             row = await conn.fetchrow("""SELECT a.token_hash,a.encrypted_link,a.encrypted_for_file_id,
-                u.drive_file_id FROM test_subscription_activation a JOIN users u ON u.id=a.user_id
+                a.device_limit,u.drive_file_id,u.device_limit AS happ_device_limit,u.limited_link,
+                u.device_limit_status FROM test_subscription_activation a JOIN users u ON u.id=a.user_id
                 WHERE a.user_id=$1""", user_id)
         if not row or not row["drive_file_id"]:
             return
-        if row["encrypted_link"] and row["encrypted_for_file_id"] == row["drive_file_id"]:
+        if row["happ_device_limit"] != row["device_limit"]:
+            async with pool.acquire() as conn:
+                await conn.execute("""UPDATE users SET device_limit=$2,happ_install_code=NULL,limited_link=NULL,
+                    device_limit_status='waiting',device_limit_error=NULL,updated_at=now() WHERE id=$1""",
+                    user_id, row["device_limit"])
+            row = dict(row)
+            row.update(happ_device_limit=row["device_limit"], limited_link=None, device_limit_status="waiting")
+        if row["happ_device_limit"] is None:
+            error = "Для тестовой активации требуется настоящий Happ Limited Link"
+            async with pool.acquire() as conn:
+                await conn.execute("""UPDATE test_subscription_activation SET encrypted_link=NULL,
+                    encrypted_for_file_id=$2,encryption_error=$3,updated_at=now() WHERE user_id=$1""",
+                    user_id, row["drive_file_id"], error)
+            return
+        if row["device_limit_status"] != "ready" or not row["limited_link"]:
+            try:
+                await _create_limited_link(user_id)
+            except (HTTPException, happ_limit.HappLimitError) as exc:
+                message = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+                async with pool.acquire() as conn:
+                    await conn.execute("""UPDATE test_subscription_activation SET encrypted_link=NULL,
+                        encrypted_for_file_id=$2,encryption_error=$3,updated_at=now() WHERE user_id=$1""",
+                        user_id, row["drive_file_id"], message[:500])
+                return
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow("""SELECT a.token_hash,a.encrypted_link,a.encrypted_for_file_id,
+                    a.device_limit,u.drive_file_id,u.device_limit AS happ_device_limit,u.limited_link,
+                    u.device_limit_status FROM test_subscription_activation a JOIN users u ON u.id=a.user_id
+                    WHERE a.user_id=$1""", user_id)
+        if row["encrypted_link"] == row["limited_link"] and row["encrypted_for_file_id"] == row["drive_file_id"]:
             return
         try:
-            source = _drive_subscription_link(row["drive_file_id"])
-            async with _happ_client() as client:
-                encrypted_link = await happ_limit.encrypt_link(client, source)
+            # Happ Limited Links are already encrypted and enforce the native HWID install limit.
+            encrypted_link = str(row["limited_link"])
             error = None
         except (happ_limit.HappLimitError, HTTPException) as exc:
             encrypted_link = None
@@ -2718,12 +2930,20 @@ async def test_activation_reset(user_id: int, request: Request):
     nonce, token_hash = _new_test_activation_credentials(user_id)
     pool = await state.db()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("""UPDATE test_subscription_activation SET token_nonce=$2,token_hash=$3,
-            browser_hash=NULL,activated_at=NULL,updated_at=now() WHERE user_id=$1 RETURNING user_id""",
-            user_id, nonce, token_hash)
+        async with conn.transaction():
+            row = await conn.fetchrow("""UPDATE test_subscription_activation SET token_nonce=$2,token_hash=$3,
+                browser_hash=NULL,activated_at=NULL,encrypted_link=NULL,encrypted_for_file_id=NULL,
+                encryption_error=NULL,updated_at=now() WHERE user_id=$1 RETURNING user_id""",
+                user_id, nonce, token_hash)
+            if row:
+                await conn.execute("DELETE FROM test_activation_devices WHERE user_id=$1", user_id)
+                await conn.execute("""UPDATE users SET happ_install_code=NULL,limited_link=NULL,
+                    device_limit_status=CASE WHEN device_limit IS NULL THEN 'none' ELSE 'waiting' END,
+                    device_limit_error=NULL,updated_at=now() WHERE id=$1""", user_id)
     if not row:
         raise HTTPException(404, "Тестовое подтверждение не включено для этой подписки")
     drive_sync = await state.push_drive_sync([user_id])
+    await _ensure_test_activation_encrypted_link(user_id)
     return {"ok": True, "test_activation_id": _test_activation_id(user_id),
             "test_activation_url": _test_activation_url(user_id, nonce, str(request.base_url).rstrip("/")),
             "drive_sync": drive_sync}
@@ -2748,21 +2968,26 @@ async def test_activation_qr(user_id: int, request: Request):
         raise HTTPException(404, "Not found")
     pool = await state.db()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("""SELECT a.encrypted_link FROM test_subscription_activation a
-            JOIN users u ON u.id=a.user_id WHERE a.user_id=$1
-              AND a.encrypted_for_file_id=u.drive_file_id AND a.encryption_error IS NULL""", user_id)
+        row = await conn.fetchrow("""SELECT a.token_nonce FROM test_subscription_activation a
+            JOIN users u ON u.id=a.user_id WHERE a.user_id=$1""", user_id)
     if not row:
         raise HTTPException(404, "Тестовое подтверждение не включено для этой подписки")
-    if not row["encrypted_link"]:
-        raise HTTPException(409, "Зашифрованная Happ-ссылка ещё не создана")
-    svg = _drive_qr_svg(row["encrypted_link"])
+    activation_url = _test_activation_url(user_id, row["token_nonce"], str(request.base_url).rstrip("/"))
+    svg = _drive_qr_svg(activation_url)
     return Response(content=svg, media_type="image/svg+xml", headers={
-        "Cache-Control": "no-store", "Content-Disposition": "inline; filename=test-subscription-qr.svg"})
+        "Cache-Control": "no-store", "Content-Disposition": "inline; filename=test-activation-qr.svg"})
 
 
 @router.post("/api/admin/users/{user_id}/device-limit")
 async def device_limit_action(user_id: int, data: DeviceLimitActionBody, request: Request):
     _auth(request, csrf=True)
+    if _test_environment.get():
+        pool = await state.db()
+        async with pool.acquire() as conn:
+            is_activation = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM test_subscription_activation WHERE user_id=$1)", user_id)
+        if is_activation:
+            raise HTTPException(409, "Управляйте этим лимитом в разделе «Активация · ТЕСТ»")
     return await _create_limited_link(user_id, rebuild=data.action == "rebuild")
 
 
@@ -2771,6 +2996,9 @@ async def device_limit_clear(user_id: int, request: Request):
     _auth(request, csrf=True)
     pool = await state.db()
     async with pool.acquire() as conn:
+        if _test_environment.get() and await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM test_subscription_activation WHERE user_id=$1)", user_id):
+            raise HTTPException(409, "Сначала отключите активацию в настройках тестовой подписки")
         row = await conn.fetchrow("""UPDATE users SET device_limit=NULL,happ_install_code=NULL,limited_link=NULL,
             device_limit_status='none',device_limit_error=NULL,updated_at=now() WHERE id=$1 RETURNING id""", user_id)
     if not row:
@@ -3230,9 +3458,11 @@ async def _test_activation_get(activation_id: str, token: str, request: Request)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     pool = await state.db()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("""SELECT a.user_id,a.token_hash,a.browser_hash,a.activated_at,
-            u.name,u.status,u.enabled,u.expires_at FROM test_subscription_activation a
-            JOIN users u ON u.id=a.user_id WHERE a.token_hash=$1 AND a.user_id=$2""", token_hash, activation_user_id)
+        row = await conn.fetchrow("""SELECT a.user_id,a.token_hash,a.activated_at,a.device_limit,
+            u.name,u.status,u.enabled,u.expires_at,u.drive_file_id,
+            a.encrypted_link,a.encrypted_for_file_id,a.encryption_error
+            FROM test_subscription_activation a JOIN users u ON u.id=a.user_id
+            WHERE a.token_hash=$1 AND a.user_id=$2""", token_hash, activation_user_id)
     if not row:
         raise HTTPException(404, "Тестовая ссылка не найдена или уже сброшена")
 
@@ -3242,18 +3472,28 @@ async def _test_activation_get(activation_id: str, token: str, request: Request)
         cookie_value = secrets.token_urlsafe(32)
     browser_hash = _test_activation_browser_hash(cookie_value)
     response_cookie = set_cookie
+    known_device = None
+    async with pool.acquire() as conn:
+        if not set_cookie:
+            known_device = await conn.fetchrow("""SELECT platform FROM test_activation_devices
+                WHERE user_id=$1 AND device_hash=$2""", activation_user_id, browser_hash)
+        registered = int(await conn.fetchval("SELECT count(*) FROM test_activation_devices WHERE user_id=$1", activation_user_id) or 0)
+    known = bool(known_device)
+    full = not known and registered >= int(row["device_limit"])
     if row["status"] != "active" or not row["enabled"] or (row["expires_at"] and row["expires_at"] <= datetime.now(timezone.utc)):
         page = _test_activation_page("Подписка недоступна", "Эта тестовая подписка отключена или срок её действия закончился.", activation_id, token, tone="error")
-    elif row["browser_hash"] and not hmac.compare_digest(row["browser_hash"], browser_hash):
-        page = _test_activation_page("Подключение уже подтверждено", "Для этой тестовой подписки подтверждение уже закреплено за другим браузером. Сбросить его может администратор тестовой панели.", activation_id, token, tone="error")
+    elif full:
+        page = _test_activation_page("Лимит устройств достигнут",
+            f"Зарегистрировано {registered} из {row['device_limit']} устройств. Новое устройство не подключено. Обратитесь к администратору, если нужно освободить слот.",
+            activation_id, token, limit=int(row["device_limit"]), registered=registered, tone="error")
     else:
         csrf = _test_activation_csrf(token_hash, cookie_value)
-        already = row["activated_at"] is not None
+        selected = known_device["platform"] if known_device else ""
         page = _test_activation_page(
-            "Подтверждение устройства · ТЕСТ",
-            f"Подтвердите браузер подписки {activation_id}. Затем вернитесь в Happ и обновите профиль." if not already
-            else "Этот браузер уже подтверждён. Нажмите кнопку ещё раз, если нужно повторить немедленную синхронизацию Drive.",
-            activation_id, token, csrf, button_text="Повторить синхронизацию" if already else "Подтвердить браузер")
+            "Добавить Secure X в Happ · ТЕСТ",
+            f"Укажите устройство для этой браузерной регистрации. Лимит: {row['device_limit']}. Ссылку установки можно открыть после подтверждения.",
+            activation_id, token, csrf, limit=int(row["device_limit"]), registered=registered,
+            selected_platform=selected, device_registered=known)
     response = HTMLResponse(page, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
     if response_cookie:
         response.set_cookie("test_activation_browser", cookie_value, max_age=365 * 24 * 60 * 60,
@@ -3278,42 +3518,84 @@ async def _test_activation_post(activation_id: str, token: str, request: Request
     if len(body) > 8192:
         raise HTTPException(413, "Слишком большой запрос")
     try:
-        form = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True, max_num_fields=4)
+        form = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True, max_num_fields=6)
     except ValueError:
         raise HTTPException(400, "Некорректная форма подтверждения") from None
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     cookie_value = request.cookies.get("test_activation_browser", "")
     supplied_csrf = (form.get("csrf") or [""])[0]
+    platform = (form.get("platform") or [""])[0]
+    if platform not in TEST_ACTIVATION_PLATFORMS or platform == "unknown":
+        raise HTTPException(422, "Выберите платформу устройства")
     if not re.fullmatch(r"[A-Za-z0-9_-]{30,64}", cookie_value) or not hmac.compare_digest(
             supplied_csrf, _test_activation_csrf(token_hash, cookie_value)):
         raise HTTPException(403, "Подтверждение браузера устарело. Откройте кнопку из Happ ещё раз.")
     browser_hash = _test_activation_browser_hash(cookie_value)
+    browser = _test_activation_browser_name(request.headers.get("user-agent", ""))
+    language = (request.headers.get("accept-language", "").split(",", 1)[0].split(";", 1)[0])[:24]
     pool = await state.db()
+    limit = 1
+    registered = 0
+    already_registered = False
     async with pool.acquire() as conn:
         async with conn.transaction():
-            row = await conn.fetchrow("""SELECT a.user_id,a.browser_hash,a.activated_at,u.name,u.status,u.enabled,u.expires_at
+            row = await conn.fetchrow("""SELECT a.user_id,a.activated_at,a.device_limit,
+                u.name,u.status,u.enabled,u.expires_at
                 FROM test_subscription_activation a JOIN users u ON u.id=a.user_id
                 WHERE a.token_hash=$1 AND a.user_id=$2 FOR UPDATE OF a,u""", token_hash, activation_user_id)
             if not row:
                 raise HTTPException(404, "Тестовая ссылка не найдена или уже сброшена")
             if row["status"] != "active" or not row["enabled"] or (row["expires_at"] and row["expires_at"] <= datetime.now(timezone.utc)):
                 raise HTTPException(409, "Тестовая подписка отключена или срок её действия закончился")
-            if row["browser_hash"] and not hmac.compare_digest(row["browser_hash"], browser_hash):
-                raise HTTPException(409, "Подтверждение уже закреплено за другим браузером")
-            await conn.execute("""UPDATE test_subscription_activation SET browser_hash=$2,
-                activated_at=COALESCE(activated_at,now()),updated_at=now() WHERE user_id=$1""",
-                row["user_id"], browser_hash)
-    delivery = await state.push_drive_sync([int(row["user_id"])])
+            limit = int(row["device_limit"])
+            existing = await conn.fetchrow("""SELECT device_hash FROM test_activation_devices
+                WHERE user_id=$1 AND device_hash=$2 FOR UPDATE""", activation_user_id, browser_hash)
+            registered = int(await conn.fetchval("SELECT count(*) FROM test_activation_devices WHERE user_id=$1", activation_user_id) or 0)
+            if existing:
+                already_registered = True
+                await conn.execute("""UPDATE test_activation_devices SET platform=$3,browser=$4,language=$5,
+                    last_seen_at=now() WHERE user_id=$1 AND device_hash=$2""",
+                    activation_user_id, browser_hash, platform, browser, language)
+            else:
+                if registered >= limit:
+                    denied_page = _test_activation_page("Лимит устройств достигнут",
+                        f"Зарегистрировано {registered} из {limit} устройств. Это устройство не подключено.",
+                        activation_id, token, limit=limit, registered=registered, tone="error")
+                    response = HTMLResponse(denied_page, status_code=409,
+                        headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+                    response.set_cookie("test_activation_browser", cookie_value, max_age=365 * 24 * 60 * 60,
+                        httponly=True, secure=True, samesite="lax", path="/test/activate")
+                    return response
+                await conn.execute("""INSERT INTO test_activation_devices(user_id,device_hash,platform,browser,language)
+                    VALUES($1,$2,$3,$4,$5)""", activation_user_id, browser_hash, platform, browser, language)
+                registered += 1
+            await conn.execute("""UPDATE test_subscription_activation SET activated_at=COALESCE(activated_at,now()),
+                updated_at=now() WHERE user_id=$1""", activation_user_id)
+    delivery = await state.push_drive_sync([activation_user_id])
+    await _ensure_test_activation_encrypted_link(activation_user_id)
+    async with pool.acquire() as conn:
+        link = await conn.fetchval("""SELECT a.encrypted_link FROM test_subscription_activation a
+            JOIN users u ON u.id=a.user_id WHERE a.user_id=$1 AND a.encrypted_for_file_id=u.drive_file_id
+              AND a.encryption_error IS NULL AND u.device_limit_status='ready'""", activation_user_id)
+    share_link = link if delivery.get("ok") and not delivery.get("pending") else None
     if delivery.get("ok") and not delivery.get("pending"):
-        message = "Браузер подтверждён. Тестовый профиль отправлен в Google Drive; обновите Happ. При включённом Geo-лимите также скачайте оба geo-файла."
+        message = ("Регистрация этого браузера уже была сохранена." if already_registered else
+                   "Устройство зарегистрировано. Подписка обновлена; добавьте её в Happ кнопкой ниже.")
         tone = "normal"
     else:
-        message = "Браузер подтверждён, но немедленная синхронизация Drive пока не завершена. Нажмите кнопку повтора позже, затем обновите Happ."
+        message = "Слот сохранён, но Google Drive пока не подтвердил синхронизацию. Happ-ссылка не показывается, пока подготовка не завершена. Повторите позже с этого же браузера."
+        tone = "error"
+    if not share_link:
+        message += " Happ Limited Link ещё не готов или недоступен; подключение закрыто до успешной подготовки ссылки."
         tone = "error"
     csrf = _test_activation_csrf(token_hash, cookie_value)
-    page = _test_activation_page("Подтверждение сохранено · ТЕСТ", message, activation_id, token, csrf,
-                                 button_text="Повторить синхронизацию")
-    return HTMLResponse(page, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+    page = _test_activation_page("Устройство зарегистрировано · ТЕСТ", message, activation_id, token, csrf,
+        limit=limit, registered=registered, selected_platform=platform, device_registered=True,
+        happ_link=share_link, tone=tone)
+    response = HTMLResponse(page, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+    response.set_cookie("test_activation_browser", cookie_value, max_age=365 * 24 * 60 * 60,
+        httponly=True, secure=True, samesite="lax", path="/test/activate")
+    return response
 
 
 async def test_geo_file(user_id: int, signature: str, filename: str, request: Request,
