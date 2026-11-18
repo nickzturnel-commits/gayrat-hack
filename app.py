@@ -3,6 +3,7 @@ import base64
 import logging
 import os
 import re
+import secrets
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -20,6 +21,22 @@ logger = logging.getLogger(__name__)
 
 SUBSCRIPTION_URL = os.getenv("SUBSCRIPTION_URL", "").strip()
 SAS_SUBSCRIPTION_URL = os.getenv("SAS_SUBSCRIPTION_URL", "").strip()
+SUBSCRIPTION_PATH_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{48}$")
+
+
+class _SubscriptionPathLogFilter(logging.Filter):
+    def filter(self, record):
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        message = re.sub(r"(/server/hash/)[A-Za-z0-9_-]{48}", r"\1[hidden]", message)
+        record.msg = message
+        record.args = ()
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_SubscriptionPathLogFilter())
 REFRESH_INTERVAL_SECONDS = 5 * 60
 REQUEST_HEADERS = frozenset(
     {
@@ -360,11 +377,21 @@ async def serve_subscription(request: Request) -> Response:
 
 @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
 async def latest_subscription(request: Request):
-    return await serve_subscription(request)
+    return Response(status_code=200 if request.method == "HEAD" else 404)
 
 
 @app.api_route("/sub.txt", methods=["GET", "HEAD"], include_in_schema=False)
 async def subscription_file(request: Request):
+    return Response(status_code=404)
+
+
+@app.api_route("/server/hash/{path_key}", methods=["GET", "HEAD"], include_in_schema=False)
+async def keyed_subscription(path_key: str, request: Request):
+    expected = os.getenv("SUBSCRIPTION_PATH_KEY", "").strip()
+    if (not SUBSCRIPTION_PATH_KEY_PATTERN.fullmatch(path_key)
+            or not SUBSCRIPTION_PATH_KEY_PATTERN.fullmatch(expected)
+            or not secrets.compare_digest(path_key, expected)):
+        return Response(status_code=404)
     return await serve_subscription(request)
 
 

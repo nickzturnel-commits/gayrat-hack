@@ -1,6 +1,6 @@
 # Secure X VPN subscription relay
 
-FastAPI service with a raw subscription relay and an independent admin panel. Secure X combines the primary provider subscription with the SAS Render subscription source. The relay returns their supported VPN server URIs at `/` and `/sub.txt`; `/health` remains a lightweight health check. Relay request headers and cache are separate from panel synchronization.
+FastAPI service with a subscription relay and an independent admin panel. Secure X combines the primary provider subscription with the SAS subscription source. `/health` remains a lightweight health check. Relay request headers and cache are separate from panel synchronization.
 
 The admin panel manages subscriber profiles and servers in Supabase. Changes made in the panel are pushed immediately to Google Drive through a protected Apps Script Web App. The existing five-minute Apps Script trigger remains as a recovery path. The already-connected legacy Drive file is kept as **Основная (legacy)** so its existing URL remains unchanged. Its real file ID is stored by the application and is intentionally omitted from this documentation. Example only: `YOUR_EXISTING_DRIVE_FILE_ID`.
 
@@ -98,7 +98,7 @@ The admin UI has separate desktop and mobile pages. `/admin` selects a layout us
 
 ## Migration without changing the existing link
 
-1. Configure Render environment variables and deploy this version. Keep the current Apps Script running while Render builds; the public relay endpoints are unchanged.
+1. Configure Render environment variables and deploy this version. Keep the current Apps Script running while Render builds; panel and synchronization API routes remain unchanged.
 2. Confirm `/health` returns `ok`, then open `/admin` and confirm the database status is connected. If it is unavailable, use the Supabase Session Pooler URL.
 3. Confirm the dashboard reports a successful upstream snapshot and a nonzero server count. A failed/empty manifest is not sent to Apps Script as a valid user list, so it cannot overwrite the current Drive file.
 4. Replace the old Apps Script source, set the Script Properties, run `setup()` and `updateSub()` once, then deploy it as a Web App and configure its `/exec` URL as `DRIVE_SYNC_URL`. The legacy subscriber continues writing to its existing Drive file; its Drive API URL does not change.
