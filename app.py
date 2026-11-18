@@ -26,13 +26,11 @@ SUBSCRIPTION_PATH_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{48}$")
 
 class _SubscriptionPathLogFilter(logging.Filter):
     def filter(self, record):
-        try:
-            message = record.getMessage()
-        except Exception:
-            return True
-        message = re.sub(r"(/server/hash/)[A-Za-z0-9_-]{48}", r"\1[hidden]", message)
-        record.msg = message
-        record.args = ()
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
+            args = list(args)
+            args[2] = re.sub(r"(/server/hash/)[A-Za-z0-9_-]{48}", r"\1[hidden]", args[2])
+            record.args = tuple(args)
         return True
 
 
