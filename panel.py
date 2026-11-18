@@ -2236,6 +2236,7 @@ def _test_activation_page(title: str, message: str, activation_id: str, token: s
     return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="color-scheme" content="dark"><meta name="robots" content="noindex,nofollow">
+<link rel="icon" href="/static/favicon.ico?v=20261119-1" sizes="any">
 <title>{title_html}</title><style>
 :root{{color-scheme:dark;background:#0b100e;color:#edf2ed;font:16px/1.55 system-ui,-apple-system,'Segoe UI',sans-serif}}
 *{{box-sizing:border-box}}body{{margin:0;min-height:100dvh;display:grid;place-items:center;padding:24px;background:linear-gradient(145deg,#111c17,#090d0c 65%)}}
@@ -2454,7 +2455,7 @@ async def admin_page():
     # still receive the phone layout when their viewport is narrow.
     return HTMLResponse("""<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
-<meta name=\"color-scheme\" content=\"dark\"><meta name=\"theme-color\" content=\"#0c1110\"><title>Secure X — панель</title></head>
+<meta name=\"color-scheme\" content=\"dark\"><meta name=\"theme-color\" content=\"#0c1110\"><link rel=\"icon\" href=\"/static/favicon.ico?v=20261119-1\" sizes=\"any\"><title>Secure X — панель</title></head>
 <body style=\"margin:0;background:#0c1110;color:#e8efea;font:15px 'Segoe UI',system-ui;display:grid;min-height:100dvh;place-items:center\">
 <p>Открываем панель…</p><script>(()=>{const mobile=matchMedia('(max-width: 760px), (pointer: coarse)').matches;
 location.replace('/admin/'+(mobile?'mobile':'desktop')+location.search+location.hash)})()</script>
@@ -2465,7 +2466,7 @@ location.replace('/admin/'+(mobile?'mobile':'desktop')+location.search+location.
 async def test_page():
     return HTMLResponse("""<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
-<meta name=\"color-scheme\" content=\"dark\"><meta name=\"theme-color\" content=\"#0c1110\"><title>Secure X — ТЕСТ</title></head>
+<meta name=\"color-scheme\" content=\"dark\"><meta name=\"theme-color\" content=\"#0c1110\"><link rel=\"icon\" href=\"/static/favicon.ico?v=20261119-1\" sizes=\"any\"><title>Secure X — ТЕСТ</title></head>
 <body style=\"margin:0;background:#0c1110;color:#e8efea;font:15px 'Segoe UI',system-ui;display:grid;min-height:100dvh;place-items:center\">
 <p>Открываем тестовую панель…</p><script>(()=>{const mobile=matchMedia('(max-width: 760px), (pointer: coarse)').matches;
 location.replace('/test/'+(mobile?'mobile':'desktop')+location.search+location.hash)})()</script>
@@ -3214,9 +3215,9 @@ async def _ensure_activation_import_link(user_id: int, cookie_value: str,
             return None, ("Тестовая подписка отключена или срок её действия закончился."
                           if is_test else "Подписка отключена или срок её действия закончился.")
         if not row["drive_file_id"]:
-            return None, "Профиль ещё создаётся в Google Drive. Повторите подтверждение позже."
+            return None, "Подписка ещё готовится. Повторите подтверждение позже."
         if not row["drive_ready_at"]:
-            return None, "Google Drive ещё не подтвердил полную версию профиля. Повторите подтверждение позже."
+            return None, "Полная подписка ещё готовится. Повторите подтверждение позже."
         if row["subscription_token_hash"] == slot_token_hash and row["encrypted_link"]:
             return str(row["encrypted_link"]), None
 
@@ -3858,8 +3859,8 @@ async def _activation_get_current(activation_id: str, token: str, request: Reque
         if known:
             import_link, import_error = await _ensure_activation_import_link(
                 activation_user_id, cookie_value, str(request.base_url).rstrip("/"), test_mode=test_mode)
-        message = (f"Это устройство уже зарегистрировано. Лимит Render: {row['device_limit']}."
-                   if known else f"Выберите платформу и подтвердите браузер. Лимит Render: {row['device_limit']}.")
+        message = (f"Это устройство уже зарегистрировано. Лимит устройств: {row['device_limit']}."
+                   if known else f"Выберите платформу и подтвердите браузер. Лимит устройств: {row['device_limit']}.")
         if import_error:
             message += " " + import_error
         page = _test_activation_page(
@@ -3988,7 +3989,7 @@ async def _activation_post_current(activation_id: str, token: str, request: Requ
     share_link, link_error = (await _ensure_activation_import_link(
         activation_user_id, cookie_value, str(request.base_url).rstrip("/"), test_mode=test_mode)
         if drive_ready else
-        (None, "Google Drive пока не подтвердил обновление. Повторите подтверждение с этого же браузера позже."))
+        (None, "Подписка ещё готовится. Повторите подтверждение с этого же браузера позже."))
     message = ("Регистрация этого браузера уже была сохранена." if already_registered else
                ("Устройство зарегистрировано. Добавьте индивидуальную тестовую подписку кнопкой ниже."
                 if test_mode else "Устройство зарегистрировано. Добавьте индивидуальную подписку кнопкой ниже."))
@@ -4052,7 +4053,7 @@ async def _activation_slot_subscription_get_current(activation_id: str, slot_tok
         return PlainTextResponse(_test_activation_gate_profile("", "Подписка временно недоступна", test_mode=test_mode),
             headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
     if not row["drive_file_id"]:
-        return PlainTextResponse(_test_activation_gate_profile("", "Профиль готовится в Google Drive", test_mode=test_mode),
+        return PlainTextResponse(_test_activation_gate_profile("", "Профиль подписки готовится", test_mode=test_mode),
             headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
 
     try:
@@ -4064,14 +4065,14 @@ async def _activation_slot_subscription_get_current(activation_id: str, slot_tok
                 or prefix.startswith((b"<!doctype html", b"<html", b"{"))):
             log.info("Render Drive source unavailable: user=%d status=%d content_type=%s",
                      user_id, drive.status_code, content_type or "unspecified")
-            content = _test_activation_gate_profile("", "Google Drive ещё не обновил профиль", test_mode=test_mode)
+            content = _test_activation_gate_profile("", "Профиль подписки ещё готовится", test_mode=test_mode)
         elif not drive.content.strip():
             content = _test_activation_gate_profile("", "Профиль подписки пуст", test_mode=test_mode)
         else:
             content = drive.content
     except (HTTPException, httpx.HTTPError) as exc:
         log.info("Render Drive proxy failed: user=%d reason=%s", user_id, type(exc).__name__)
-        content = _test_activation_gate_profile("", "Google Drive временно недоступен", test_mode=test_mode)
+        content = _test_activation_gate_profile("", "Профиль подписки временно недоступен", test_mode=test_mode)
     return Response(content=content, media_type="text/plain; charset=utf-8", headers={
         "Cache-Control": "no-store, no-cache, must-revalidate",
         "X-Content-Type-Options": "nosniff",
