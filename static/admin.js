@@ -805,7 +805,11 @@
       button.innerHTML = '<span class="spinner"></span><span>Обновляю…</span>';
       try {
         const refreshed = await api('/api/admin/servers/refresh', { method: 'POST', body: {} });
-        toast(resultText(refreshed, `Серверов: ${refreshed.count}`));
+        const counts = refreshed.source_counts;
+        const summary = counts
+          ? `Secure X: ${counts.secure_x} · SAS: ${counts.sas} · порядок обновлён`
+          : `Серверов: ${refreshed.count}`;
+        toast(resultText(refreshed, summary));
         await render();
       } catch (failure) { button.disabled = false; button.innerHTML = `${svg('refresh')}<span>Обновить источники</span>`; toast(failure.message); }
     });
@@ -815,7 +819,11 @@
       button.innerHTML = '<span class="spinner"></span><span>Обновляю кэш…</span>';
       try {
         const refreshed = await api('/api/admin/cache/refresh', { method: 'POST', body: {} });
-        toast(resultText(refreshed, `${testMode ? 'Тестовый кэш' : 'Кэш'} обновлён · серверов: ${refreshed.count}`));
+        const counts = refreshed.source_counts;
+        const summary = counts
+          ? `${testMode ? 'Тестовый кэш' : 'Кэш'} обновлён · Secure X: ${counts.secure_x} · SAS: ${counts.sas} · порядок обновлён`
+          : `${testMode ? 'Тестовый кэш' : 'Кэш'} обновлён · серверов: ${refreshed.count}`;
+        toast(resultText(refreshed, summary));
         await render();
       } catch (failure) { button.disabled = false; button.innerHTML = `${svg('refresh')}<span>${testMode ? 'Обновить кэш · ТЕСТ' : 'Обновить кэш'}</span>`; toast(failure.message); }
     });
