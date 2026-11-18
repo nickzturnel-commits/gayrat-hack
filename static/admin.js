@@ -19,11 +19,12 @@
   if (testMode) {
     document.body.classList.add('test-environment');
     const banner = document.createElement('div');
-    banner.textContent = '🧪 ТЕСТОВАЯ СРЕДА · отдельные подписки и настройки';
+    banner.textContent = '🧪 ТЕСТОВАЯ СРЕДА · данные изолированы';
+    banner.className = 'environment-banner test-banner';
     banner.setAttribute('role', 'status');
-    banner.style.cssText = 'position:sticky;top:0;z-index:10000;padding:9px 14px;text-align:center;background:#9b4d12;color:#fff;font:700 13px system-ui;letter-spacing:.03em;box-shadow:0 2px 12px #0008';
     document.body.prepend(banner);
   }
+  $$('[data-home-link]').forEach(link => { link.href = testMode ? '/test' : '/admin'; });
 
   function toast(message) {
     const node = $('#toast');
