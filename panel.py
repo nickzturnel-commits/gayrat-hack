@@ -1581,8 +1581,8 @@ async def admin_page():
     # still receive the phone layout when their viewport is narrow.
     return HTMLResponse("""<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
-<meta name=\"color-scheme\" content=\"light\"><meta name=\"theme-color\" content=\"#f3f2ec\"><title>Secure X — панель</title></head>
-<body style=\"margin:0;background:#f3f2ec;color:#1d2a23;font:15px 'Segoe UI',system-ui;display:grid;min-height:100dvh;place-items:center\">
+<meta name=\"color-scheme\" content=\"dark\"><meta name=\"theme-color\" content=\"#0c1110\"><title>Secure X — панель</title></head>
+<body style=\"margin:0;background:#0c1110;color:#e8efea;font:15px 'Segoe UI',system-ui;display:grid;min-height:100dvh;place-items:center\">
 <p>Открываем панель…</p><script>(()=>{const mobile=matchMedia('(max-width: 760px), (pointer: coarse)').matches;
 location.replace('/admin/'+(mobile?'mobile':'desktop')+location.search+location.hash)})()</script>
 <noscript><p><a href=\"/admin/mobile\">Телефон</a> · <a href=\"/admin/desktop\">Компьютер</a></p></noscript>
@@ -1592,8 +1592,8 @@ location.replace('/admin/'+(mobile?'mobile':'desktop')+location.search+location.
 async def test_page():
     return HTMLResponse("""<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">
-<meta name=\"color-scheme\" content=\"light\"><meta name=\"theme-color\" content=\"#f3f2ec\"><title>Secure X — ТЕСТ</title></head>
-<body style=\"margin:0;background:#f3f2ec;color:#1d2a23;font:15px 'Segoe UI',system-ui;display:grid;min-height:100dvh;place-items:center\">
+<meta name=\"color-scheme\" content=\"dark\"><meta name=\"theme-color\" content=\"#0c1110\"><title>Secure X — ТЕСТ</title></head>
+<body style=\"margin:0;background:#0c1110;color:#e8efea;font:15px 'Segoe UI',system-ui;display:grid;min-height:100dvh;place-items:center\">
 <p>Открываем тестовую панель…</p><script>(()=>{const mobile=matchMedia('(max-width: 760px), (pointer: coarse)').matches;
 location.replace('/test/'+(mobile?'mobile':'desktop')+location.search+location.hash)})()</script>
 <noscript><p><a href=\"/test/mobile\">Телефон</a> · <a href=\"/test/desktop\">Компьютер</a></p></noscript>
