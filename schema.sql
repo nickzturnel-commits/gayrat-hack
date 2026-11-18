@@ -55,10 +55,15 @@ CREATE TABLE IF NOT EXISTS servers (
     custom_name TEXT,
     hidden BOOLEAN NOT NULL DEFAULT FALSE,
     sort_order INTEGER NOT NULL DEFAULT 0,
+    provider_order INTEGER NOT NULL DEFAULT 0,
     present_upstream BOOLEAN NOT NULL DEFAULT TRUE,
     first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE servers ADD COLUMN IF NOT EXISTS provider_order INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS servers_stale_cleanup_idx
+    ON servers(last_seen_at) WHERE present_upstream=FALSE;
 
 -- Existing databases may have been created before provider-name identity was added.
 ALTER TABLE servers ADD COLUMN IF NOT EXISTS source_key TEXT;

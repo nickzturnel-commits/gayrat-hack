@@ -24,6 +24,7 @@ from urllib.parse import quote, unquote, urlencode, urlsplit
 import asyncpg
 import httpx
 import qrcode
+import yaml
 from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -45,13 +46,18 @@ ASHGABAT_WEATHER_UNAVAILABLE = "🌡 Ашхабад: текущая погода
 UPSTREAM_TIMEOUT_SECONDS = 20.0
 PANEL_CACHE_TTL_SECONDS = 300
 GEO_FILE_CACHE_TTL_SECONDS = 24 * 60 * 60
+SERVER_STALE_RETENTION_DAYS = 60
 SESSION_SECONDS = 12 * 60 * 60
 DB_HINT = ("Не удалось подключиться к базе. Если используется прямой хост db.*.supabase.co, "
            "возьмите в Supabase (Connect → Session pooler) строку подключения и поставьте её в DATABASE_URL")
-URI_LINE = re.compile(r"(?i)^\s*(?:vless|vmess|trojan|ss|hysteria2?|tuic)://")
-URI_ANY = re.compile(r"(?i)(?:vless|vmess|trojan|ss|hysteria2?|tuic)://")
+URI_LINE = re.compile(r"(?i)^\s*(?:vless|vmess|trojan|ssr?|hysteria2?|hy2|tuic|socks5?|https?|wireguard|anytls|ssh|mieru)://")
+URI_ANY = re.compile(r"(?i)(?:vless|vmess|trojan|ssr?|hysteria2?|hy2|tuic|socks5?|https?|wireguard|anytls|ssh|mieru)://")
 DEVICE_MARKERS = (b"device limit full", b"remove a device first")
 SKIP_UPSTREAM_HEADERS = {"host", "content-length", "connection", "accept-encoding"}
+
+
+class UnsupportedProxyConfig(ValueError):
+    """A source contains proxy entries that cannot safely be converted yet."""
 
 DAY_DEFAULTS = ["💪 Понедельник — начинаем бодро", "🔥 Вторник — продуктивного дня", "⚡ Среда — середина недели",
                 "😎 Четверг — почти пятница", "🎉 Пятница — выходные близко", "🛋 Суббота — отдыхаем", "🌴 Воскресенье — набираемся сил"]
@@ -139,13 +145,21 @@ def _xray_json_uris(text: str) -> list[str] | None:
     if not documents:
         return None
 
-    by_identity: dict[str, tuple[int, str]] = {}
+    by_identity: dict[tuple[str, str], tuple[int, str]] = {}
+    best_rank_by_connection: dict[str, int] = {}
+    unsupported: set[str] = set()
 
     def add_link(uri: str, rank: int):
         try:
-            identity = parse_server_uri(uri)["id"]
+            parsed = parse_server_uri(uri)
+            # Keep provider entries with the same connection credentials but
+            # different display labels. The label is part of what the user
+            # expects to see in Happ, even when both entries route identically.
+            identity = (parsed["id"], parsed["source_key"])
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
             return
+        best_rank_by_connection[parsed["id"]] = max(
+            rank, best_rank_by_connection.get(parsed["id"], -1))
         previous = by_identity.get(identity)
         if previous is None or rank > previous[0]:
             by_identity[identity] = (rank, uri)
@@ -168,6 +182,67 @@ def _xray_json_uris(text: str) -> list[str] | None:
         query = urlencode(params, doseq=True, quote_via=quote, safe="")
         return f"{scheme}://{userinfo}@{host}:{port}?{query}#{quote(label, safe='')}"
 
+    def outbound_label(outbound: dict, profile_name: str, fallback: str,
+                       *, singleton: bool, protocol: str) -> tuple[str, int]:
+        tag = str(outbound.get("remarks") or outbound.get("tag") or "").strip()
+        generic = bool(re.fullmatch(
+            rf"(?:proxy|outbound|{re.escape(protocol)})(?:[-_ ]?\d+)?", tag, flags=re.I))
+        if tag and not generic:
+            return tag, 2
+        if singleton and profile_name and not re.search(r"(?i)auto|автовыбор|selector", profile_name):
+            return profile_name, 3
+        if profile_name and not re.search(r"(?i)auto|автовыбор|selector", profile_name):
+            return profile_name, 1
+        return fallback, 0
+
+    def transport_values(stream: dict, network: str) -> dict:
+        return stream.get(f"{network}Settings") if isinstance(stream.get(f"{network}Settings"), dict) else {}
+
+    def append_transport_params(params: list[tuple[str, str]], network: str, connection: dict):
+        if network in {"ws", "httpupgrade"}:
+            path = connection.get("path")
+            host_header = connection.get("host")
+            if network == "ws" and isinstance(connection.get("headers"), dict):
+                host_header = connection["headers"].get("Host") or host_header
+            if isinstance(path, str) and path:
+                params.append(("path", path))
+            if isinstance(host_header, str) and host_header:
+                params.append(("host", host_header))
+        elif network == "grpc":
+            service_name = connection.get("serviceName")
+            authority = connection.get("authority")
+            if isinstance(service_name, str) and service_name:
+                params.append(("serviceName", service_name))
+            if isinstance(authority, str) and authority:
+                params.append(("authority", authority))
+            mode = connection.get("mode")
+            if not isinstance(mode, str) or not mode:
+                mode = "multi" if connection.get("multiMode") else "gun"
+            if mode != "gun":
+                params.append(("mode", mode))
+        elif network == "xhttp":
+            for key in ("path", "host", "mode"):
+                value = connection.get(key)
+                if isinstance(value, str) and value:
+                    params.append((key, value))
+            extra = connection.get("extra")
+            if isinstance(extra, dict):
+                params.append(("extra", json.dumps(extra, separators=(",", ":"), ensure_ascii=False)))
+            elif isinstance(extra, str) and extra:
+                params.append(("extra", extra))
+        elif network == "tcp":
+            header = connection.get("header")
+            if isinstance(header, dict) and isinstance(header.get("type"), str) and header["type"] != "none":
+                params.append(("headerType", header["type"]))
+                request = header.get("request") if isinstance(header.get("request"), dict) else {}
+                path_values = request.get("path")
+                if isinstance(path_values, list) and path_values:
+                    params.append(("path", ",".join(str(item) for item in path_values)))
+                request_headers = request.get("headers") if isinstance(request.get("headers"), dict) else {}
+                host_values = request_headers.get("Host")
+                if isinstance(host_values, list) and host_values:
+                    params.append(("host", ",".join(str(item) for item in host_values)))
+
     for profile in documents:
         outbounds = profile["outbounds"]
         if not isinstance(outbounds, list):
@@ -182,6 +257,10 @@ def _xray_json_uris(text: str) -> list[str] | None:
                 continue
             protocol = str(outbound.get("protocol", "")).lower()
             settings = outbound.get("settings") if isinstance(outbound.get("settings"), dict) else {}
+            if protocol not in {"ss", "shadowsocks", "trojan", "vmess", "vless", "freedom", "blackhole", "dns", "loopback", "direct"}:
+                if isinstance(settings.get("servers"), list) or isinstance(settings.get("vnext"), list):
+                    unsupported.add(protocol or "unknown")
+                continue
             if protocol in {"ss", "shadowsocks"}:
                 servers = settings.get("servers")
                 if not isinstance(servers, list):
@@ -202,6 +281,102 @@ def _xray_json_uris(text: str) -> list[str] | None:
                     add_link(f"ss://{auth}@{host}:{port}#{quote(label, safe='')}", 2 if remark else 0)
                 continue
 
+            if protocol in {"trojan", "vmess"}:
+                servers = settings.get("servers") if protocol == "trojan" else settings.get("vnext")
+                if not isinstance(servers, list):
+                    continue
+                stream = outbound.get("streamSettings") if isinstance(outbound.get("streamSettings"), dict) else {}
+                network = str(stream.get("network") or "tcp").lower()
+                if network not in {"tcp", "kcp", "ws", "http", "grpc", "httpupgrade", "xhttp"}:
+                    unsupported.add(f"{protocol}/{network}")
+                    continue
+                security = str(stream.get("security") or ("tls" if protocol == "trojan" else "none")).lower()
+                if security not in ({"tls", "none"} if protocol == "trojan" else {"tls", "none"}):
+                    unsupported.add(f"{protocol}/{security}")
+                    continue
+                tls = stream.get("tlsSettings") if isinstance(stream.get("tlsSettings"), dict) else {}
+                connection = transport_values(stream, network)
+                outbound_tag = str(outbound.get("remarks") or outbound.get("tag") or "").strip()
+                eligible_count = sum(
+                    1 for candidate in outbounds
+                    if isinstance(candidate, dict)
+                    and str(candidate.get("protocol", "")).lower() == protocol
+                )
+
+                for index, server in enumerate(servers, 1):
+                    if not isinstance(server, dict):
+                        continue
+                    endpoint = valid_endpoint(server.get("address"), server.get("port"))
+                    if endpoint is None:
+                        continue
+                    host, port = endpoint
+                    if protocol == "trojan":
+                        password = server.get("password")
+                        if not isinstance(password, str) or not password:
+                            continue
+                        params: list[tuple[str, str]] = [("type", network)]
+                        if security == "tls":
+                            params.append(("security", "tls"))
+                            for key, uri_key in (("serverName", "sni"), ("fingerprint", "fp")):
+                                value = tls.get(key)
+                                if isinstance(value, str) and value:
+                                    params.append((uri_key, value))
+                            alpn = tls.get("alpn")
+                            if isinstance(alpn, list) and alpn:
+                                params.append(("alpn", ",".join(str(item) for item in alpn)))
+                        append_transport_params(params, network, connection)
+                        label, rank = outbound_label(
+                            outbound, profile_name, f"{host}:{port}",
+                            singleton=eligible_count == 1, protocol=protocol)
+                        if len(servers) > 1 and (outbound_tag or profile_name):
+                            label = f"{label} {index}"
+                        add_link(query_uri("trojan", quote(password, safe="-._~"), host,
+                                           port, params, label), rank)
+                        continue
+
+                    users = server.get("users")
+                    if not isinstance(users, list):
+                        continue
+                    for user_index, user in enumerate(users, 1):
+                        if not isinstance(user, dict) or not isinstance(user.get("id"), str) or not user["id"].strip():
+                            continue
+                        if security == "tls" and not tls:
+                            tls = {}
+                        label, rank = outbound_label(
+                            outbound, profile_name, f"{host}:{port}",
+                            singleton=eligible_count == 1, protocol=protocol)
+                        if len(servers) > 1:
+                            label = f"{label} {index}"
+                        if len(users) > 1:
+                            label = f"{label} {user_index}"
+                        header = connection.get("header") if isinstance(connection.get("header"), dict) else {}
+                        host_header = connection.get("host")
+                        if network == "ws" and isinstance(connection.get("headers"), dict):
+                            host_header = connection["headers"].get("Host") or host_header
+                        vmess_obj = {
+                            "v": "2", "ps": label, "add": host.strip("[]"), "port": str(port),
+                            "id": user["id"].strip(), "aid": str(user.get("alterId", 0)),
+                            "scy": str(user.get("security") or "auto"), "net": network,
+                            "type": str(header.get("type") or "none"),
+                            "host": str(host_header or tls.get("serverName") or ""),
+                            "path": str(connection.get("path") or ""),
+                        }
+                        if security == "tls":
+                            vmess_obj["tls"] = "tls"
+                            if tls.get("serverName"):
+                                vmess_obj["sni"] = tls["serverName"]
+                            if tls.get("fingerprint"):
+                                vmess_obj["fp"] = tls["fingerprint"]
+                            if isinstance(tls.get("alpn"), list):
+                                vmess_obj["alpn"] = ",".join(str(item) for item in tls["alpn"])
+                        if network == "grpc" and connection.get("serviceName"):
+                            vmess_obj["path"] = connection["serviceName"]
+                            vmess_obj["type"] = "multi" if connection.get("multiMode") else "gun"
+                        encoded = base64.b64encode(json.dumps(
+                            vmess_obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).decode("ascii")
+                        add_link("vmess://" + encoded, rank)
+                continue
+
             if protocol != "vless":
                 continue
             vnext = settings.get("vnext")
@@ -210,8 +385,12 @@ def _xray_json_uris(text: str) -> list[str] | None:
             stream = outbound.get("streamSettings") if isinstance(outbound.get("streamSettings"), dict) else {}
             network = str(stream.get("network") or "tcp").lower()
             if network not in {"tcp", "kcp", "ws", "http", "grpc", "httpupgrade", "xhttp"}:
+                unsupported.add(f"{protocol}/{network}")
                 continue
             security = str(stream.get("security") or "none").lower()
+            if security not in {"none", "tls", "reality"}:
+                unsupported.add(f"{protocol}/{security}")
+                continue
             tls = stream.get("tlsSettings") if isinstance(stream.get("tlsSettings"), dict) else {}
             reality = stream.get("realitySettings") if isinstance(stream.get("realitySettings"), dict) else {}
             transport = {
@@ -343,7 +522,269 @@ def _xray_json_uris(text: str) -> list[str] | None:
                     uri = query_uri("vless", quote(user["id"].strip(), safe="-._~"), host, port, params, label)
                     add_link(uri, rank)
 
-    return [uri for _rank, uri in by_identity.values()]
+    # Xray profile lists often repeat a generic auto-selector beside the
+    # individually named nodes. Drop only that lower-ranked generic alias;
+    # retain distinct provider labels for the same connection.
+    if unsupported:
+        raise UnsupportedProxyConfig(
+            "В JSON найдены неподдерживаемые прокси-конфиги: " + ", ".join(sorted(unsupported)))
+    converted = [uri for (connection_id, _name), (rank, uri) in by_identity.items()
+                 if rank >= best_rank_by_connection.get(connection_id, rank)]
+    return converted or None
+
+
+def _singbox_json_uris(text: str) -> list[str] | None:
+    """Convert common sing-box proxy outbounds to Happ-compatible share links."""
+    try:
+        document = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    documents = document if isinstance(document, list) else [document]
+    documents = [item for item in documents if isinstance(item, dict) and isinstance(item.get("outbounds"), list)]
+    if not documents:
+        return None
+
+    converted: list[str] = []
+    supported = {"vless", "vmess", "trojan", "shadowsocks", "hysteria", "hysteria2", "tuic", "socks", "http", "anytls", "ssh"}
+    unsupported: set[str] = set()
+    for profile in documents:
+        profile_name = str(profile.get("remarks") or profile.get("name") or "").strip()
+        for outbound in profile["outbounds"]:
+            if not isinstance(outbound, dict):
+                continue
+            protocol = str(outbound.get("type") or "").lower()
+            if protocol not in supported:
+                if outbound.get("server") and outbound.get("server_port"):
+                    unsupported.add(protocol or "unknown")
+                continue
+            host_value = outbound.get("server")
+            port_value = outbound.get("server_port")
+            endpoint = _parse_config_endpoint(host_value, port_value)
+            if endpoint is None:
+                continue
+            host, port = endpoint
+            label = str(outbound.get("tag") or outbound.get("name") or profile_name or f"{host}:{port}").strip()
+            tls = outbound.get("tls") if isinstance(outbound.get("tls"), dict) else {}
+            transport = outbound.get("transport") if isinstance(outbound.get("transport"), dict) else {}
+            network = str(transport.get("type") or "tcp").lower()
+            if network not in {"tcp", "ws", "http", "grpc", "httpupgrade", "xhttp"}:
+                unsupported.add(f"{protocol}/{network}")
+                continue
+            params: list[tuple[str, str]] = []
+            server_name = tls.get("server_name") or tls.get("serverName")
+            utls = tls.get("utls") if isinstance(tls.get("utls"), dict) else {}
+            fingerprint = utls.get("fingerprint") or tls.get("fingerprint")
+            alpn = tls.get("alpn")
+            if isinstance(server_name, str) and server_name:
+                params.append(("sni", server_name))
+            if isinstance(fingerprint, str) and fingerprint:
+                params.append(("fp", fingerprint))
+            if isinstance(alpn, list) and alpn:
+                params.append(("alpn", ",".join(str(item) for item in alpn)))
+            if tls.get("insecure") is True:
+                params.append(("insecure", "1"))
+            if network in {"ws", "httpupgrade", "xhttp"}:
+                path = transport.get("path")
+                headers = transport.get("headers") if isinstance(transport.get("headers"), dict) else {}
+                ws_host = headers.get("Host") or headers.get("host")
+                if isinstance(path, str) and path:
+                    params.append(("path", path))
+                if isinstance(ws_host, str) and ws_host:
+                    params.append(("host", ws_host))
+                if network == "xhttp" and transport.get("mode"):
+                    params.append(("mode", str(transport["mode"])))
+            elif network == "grpc":
+                for key in ("service_name", "authority", "mode"):
+                    if isinstance(transport.get(key), str) and transport[key]:
+                        params.append(("serviceName" if key == "service_name" else key, transport[key]))
+
+            if protocol == "vless":
+                user_id = outbound.get("uuid")
+                if not isinstance(user_id, str) or not user_id:
+                    continue
+                params.insert(0, ("encryption", str(outbound.get("encryption") or "none")))
+                params.insert(1, ("type", network))
+                if outbound.get("flow"):
+                    params.append(("flow", str(outbound["flow"])))
+                reality = tls.get("reality") if isinstance(tls.get("reality"), dict) else {}
+                if tls.get("enabled") or reality.get("enabled"):
+                    params.append(("security", "reality" if reality.get("enabled") else "tls"))
+                if reality.get("public_key"):
+                    params.append(("pbk", str(reality["public_key"])))
+                if reality.get("short_id"):
+                    params.append(("sid", str(reality["short_id"])))
+                if reality.get("spider_x"):
+                    params.append(("spx", str(reality["spider_x"])))
+                converted.append(_make_query_share("vless", quote(user_id, safe="-._~"), host, port, params, label))
+            elif protocol == "trojan":
+                password = outbound.get("password")
+                if not isinstance(password, str) or not password:
+                    continue
+                params.insert(0, ("type", network))
+                if tls.get("enabled") is not False and not any(key == "sni" for key, _ in params):
+                    params.append(("security", "tls"))
+                converted.append(_make_query_share("trojan", quote(password, safe="-._~"), host, port, params, label))
+            elif protocol == "shadowsocks":
+                method, password = outbound.get("method"), outbound.get("password")
+                if not isinstance(method, str) or not isinstance(password, str) or not password:
+                    continue
+                auth = base64.urlsafe_b64encode(f"{method}:{password}".encode()).decode().rstrip("=")
+                converted.append(f"ss://{auth}@{host}:{port}#{quote(label, safe='')}")
+            elif protocol == "vmess":
+                user_id = outbound.get("uuid")
+                if not isinstance(user_id, str) or not user_id:
+                    continue
+                vmess = {"v": "2", "ps": label, "add": host.strip("[]"), "port": str(port),
+                         "id": user_id, "aid": str(outbound.get("alter_id", 0)),
+                         "scy": str(outbound.get("security") or "auto"), "net": network,
+                         "type": "none", "host": str(transport.get("headers", {}).get("Host", "")
+                         if isinstance(transport.get("headers"), dict) else ""),
+                         "path": str(transport.get("path") or "")}
+                if tls.get("enabled"):
+                    vmess["tls"] = "tls"
+                    if server_name:
+                        vmess["sni"] = server_name
+                    if fingerprint:
+                        vmess["fp"] = fingerprint
+                    if isinstance(alpn, list):
+                        vmess["alpn"] = ",".join(str(item) for item in alpn)
+                encoded = base64.b64encode(json.dumps(vmess, separators=(",", ":"), ensure_ascii=False).encode()).decode()
+                converted.append("vmess://" + encoded)
+            elif protocol in {"hysteria", "hysteria2", "tuic"}:
+                password = str(outbound.get("password") or "")
+                if protocol == "tuic":
+                    user_id = str(outbound.get("uuid") or "")
+                    if not user_id or not password:
+                        continue
+                    userinfo = quote(user_id, safe="-._~") + ":" + quote(password, safe="-._~")
+                    for source_key, uri_key in (("congestion_control", "congestion_control"),
+                                                ("udp_relay_mode", "udp_relay_mode")):
+                        if outbound.get(source_key):
+                            params.append((uri_key, str(outbound[source_key])))
+                    scheme = "tuic"
+                elif protocol == "hysteria2":
+                    if not password:
+                        continue
+                    userinfo, scheme = quote(password, safe="-._~"), "hysteria2"
+                    obfs = outbound.get("obfs") if isinstance(outbound.get("obfs"), dict) else {}
+                    if obfs.get("type"):
+                        params.append(("obfs", str(obfs["type"])))
+                    if obfs.get("password"):
+                        params.append(("obfs-password", str(obfs["password"])))
+                else:
+                    auth = str(outbound.get("auth_str") or password)
+                    if not auth:
+                        continue
+                    userinfo, scheme = quote(auth, safe="-._~"), "hysteria"
+                    for source_key, uri_key in (("up_mbps", "upmbps"), ("down_mbps", "downmbps")):
+                        if outbound.get(source_key) is not None:
+                            params.append((uri_key, str(outbound[source_key])))
+                    if outbound.get("obfs"):
+                        params.append(("obfs", str(outbound["obfs"])))
+                converted.append(_make_query_share(scheme, userinfo, host, port, params, label))
+            elif protocol == "anytls":
+                password = outbound.get("password")
+                if not isinstance(password, str) or not password:
+                    continue
+                converted.append(_make_query_share("anytls", quote(password, safe="-._~"), host, port, params, label))
+            elif protocol == "ssh":
+                user = quote(str(outbound.get("username") or "root"), safe="-._~")
+                password = outbound.get("password")
+                userinfo = user + (":" + quote(str(password), safe="-._~") if password else "")
+                converted.append(f"ssh://{userinfo}@{host}:{port}#{quote(label, safe='')}")
+            elif protocol in {"socks", "http"}:
+                scheme = "socks5" if protocol == "socks" else "http"
+                user = str(outbound.get("username") or "")
+                password = str(outbound.get("password") or "")
+                userinfo = quote(user, safe="-._~")
+                if password:
+                    userinfo += ":" + quote(password, safe="-._~")
+                auth = userinfo + "@" if userinfo else ""
+                converted.append(f"{scheme}://{auth}{host}:{port}#{quote(label, safe='')}")
+    if unsupported:
+        raise UnsupportedProxyConfig(
+            "В sing-box JSON найдены неподдерживаемые прокси-конфиги: " + ", ".join(sorted(unsupported)))
+    return converted or None
+
+
+def _parse_config_endpoint(host_value, port_value):
+    if not isinstance(host_value, str) or isinstance(port_value, bool):
+        return None
+    host = host_value.strip()
+    try:
+        port = int(port_value)
+    except (TypeError, ValueError):
+        return None
+    if not host or any(char.isspace() for char in host) or not 1 <= port <= 65535:
+        return None
+    return (f"[{host}]" if ":" in host and not host.startswith("[") else host, port)
+
+
+def _make_query_share(scheme: str, userinfo: str, host: str, port: int,
+                      params: list[tuple[str, str]], label: str) -> str:
+    query = urlencode(params, doseq=True, quote_via=quote, safe="")
+    return f"{scheme}://{userinfo}@{host}:{port}" + (f"?{query}" if query else "") + f"#{quote(label, safe='')}"
+
+
+def _clash_yaml_uris(text: str) -> list[str] | None:
+    """Read Clash proxy lists and translate their common protocols to URI links."""
+    try:
+        document = yaml.safe_load(text)
+    except (yaml.YAMLError, TypeError, ValueError):
+        return None
+    if not isinstance(document, dict) or not isinstance(document.get("proxies"), list):
+        return None
+    normalized = []
+    for proxy in document["proxies"]:
+        if not isinstance(proxy, dict):
+            continue
+        kind = str(proxy.get("type") or "").lower()
+        if kind not in {"vless", "vmess", "trojan", "ss", "shadowsocks", "hysteria", "hysteria2", "tuic", "socks5", "http", "anytls", "ssh"}:
+            raise UnsupportedProxyConfig(
+                f"В Clash YAML найден неподдерживаемый прокси-конфиг: {kind or 'unknown'}")
+        if kind == "ss":
+            kind = "shadowsocks"
+        elif kind == "socks5":
+            kind = "socks"
+        network = str(proxy.get("network") or "tcp").lower()
+        transport: dict = {"type": network}
+        ws = proxy.get("ws-opts") if isinstance(proxy.get("ws-opts"), dict) else {}
+        grpc = proxy.get("grpc-opts") if isinstance(proxy.get("grpc-opts"), dict) else {}
+        if network in {"ws", "httpupgrade"}:
+            transport["path"] = ws.get("path")
+            transport["headers"] = ws.get("headers") or {}
+        elif network == "grpc":
+            transport["service_name"] = grpc.get("grpc-service-name")
+            transport["mode"] = grpc.get("grpc-mode")
+        reality = proxy.get("reality-opts") if isinstance(proxy.get("reality-opts"), dict) else {}
+        tls = {"enabled": bool(proxy.get("tls") or proxy.get("servername") or reality),
+               "server_name": proxy.get("servername") or proxy.get("sni"),
+               "insecure": bool(proxy.get("skip-cert-verify")),
+               "alpn": proxy.get("alpn"), "utls": {"fingerprint": proxy.get("client-fingerprint")},
+               "reality": {"enabled": bool(reality), "public_key": reality.get("public-key"),
+                           "short_id": reality.get("short-id"), "spider_x": reality.get("spider-x")}}
+        item = {"type": kind, "tag": proxy.get("name"), "server": proxy.get("server"),
+                "server_port": proxy.get("port"), "uuid": proxy.get("uuid"),
+                "password": proxy.get("password"), "username": proxy.get("username") or proxy.get("user"),
+                "method": proxy.get("cipher"),
+                "alter_id": proxy.get("alterId", 0), "security": proxy.get("cipher"),
+                "flow": proxy.get("flow"), "tls": tls, "transport": transport,
+                "obfs": {"type": proxy.get("obfs"), "password": proxy.get("obfs-password")},
+                "auth_str": proxy.get("auth-str"), "up_mbps": proxy.get("up-mbps"),
+                "down_mbps": proxy.get("down-mbps")}
+        if kind == "tuic":
+            item["congestion_control"] = proxy.get("congestion-controller") or proxy.get("congestion_control")
+            item["udp_relay_mode"] = proxy.get("udp-relay-mode") or proxy.get("udp_relay_mode")
+        normalized.append(item)
+    return _singbox_json_uris(json.dumps({"outbounds": normalized}, ensure_ascii=False))
+
+
+def _structured_config_uris(text: str) -> list[str] | None:
+    for parser in (_xray_json_uris, _singbox_json_uris, _clash_yaml_uris):
+        converted = parser(text)
+        if converted:
+            return converted
+    return None
 
 
 def _decode_subscription(body: bytes) -> str:
@@ -358,9 +799,11 @@ def _decode_subscription(body: bytes) -> str:
         decoded_text = decoded.decode("utf-8-sig").strip()
         if URI_ANY.search(decoded_text):
             return decoded_text
-        converted = _xray_json_uris(decoded_text)
+        converted = _structured_config_uris(decoded_text)
         if converted:
             return "\n".join(converted)
+    except UnsupportedProxyConfig:
+        raise
     except (ValueError, UnicodeDecodeError):
         pass
     return text
@@ -422,7 +865,7 @@ def _extract_uris(text: str) -> list[str]:
     # `#Germany West` is valid input for clients even though it contains spaces.
     # Only allow those spaces after `#`; whitespace in the connection part
     # would make the URI ambiguous and is treated as malformed.
-    converted = _xray_json_uris(text)
+    converted = _structured_config_uris(text)
     if converted is not None:
         text = "\n".join(converted)
     uris = []
@@ -437,11 +880,12 @@ def _extract_uris(text: str) -> list[str]:
         if not separator and any(char.isspace() for char in candidate):
             continue
         try:
-            server_id = parse_server_uri(candidate)["id"]
+            parsed = parse_server_uri(candidate)
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
             continue
-        if server_id not in seen:
-            seen.add(server_id)
+        entry_key = (parsed["id"], parsed["source_key"])
+        if entry_key not in seen:
+            seen.add(entry_key)
             uris.append(candidate)
     return uris
 
@@ -472,6 +916,8 @@ def _invalid_payload(body: bytes, content_type: str) -> str | None:
             return "Апстрим не содержит поддерживаемых VPN-серверов"
         for uri in uris:
             parse_server_uri(uri)
+    except UnsupportedProxyConfig as exc:
+        return str(exc)
     except Exception:
         return "Апстрим вернул некорректную запись сервера"
     return None
@@ -1355,21 +1801,39 @@ async def _sync_servers(conn, body: bytes, *, primary_body: bytes | None = None,
     if not uris:
         raise HTTPException(502, "В списке апстрима нет VPN-серверов")
     parsed = [parse_server_uri(uri) for uri in uris]
-    primary_ids: set[str] = set()
-    sas_ids: set[str] = set()
+    primary_entries: set[tuple[str, str]] = set()
+    sas_entries: set[tuple[str, str]] = set()
     if primary_body is not None:
-        primary_ids = {parse_server_uri(uri)["id"] for uri in
-                       _extract_uris(_decode_subscription(primary_body))}
+        primary_entries = {(server["id"], server["source_key"]) for server in
+                           (parse_server_uri(uri) for uri in
+                            _extract_uris(_decode_subscription(primary_body)))}
     if sas_body is not None:
-        sas_ids = {parse_server_uri(uri)["id"] for uri in
-                   _extract_uris(_decode_subscription(sas_body))
-                   if not is_excluded_sas_server(uri)}
+        sas_entries = {(server["id"], server["source_key"]) for server in
+                       (parse_server_uri(uri) for uri in
+                        _extract_uris(_decode_subscription(sas_body))
+                        if not is_excluded_sas_server(uri))}
     for server in parsed:
-        server["source"] = ("sas" if server["id"] in sas_ids and server["id"] not in primary_ids
+        entry = (server["id"], server["source_key"])
+        server["source"] = ("sas" if entry in sas_entries and entry not in primary_entries
                             else "primary")
+
+    # A provider can publish several named entries that share the same
+    # connection URI. Keep each label as a separate row/profile item.
+    identity_groups: dict[str, list[dict]] = {}
+    for server in parsed:
+        identity_groups.setdefault(server["id"], []).append(server)
+    for identity, aliases in identity_groups.items():
+        if len(aliases) < 2:
+            continue
+        for server in aliases:
+            alias_key = server.get("source_key") or _server_name_key(server.get("name", ""))
+            server["id"] = hashlib.sha256(
+                f"provider-alias\0{identity}\0{alias_key}".encode("utf-8")
+            ).hexdigest()[:24]
+
     async with conn.transaction():
         existing = await conn.fetch("""SELECT id,original_name,source_key,source,custom_name,hidden,sort_order,
-            present_upstream,first_seen_at,last_seen_at FROM servers""")
+            provider_order,present_upstream,first_seen_at,last_seen_at FROM servers""")
         counts = await conn.fetch("SELECT server_id,COUNT(*) AS override_count FROM user_servers GROUP BY server_id")
         override_counts = {str(row["server_id"]): int(row["override_count"]) for row in counts}
         parsed, merge_ids = _plan_server_reconciliation(parsed, existing, override_counts)
@@ -1378,16 +1842,44 @@ async def _sync_servers(conn, body: bytes, *, primary_body: bytes | None = None,
             (int(_server_row_value(row, "sort_order", -1)) for row in existing),
             default=-1,
         ) + 1
+        source_positions: dict[str, int] = {}
+        provider_order_by_id: dict[str, int] = {}
+        reset_sources: set[str] = set()
+        incoming_ids = {str(server["id"]) for server in parsed}
+        for server in parsed:
+            source = "sas" if server.get("source") == "sas" else "primary"
+            position = source_positions.get(source, 0)
+            source_positions[source] = position + 1
+            server_id = str(server["id"])
+            provider_order_by_id[server_id] = position
+            old = existing_by_id.get(server_id)
+            if old is None or not bool(_server_row_value(old, "present_upstream", False)):
+                reset_sources.add(source)
+            elif _server_row_value(old, "source", "unknown") not in {source, "unknown", None}:
+                reset_sources.add(source)
+                reset_sources.add("sas" if _server_row_value(old, "source") == "sas" else "primary")
+            elif int(_server_row_value(old, "provider_order", 0) or 0) != position:
+                reset_sources.add(source)
+        for old in existing:
+            if bool(_server_row_value(old, "present_upstream", False)) and str(old["id"]) not in incoming_ids:
+                reset_sources.add("sas" if _server_row_value(old, "source") == "sas" else "primary")
+
         await conn.execute("UPDATE servers SET present_upstream=FALSE")
-        for index, server in enumerate(parsed):
-            existing_row = existing_by_id.get(str(server["id"]))
+        for server in parsed:
+            server_id = str(server["id"])
+            provider_order = provider_order_by_id[server_id]
+            source = "sas" if server.get("source") == "sas" else "primary"
+            existing_row = existing_by_id.get(server_id)
             if existing_row is None:
-                sort_order = next_sort_order
-                next_sort_order += 1
+                sort_order = provider_order if source in reset_sources else next_sort_order
+                if source not in reset_sources:
+                    next_sort_order += 1
+            elif source in reset_sources:
+                sort_order = provider_order
             else:
-                sort_order = _server_row_value(existing_row, "sort_order", index)
+                sort_order = _server_row_value(existing_row, "sort_order", provider_order)
                 if sort_order is None:
-                    sort_order = index
+                    sort_order = provider_order
             old_ids = merge_ids.get(server["id"], [])
             if len(old_ids) > 1:
                 await conn.execute("""UPDATE servers AS target SET
@@ -1413,14 +1905,23 @@ async def _sync_servers(conn, body: bytes, *, primary_body: bytes | None = None,
                 # resurfacing if an admin later clears or changes a current name.
                 await conn.execute("DELETE FROM servers WHERE id=ANY($2::text[]) AND id<>$1",
                                    server["id"], old_ids)
-            await conn.execute("""INSERT INTO servers(id,original_name,source_key,source,sort_order,present_upstream,last_seen_at)
-                VALUES($1,$2,$3,$4,$5,TRUE,now()) ON CONFLICT(id) DO UPDATE SET original_name=EXCLUDED.original_name,
-                source_key=EXCLUDED.source_key,source=EXCLUDED.source,present_upstream=TRUE,last_seen_at=now()""",
-                server["id"], server["name"], server["source_key"], server["source"], sort_order)
+            await conn.execute("""INSERT INTO servers(id,original_name,source_key,source,sort_order,provider_order,
+                present_upstream,last_seen_at) VALUES($1,$2,$3,$4,$5,$6,TRUE,now())
+                ON CONFLICT(id) DO UPDATE SET original_name=EXCLUDED.original_name,
+                source_key=EXCLUDED.source_key,source=EXCLUDED.source,present_upstream=TRUE,
+                last_seen_at=now(),provider_order=EXCLUDED.provider_order""",
+                server["id"], server["name"], server["source_key"], server["source"], sort_order,
+                provider_order_by_id[server_id])
+        if reset_sources:
+            await _reset_server_order(conn, parsed, sources=reset_sources)
+        # Remove long-gone provider entries and their personal overrides only
+        # after a grace period, allowing temporary provider omissions to recover.
+        await conn.execute("""DELETE FROM servers WHERE present_upstream=FALSE
+            AND last_seen_at < now() - ($1::integer * INTERVAL '1 day')""", SERVER_STALE_RETENTION_DAYS)
     return parsed
 
 
-async def _reset_server_order(conn, servers: list[dict]) -> None:
+async def _reset_server_order(conn, servers: list[dict], sources: set[str] | None = None) -> None:
     """Restore each provider's incoming order without changing server settings."""
     groups = {
         "primary": list(dict.fromkeys(str(server["id"]) for server in servers
@@ -1429,7 +1930,9 @@ async def _reset_server_order(conn, servers: list[dict]) -> None:
                                   if server.get("source") == "sas")),
     }
     async with conn.transaction():
-        for ids in groups.values():
+        for source, ids in groups.items():
+            if sources is not None and source not in sources:
+                continue
             if not ids:
                 continue
             await conn.execute("""UPDATE servers AS server

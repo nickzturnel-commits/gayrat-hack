@@ -42,18 +42,36 @@ class FakeConn:
         elif query.startswith("UPDATE servers SET present_upstream=FALSE"):
             for row in self.servers:
                 row["present_upstream"] = False
+        elif query.startswith("UPDATE servers AS server") and "WITH ORDINALITY" in query:
+            (server_ids,) = args
+            for position, server_id in enumerate(server_ids):
+                row = next((item for item in self.servers if item.get("id") == server_id), None)
+                if row:
+                    row["sort_order"] = position
+        elif query.startswith("DELETE FROM servers WHERE present_upstream=FALSE"):
+            (retention_days,) = args
+            cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+            expired_ids = {row["id"] for row in self.servers
+                           if not row.get("present_upstream", True)
+                           and row.get("last_seen_at") is not None
+                           and row["last_seen_at"] < cutoff}
+            self.servers[:] = [row for row in self.servers if row.get("id") not in expired_ids]
+            self.user_servers[:] = [row for row in self.user_servers
+                                    if row.get("server_id") not in expired_ids]
         elif query.startswith("INSERT INTO servers(id,original_name,source_key"):
-            server_id, original_name, source_key, source, sort_order = args
+            server_id, original_name, source_key, source, sort_order, provider_order = args
             row = next((item for item in self.servers if item.get("id") == server_id), None)
             if row is None:
                 row = {"id": server_id, "original_name": original_name, "source_key": source_key,
                        "source": source,
                        "custom_name": None, "hidden": False, "sort_order": sort_order,
-                       "present_upstream": True}
+                       "provider_order": provider_order, "present_upstream": True,
+                       "last_seen_at": datetime.now(timezone.utc)}
                 self.servers.append(row)
             else:
                 row.update(original_name=original_name, source_key=source_key, source=source,
-                           present_upstream=True)
+                           provider_order=provider_order, present_upstream=True,
+                           last_seen_at=datetime.now(timezone.utc))
         elif query.startswith("UPDATE servers AS target SET"):
             target_id, old_ids = args
             target = next((item for item in self.servers if item.get("id") == target_id), None)
@@ -207,9 +225,10 @@ class UriTests(unittest.TestCase):
         self.assertEqual(panel._decode_subscription(base64.b64encode(raw.encode())), raw.strip())
         self.assertIsNotNone(panel._invalid_payload(base64.b64encode(b"DEVICE LIMIT FULL"), ""))
 
-    def test_duplicate_server_entries_with_different_names_collapse(self):
+    def test_duplicate_connection_with_different_provider_names_is_preserved(self):
         entries = "vless://id@host:443#First\nvless://id@host:443#Second\n"
-        self.assertEqual(panel._extract_uris(entries), ["vless://id@host:443#First"])
+        self.assertEqual(panel._extract_uris(entries), [
+            "vless://id@host:443#First", "vless://id@host:443#Second"])
 
     def test_subscription_extracts_new_nodes_with_unescaped_spaces_in_names(self):
         raw = "\n".join([
@@ -250,6 +269,94 @@ class UriTests(unittest.TestCase):
                 uris = panel._extract_uris(decoded)
                 self.assertEqual(uris, [expected])
                 self.assertIsNone(panel._invalid_payload(body, "application/json"))
+
+    def test_xray_json_vmess_and_trojan_outbounds_are_not_dropped(self):
+        config = {"remarks": "Provider group", "outbounds": [
+            {"protocol": "vmess", "tag": "Tokyo VMess", "settings": {"vnext": [{
+                "address": "vmess.example", "port": 443, "users": [
+                    {"id": "00000000-0000-4000-8000-000000000021", "alterId": 0, "security": "auto"}]}]},
+             "streamSettings": {"network": "ws", "security": "tls",
+                                "tlsSettings": {"serverName": "cdn.example"},
+                                "wsSettings": {"path": "/edge", "headers": {"Host": "cdn.example"}}}},
+            {"protocol": "trojan", "tag": "Tokyo Trojan", "settings": {"servers": [{
+                "address": "trojan.example", "port": 443, "password": "secret"}]},
+             "streamSettings": {"network": "tcp", "security": "tls",
+                                "tlsSettings": {"serverName": "trojan.example"}}},
+        ]}
+
+        uris = panel._extract_uris(json.dumps(config))
+        schemes = [uri.split(":", 1)[0] for uri in uris]
+        names = [panel.parse_server_uri(uri)["name"] for uri in uris]
+
+        self.assertEqual(schemes, ["vmess", "trojan"])
+        self.assertEqual(names, ["Tokyo VMess", "Tokyo Trojan"])
+
+    def test_singbox_json_vless_reality_and_hysteria2_are_converted(self):
+        config = {"outbounds": [
+            {"type": "vless", "tag": "SB Reality", "server": "reality.example", "server_port": 443,
+             "uuid": "00000000-0000-4000-8000-000000000022", "flow": "xtls-rprx-vision",
+             "tls": {"enabled": True, "server_name": "front.example",
+                     "reality": {"enabled": True, "public_key": "public-key", "short_id": "ab"}},
+             "transport": {"type": "ws", "path": "/api", "headers": {"Host": "front.example"}}},
+            {"type": "hysteria2", "tag": "SB Hysteria", "server": "hy.example", "server_port": 8443,
+             "password": "hy-secret", "tls": {"enabled": True, "server_name": "hy.example"}},
+        ]}
+
+        uris = panel._extract_uris(json.dumps(config))
+        self.assertEqual([uri.split(":", 1)[0] for uri in uris], ["vless", "hysteria2"])
+        self.assertIn("security=reality", uris[0])
+        self.assertIn("pbk=public-key", uris[0])
+        self.assertEqual([panel.parse_server_uri(uri)["name"] for uri in uris],
+                         ["SB Reality", "SB Hysteria"])
+
+    def test_clash_yaml_proxy_list_is_converted(self):
+        config = """proxies:
+  - name: Clash VMess
+    type: vmess
+    server: vmess.example
+    port: 443
+    uuid: 00000000-0000-4000-8000-000000000023
+    alterId: 0
+    cipher: auto
+    tls: true
+    servername: cdn.example
+    network: ws
+    ws-opts:
+      path: /edge
+      headers:
+        Host: cdn.example
+  - name: Clash Trojan
+    type: trojan
+    server: trojan.example
+    port: 443
+    password: secret
+    sni: trojan.example
+"""
+
+        uris = panel._extract_uris(config)
+        self.assertEqual([uri.split(":", 1)[0] for uri in uris], ["vmess", "trojan"])
+        self.assertEqual([panel.parse_server_uri(uri)["name"] for uri in uris],
+                         ["Clash VMess", "Clash Trojan"])
+
+    def test_raw_share_links_accept_additional_common_protocols(self):
+        links = ("ssr://encoded-profile\nanytls://secret@host.example:443#AnyTLS\n"
+                 "socks5://user:password@127.0.0.1:1080#Local\n")
+        self.assertEqual([uri.split(":", 1)[0] for uri in panel._extract_uris(links)],
+                         ["ssr", "anytls", "socks5"])
+
+    def test_structured_feed_with_unknown_proxy_type_fails_instead_of_dropping_a_node(self):
+        config = {"outbounds": [
+            {"protocol": "vless", "tag": "Known", "settings": {"vnext": [{
+                "address": "known.example", "port": 443, "users": [
+                    {"id": "00000000-0000-4000-8000-000000000024"}]}]}},
+            {"protocol": "vendor-tunnel", "settings": {"servers": [{
+                "address": "unknown.example", "port": 8443, "token": "secret"}]}},
+        ]}
+        body = json.dumps(config).encode()
+
+        error = panel._invalid_payload(body, "application/json")
+
+        self.assertIn("vendor-tunnel", error)
 
     def test_sas_xray_profile_list_converts_vless_and_preserves_transport_security(self):
         xhttp_outbound = {
@@ -369,25 +476,115 @@ class ServerReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("vless://uuid@de.example:443?security=tls#Germany%20West%2001", content)
         self.assertIn("trojan://secret@jp.example:443#Japan%20Tokyo", content)
 
-    async def test_manual_order_survives_refresh_and_new_servers_append(self):
+    async def test_same_connection_aliases_both_reach_generated_subscription(self):
+        provider_text = ("vless://id@host:443#Moscow\n"
+                         "vless://id@host:443#ru Москва-игровой 🎮\n")
+        body = provider_text.encode("utf-8")
+        conn = FakeConn()
+        user = {"id": 43, "slug": "aliases", "name": "Aliases", "enabled": True,
+                "expires_at": None, "announce_override": "", "title_override": None,
+                "status": "active", "drive_file_id": None}
+
+        servers = await panel._sync_servers(conn, body)
+        content = await panel.build_manifest_content(
+            conn, user, body, {}, dict(panel.DEFAULT_SETTINGS, announce_enabled=False), servers=servers)
+        names = [panel.parse_server_uri(uri)["name"] for uri in panel._extract_uris(content)]
+
+        self.assertEqual(len(servers), 2)
+        self.assertEqual(len({server["id"] for server in servers}), 2)
+        self.assertEqual(names, ["Moscow", "ru Москва-игровой 🎮"])
+
+    async def test_manual_order_survives_when_provider_snapshot_is_unchanged(self):
+        first = panel.parse_server_uri("vless://first@one.example#First")
+        second = panel.parse_server_uri("vless://second@two.example#Second")
+        conn = FakeConn(servers=[
+            {"id": first["id"], "original_name": "First", "source_key": first["source_key"],
+             "source": "primary", "custom_name": None, "hidden": False, "sort_order": 11,
+             "provider_order": 0, "present_upstream": True},
+            {"id": second["id"], "original_name": "Second", "source_key": second["source_key"],
+             "source": "primary", "custom_name": None, "hidden": False, "sort_order": 3,
+             "provider_order": 1, "present_upstream": True},
+        ])
+
+        await panel._sync_servers(conn, f"{first['uri']}\n{second['uri']}".encode())
+
+        order = {row["id"]: row["sort_order"] for row in conn.servers if row.get("present_upstream")}
+        self.assertEqual(order[first["id"]], 11)
+        self.assertEqual(order[second["id"]], 3)
+
+    async def test_provider_order_change_reindexes_without_losing_names_or_visibility(self):
         first = panel.parse_server_uri("vless://first@one.example#First")
         second = panel.parse_server_uri("vless://second@two.example#Second")
         added = panel.parse_server_uri("vless://added@three.example#Added")
         conn = FakeConn(servers=[
             {"id": first["id"], "original_name": "First", "source_key": first["source_key"],
-             "source": "primary", "custom_name": None, "hidden": False, "sort_order": 11,
-             "present_upstream": True},
+             "source": "primary", "custom_name": "My First", "hidden": True, "sort_order": 11,
+             "provider_order": 0, "present_upstream": True},
             {"id": second["id"], "original_name": "Second", "source_key": second["source_key"],
              "source": "primary", "custom_name": None, "hidden": False, "sort_order": 3,
-             "present_upstream": True},
+             "provider_order": 1, "present_upstream": True},
         ])
 
         await panel._sync_servers(conn, f"{added['uri']}\n{second['uri']}\n{first['uri']}".encode())
 
         order = {row["id"]: row["sort_order"] for row in conn.servers if row.get("present_upstream")}
-        self.assertEqual(order[first["id"]], 11)
-        self.assertEqual(order[second["id"]], 3)
-        self.assertEqual(order[added["id"]], 12)
+        self.assertEqual(order[added["id"]], 0)
+        self.assertEqual(order[second["id"]], 1)
+        self.assertEqual(order[first["id"]], 2)
+        first_row = next(row for row in conn.servers if row["id"] == first["id"])
+        self.assertEqual(first_row["custom_name"], "My First")
+        self.assertTrue(first_row["hidden"])
+
+    async def test_securex_and_sas_have_independent_provider_order(self):
+        sas_one = "vless://sas1@sas-one.example:443#SAS One"
+        primary_one = "vless://main1@main-one.example:443#Main One"
+        sas_two = "vless://sas2@sas-two.example:443#SAS Two"
+        primary = f"{primary_one}\n".encode()
+        sas = f"{sas_one}\n{sas_two}\n".encode()
+        merged = panel.merge_subscription_bodies(primary, sas)
+        conn = FakeConn()
+
+        servers = await panel._sync_servers(conn, merged, primary_body=primary, sas_body=sas)
+
+        self.assertEqual([row["source"] for row in servers], ["primary", "sas", "sas"])
+        self.assertEqual([row["provider_order"] for row in conn.servers], [0, 0, 1])
+        self.assertEqual([row["sort_order"] for row in conn.servers], [0, 0, 1])
+
+    async def test_same_connection_with_different_labels_keeps_correct_provider_source(self):
+        primary = b"vless://shared@same.example:443#Primary name\n"
+        sas = b"vless://shared@same.example:443#SAS name\n"
+        merged = panel.merge_subscription_bodies(primary, sas)
+        conn = FakeConn()
+
+        servers = await panel._sync_servers(conn, merged, primary_body=primary, sas_body=sas)
+
+        self.assertEqual([server["source"] for server in servers], ["primary", "sas"])
+        self.assertEqual(len({server["id"] for server in servers}), 2)
+
+    async def test_long_missing_servers_and_their_user_overrides_are_pruned(self):
+        current = panel.parse_server_uri("vless://current@current.example#Current")
+        old = panel.parse_server_uri("vless://old@old.example#Old")
+        recent = panel.parse_server_uri("vless://recent@recent.example#Recent")
+        old_seen = datetime.now(timezone.utc) - timedelta(days=61)
+        recent_seen = datetime.now(timezone.utc) - timedelta(days=12)
+        conn = FakeConn(servers=[
+            {"id": old["id"], "original_name": "Old", "source_key": old["source_key"],
+             "source": "primary", "sort_order": 4, "provider_order": 4,
+             "present_upstream": True, "last_seen_at": old_seen},
+            {"id": recent["id"], "original_name": "Recent", "source_key": recent["source_key"],
+             "source": "primary", "sort_order": 5, "provider_order": 5,
+             "present_upstream": True, "last_seen_at": recent_seen},
+        ], user_servers=[
+            {"user_id": 1, "server_id": old["id"], "hidden": True, "custom_name": "Old custom"},
+        ])
+
+        await panel._sync_servers(conn, f"{current['uri']}\n".encode())
+
+        ids = {row["id"] for row in conn.servers}
+        self.assertNotIn(old["id"], ids)
+        self.assertIn(recent["id"], ids)
+        self.assertFalse(next(row for row in conn.servers if row["id"] == recent["id"])["present_upstream"])
+        self.assertEqual(conn.user_servers, [])
 
     async def test_changed_uri_keeps_global_and_per_user_customizations(self):
         previous = panel.parse_server_uri("vless://old-id@old.example:443#Nord")
@@ -412,7 +609,7 @@ class ServerReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["id"] for row in active], [previous["id"]])
         self.assertEqual(active[0]["custom_name"], "My Nord")
         self.assertTrue(active[0]["hidden"])
-        self.assertEqual(active[0]["sort_order"], 7)
+        self.assertEqual(active[0]["sort_order"], 0)
         self.assertEqual(personal["server_id"], previous["id"])
         self.assertEqual(personal["custom_name"], "Personal Nord")
         self.assertFalse(stale_row["present_upstream"])
@@ -1224,12 +1421,12 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mobile.status_code, 200)
         self.assertIn('class="desktop-ui"', desktop.text)
         self.assertIn('class="mobile-ui"', mobile.text)
-        self.assertIn("/static/admin.js?v=20261030-1", desktop.text)
-        self.assertIn("/static/admin.js?v=20261030-1", mobile.text)
+        self.assertIn("/static/admin.js?v=20261118-7", desktop.text)
+        self.assertIn("/static/admin.js?v=20261118-7", mobile.text)
         self.assertIn("/static/admin-actions.js?v=20261029-2", desktop.text)
         self.assertIn("/static/admin-actions.js?v=20261029-2", mobile.text)
-        self.assertIn("/static/admin.css?v=20261030-1", desktop.text)
-        self.assertIn("/static/admin.css?v=20261030-1", mobile.text)
+        self.assertIn("/static/admin.css?v=20261118-6", desktop.text)
+        self.assertIn("/static/admin.css?v=20261118-6", mobile.text)
         self.assertIn('class="mobile-nav-glider"', mobile.text)
         self.assertIn('data-active-index="0"', mobile.text)
         self.assertEqual(javascript.status_code, 200)
@@ -1265,20 +1462,15 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stylesheet.status_code, 200)
         self.assertIn("no-cache", javascript.headers.get("cache-control", ""))
         self.assertIn("no-cache", stylesheet.headers.get("cache-control", ""))
-        self.assertIn("prefers-reduced-motion", stylesheet.text)
-        self.assertIn(".hidden { display: none !important; }", stylesheet.text)
-        self.assertIn(".mobile-content .user-actions .user-qr-action", stylesheet.text)
-        self.assertIn("Liquid glass pass", stylesheet.text)
-        self.assertIn("blur(52px) saturate(190%)", stylesheet.text)
+        self.assertIn("prefers-reduced-motion:reduce", stylesheet.text)
+        self.assertIn(".hidden{display:none!important}", stylesheet.text)
+        self.assertIn(".user-qr-action{", stylesheet.text)
         self.assertIn("mobile-nav-glider", stylesheet.text)
-        self.assertIn("cubic-bezier(.2, 1.22, .32, 1)", stylesheet.text)
-        self.assertIn(".mobile-ui .modal-shell .source-choice-grid", stylesheet.text)
+        self.assertIn(".source-choice-grid{grid-template-columns:minmax(0,1fr)", stylesheet.text)
         self.assertIn(".mobile-ui .modal-shell .subscription-fields", stylesheet.text)
-        self.assertIn("rgba(15,16,17,.985)", stylesheet.text)
-        self.assertIn("@media (max-width: 760px) and (max-height: 700px)", stylesheet.text)
-        self.assertIn(".mobile-ui .modal-shell .subscription-form .form-actions { position: static; }", stylesheet.text)
-        self.assertIn(".sidebar { position: sticky; align-self: start; top: 18px", stylesheet.text)
-        self.assertIn("overflow-x: clip", stylesheet.text)
+        self.assertIn(".modal-shell[open]{position:fixed", stylesheet.text)
+        self.assertIn(".sidebar{position:fixed", stylesheet.text)
+        self.assertIn("overflow-x:clip", stylesheet.text)
         self.assertNotIn(".mobile-shell { display: block !important; }", stylesheet.text)
 
     async def test_pending_delete_is_removed_only_after_success_report(self):
