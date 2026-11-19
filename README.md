@@ -29,6 +29,7 @@ Create or update the Render Web Service from `render.yaml`. Set these environmen
 | `HAPP_PROVIDER_CODE` | Yes for limited links | Happ provider code (8 letters or digits) |
 | `HAPP_AUTH_KEY` | Yes for limited links | Happ provider authorization key (32 supported characters); keep it only in Render secrets |
 | `HAPP_PROVIDER_ID` | Optional | Eight-character provider ID included in generated profile metadata when valid |
+| `mcp_hash` | Optional | 64-character hexadecimal secret that enables the MCP admin endpoint; keep it only in Render secrets |
 
 `ADMIN_PASSWORD_HASH`, when set, takes precedence over `ADMIN_PASSWORD`. Supported encodings are `pbkdf2_sha256$salt$urlsafe_base64_digest` (310,000 PBKDF2-SHA256 rounds) and `scrypt$salt$urlsafe_base64_digest` (`n=16384, r=8, p=1`). Keep the hash string in Render secrets just like a password. Use a random `SESSION_SECRET` of at least 32 characters. If the admin credentials or `SESSION_SECRET` are missing or invalid, panel API access is disabled. If `SYNC_KEY` is missing, Apps Script endpoints are disabled. The relay itself remains available if the database cannot connect.
 
@@ -107,6 +108,12 @@ The admin UI has separate desktop and mobile pages. `/admin` selects a layout us
 5. Confirm the old Happ link still loads, then create additional users in the panel. Their Drive files and links are created immediately by the Web App.
 
 The project has no dependency on an Apps Script trigger recreation: the existing five-minute trigger name remains `updateSub`.
+
+## MCP for AI agents
+
+Set `mcp_hash` in Render to a private 64-character hexadecimal value. The MCP endpoint is `https://zeva-online.onrender.com/mcp/agent/<mcp_hash>` and uses Streamable HTTP. If the variable is empty, the endpoint is not mounted. The secret in the URL grants administrative access; keep it out of source control, screenshots, and shared logs. Access logs redact this path segment.
+
+The MCP server operates the primary `/admin` environment only. Its tools cover dashboard and integration status, subscription creation/editing and batch changes/revocation, exact profile preview and explicitly requested private links, activation slots and limits, Happ device limits, global and per-subscription servers, bulk rename/show/hide/order actions, provider refresh/cache rebuild, settings, and immediate Drive sync. Existing admin API validation and Apps Script delivery are reused. Mutating tools require `confirm=true`; bulk profile changes are sent with one targeted Drive sync. Happ link creation is a provider call per subscription and is limited to three concurrent calls. The test schema and `/test` panel are not exposed through MCP.
 
 ## Tests
 

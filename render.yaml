@@ -52,3 +52,5 @@ services:
         sync: false
       - key: TEST_HAPP_PROVIDER_ID
         sync: false
+      - key: mcp_hash
+        sync: false

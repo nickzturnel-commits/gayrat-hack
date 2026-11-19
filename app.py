@@ -17,6 +17,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import panel as admin_panel
+import mcp_admin
 
 
 load_dotenv()
@@ -33,6 +34,7 @@ class _SubscriptionPathLogFilter(logging.Filter):
         if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
             args = list(args)
             args[2] = re.sub(r"(/server/hash/)[A-Za-z0-9_-]{48}", r"\1[hidden]", args[2])
+            args[2] = re.sub(r"(/mcp/agent/)[A-Fa-f0-9]{64}", r"\1[hidden]", args[2])
             record.args = tuple(args)
         return True
 
@@ -426,6 +428,7 @@ async def health():
 
 
 admin_panel.install(app)
+mcp_admin.install(app, admin_panel)
 
 
 @app.exception_handler(StarletteHTTPException)
