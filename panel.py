@@ -3233,7 +3233,7 @@ def _happ_client() -> httpx.AsyncClient:
 async def _ensure_activation_import_link(user_id: int, cookie_value: str,
                                          fallback_base_url: str | None = None,
                                          *, test_mode: bool | None = None) -> tuple[str | None, str | None]:
-    """Encrypt one slot-scoped Render URL without creating a Happ install counter."""
+    """Encrypt the registered slot's Drive (primary) or Render (test) URL."""
     context = _test_environment.set(_test_environment.get() if test_mode is None else test_mode)
     try:
         scope = _activation_scope()
@@ -3243,7 +3243,11 @@ async def _ensure_activation_import_link(user_id: int, cookie_value: str,
         pool = await state.db()
         browser_hash = _activation_device_hash(cookie_value, test_mode=is_test)
         slot_token = _activation_slot_token(user_id, cookie_value, test_mode=is_test)
-        slot_token_hash = hashlib.sha256(slot_token.encode()).hexdigest()
+        # The primary activation flow now gives Happ the Drive URL directly.
+        # Version the persisted link key so an already-cached Render proxy URL
+        # is regenerated once; keep test activation's token behavior unchanged.
+        link_token = f"drive-v1:{slot_token}" if not is_test else slot_token
+        slot_token_hash = hashlib.sha256(link_token.encode()).hexdigest()
         async with pool.acquire() as conn:
             row = await conn.fetchrow("""SELECT d.subscription_token_hash,d.encrypted_link,
                 u.drive_file_id,u.status,u.enabled,u.expires_at,a.drive_ready_at
@@ -3264,12 +3268,13 @@ async def _ensure_activation_import_link(user_id: int, cookie_value: str,
         if row["subscription_token_hash"] == slot_token_hash and row["encrypted_link"]:
             return str(row["encrypted_link"]), None
 
-        source_url = _activation_slot_url(user_id, slot_token, fallback_base_url, test_mode=is_test)
+        source_url = (_activation_slot_url(user_id, slot_token, fallback_base_url, test_mode=True)
+                      if is_test else _drive_subscription_link(str(row["drive_file_id"])))
         try:
             async with _happ_client() as client:
                 encrypted_link = await happ_limit.encrypt_link(client, source_url)
         except happ_limit.HappLimitError as exc:
-            log.info("Render activation encryption unavailable: user=%d reason=%s", user_id, str(exc)[:120])
+            log.info("Activation link encryption unavailable: user=%d reason=%s", user_id, str(exc)[:120])
             return None, "Не удалось зашифровать индивидуальную ссылку. Нажмите подтверждение ещё раз позже."
 
         async with pool.acquire() as conn:
