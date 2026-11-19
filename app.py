@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import html
 import logging
 import os
 import re
@@ -378,22 +377,6 @@ async def serve_subscription(request: Request) -> Response:
     return Response(content=snapshot.body, headers=snapshot.headers)
 
 
-def _device_type(user_agent: str) -> str:
-    """Coarsely classify the requesting device without storing its user agent."""
-    ua = (user_agent or "").lower()
-    if any(marker in ua for marker in ("smart-tv", "smarttv", "hbbtv", "tizen", "webos", "appletv", "android tv")):
-        return "телевизор"
-    if any(marker in ua for marker in ("ipad", "tablet", "playbook", "silk")):
-        return "планшет"
-    if "android" in ua and "mobile" not in ua:
-        return "планшет"
-    if any(marker in ua for marker in ("iphone", "ipod", "windows phone", "mobile")) or "android" in ua:
-        return "телефон"
-    if any(marker in ua for marker in ("windows nt", "macintosh", "x11", "linux", "cros")):
-        return "компьютер"
-    return "не удалось определить"
-
-
 def _wants_html_404(request: Request) -> bool:
     accept = request.headers.get("accept", "").lower()
     return "text/html" in accept or "application/xhtml+xml" in accept
@@ -410,9 +393,7 @@ def _not_found_response(request: Request, status_code: int = 404) -> Response:
     if request.method == "HEAD" or not _wants_html_404(request):
         return Response(status_code=status_code, headers=headers)
 
-    device = html.escape(_device_type(request.headers.get("user-agent", "")))
-    page = NOT_FOUND_TEMPLATE.replace("{{DEVICE_TYPE}}", device)
-    return HTMLResponse(page, status_code=status_code, headers=headers)
+    return HTMLResponse(NOT_FOUND_TEMPLATE, status_code=status_code, headers=headers)
 
 
 @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
