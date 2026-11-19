@@ -15,6 +15,7 @@ from typing import Any, Literal
 import httpx
 from fastapi import FastAPI
 from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.routing import BaseRoute, Match, Mount
 from starlette.types import Receive, Scope, Send
@@ -94,11 +95,11 @@ def install(app: FastAPI, panel) -> bool:
     async def admin_api(method: str, path: str, data: dict | None = None) -> Any:
         """Call an existing primary admin API route in-process using a short-lived signed session."""
         if not path.startswith("/api/admin/") or path.startswith("/api/admin/test"):
-            raise ValueError("Только API основной админ-панели доступно через этот инструмент")
+            raise ToolError("Только API основной админ-панели доступно через этот инструмент")
         username = os.getenv("ADMIN_USERNAME", "").strip()
         session_secret = os.getenv("SESSION_SECRET", "")
         if not username or len(session_secret) < 32:
-            raise RuntimeError("Основная админ-панель не настроена")
+            raise ToolError("Основная админ-панель не настроена")
         csrf = secrets.token_urlsafe(24)
         session = panel._sign_session({
             "u": username,
@@ -107,25 +108,28 @@ def install(app: FastAPI, panel) -> bool:
             "exp": int(time.time()) + 120,
         })
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-        async with httpx.AsyncClient(
-            transport=transport,
-            base_url="https://zeva-online.onrender.com",
-            timeout=httpx.Timeout(120.0),
-            cookies={"admin_session": session},
-        ) as client:
-            response = await client.request(
-                method,
-                path,
-                json=data,
-                headers={"x-csrf-token": csrf, "accept": "application/json"},
-            )
+        try:
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="https://zeva-online.onrender.com",
+                timeout=httpx.Timeout(120.0),
+                cookies={"admin_session": session},
+            ) as client:
+                response = await client.request(
+                    method,
+                    path,
+                    json=data,
+                    headers={"x-csrf-token": csrf, "accept": "application/json"},
+                )
+        except httpx.TimeoutException as exc:
+            raise ToolError(f"Панель не ответила вовремя ({type(exc).__name__}); проверь состояние операции отдельно.") from None
         content_type = response.headers.get("content-type", "")
         if response.status_code >= 400:
             try:
                 detail = response.json().get("detail", "")
             except Exception:
                 detail = response.text[:500]
-            raise RuntimeError(f"Панель вернула HTTP {response.status_code}: {detail}")
+            raise ToolError(f"Панель вернула HTTP {response.status_code}: {detail}")
         if "application/json" in content_type:
             return response.json()
         return response.text
@@ -141,7 +145,7 @@ def install(app: FastAPI, panel) -> bool:
 
     async def require_confirm(confirm: bool) -> None:
         if confirm is not True:
-            raise ValueError("Подтвердите действие параметром confirm=true")
+            raise ToolError("Подтвердите действие параметром confirm=true")
 
     async def raw_subscriptions() -> list[dict]:
         result = await admin_api("GET", "/api/admin/users")
@@ -174,7 +178,7 @@ def install(app: FastAPI, panel) -> bool:
         users = await raw_subscriptions()
         user = next((item for item in users if int(item.get("id", -1)) == user_id), None)
         if user is None:
-            raise ValueError("Подписка не найдена")
+            raise ToolError("Подписка с таким ID не найдена в основной среде. Сначала проверь ID через list_subscriptions.")
         return _public(user)
 
     @mcp.tool()
@@ -194,11 +198,11 @@ def install(app: FastAPI, panel) -> bool:
             "activation_enabled", "activation_limit",
         }
         if not changes or set(changes) - allowed:
-            raise ValueError(f"Изменения должны содержать только поля: {', '.join(sorted(allowed))}")
+            raise ToolError(f"Изменения должны содержать только поля: {', '.join(sorted(allowed))}")
         users = await raw_subscriptions()
         current = next((item for item in users if int(item.get("id", -1)) == user_id), None)
         if current is None:
-            raise ValueError("Подписка не найдена")
+            raise ToolError("Подписка не найдена")
         body = {key: current.get(key) for key in (
             "name", "note", "enabled", "expires_at", "title_override", "announce_override",
             "traffic_limit_bytes", "hide_traffic_usage", "include_sas", "device_limit",
@@ -206,13 +210,13 @@ def install(app: FastAPI, panel) -> bool:
         body.update(changes)
         if "activation_limit" in changes and "activation_enabled" not in changes:
             if not current.get("activation_enabled"):
-                raise ValueError("Для нового лимита включи activation_enabled=true и укажи activation_limit")
+                raise ToolError("Для нового лимита включи activation_enabled=true и укажи activation_limit")
             body["activation_enabled"] = True
         if changes.get("activation_enabled") is True and "activation_limit" not in changes:
             if current.get("activation_enabled") and current.get("activation_limit"):
                 body["activation_limit"] = current["activation_limit"]
             else:
-                raise ValueError("При включении Render-активации укажи activation_limit от 1 до 20")
+                raise ToolError("При включении Render-активации укажи activation_limit от 1 до 20")
         result = await admin_api("PUT", f"/api/admin/users/{user_id}", body)
         return _public(result)
 
@@ -231,7 +235,7 @@ def install(app: FastAPI, panel) -> bool:
                         "FROM users WHERE id=ANY($1::bigint[]) FOR UPDATE", ids,
                     )
                     if len(rows) != len(ids):
-                        raise ValueError("Один или несколько ID подписок не найдены")
+                        raise ToolError("Один или несколько ID подписок не найдены")
                     activation_ids = set()
                     if "device_limit" in normalized:
                         activation_ids = set(await conn.fetchval(
@@ -240,7 +244,7 @@ def install(app: FastAPI, panel) -> bool:
                     legacy_ids = {int(row["id"]) for row in rows
                                   if row["slug"] == "legacy" or row["drive_file_id"] == panel.LEGACY_DRIVE_FILE_ID}
                     if "device_limit" in normalized and (legacy_ids or activation_ids):
-                        raise ValueError("Массовую смену Happ-лимита нельзя применять к legacy- или Render-активациям")
+                        raise ToolError("Массовую смену Happ-лимита нельзя применять к legacy- или Render-активациям")
 
                     changed_ids: list[int] = []
                     rebuild_ids: list[int] = []
@@ -305,9 +309,9 @@ def install(app: FastAPI, panel) -> bool:
                         "SELECT id,slug,drive_file_id FROM users WHERE id=ANY($1::bigint[]) FOR UPDATE", ids,
                     )
                     if len(rows) != len(ids):
-                        raise ValueError("Один или несколько ID подписок не найдены")
+                        raise ToolError("Один или несколько ID подписок не найдены")
                     if any(row["slug"] == "legacy" or row["drive_file_id"] == panel.LEGACY_DRIVE_FILE_ID for row in rows):
-                        raise ValueError("Основная legacy-подписка защищена от массового отключения")
+                        raise ToolError("Основная legacy-подписка защищена от массового отключения")
                     await conn.execute(
                         "UPDATE users SET status='pending_delete',enabled=FALSE,updated_at=now() "
                         "WHERE id=ANY($1::bigint[])", ids,
@@ -327,7 +331,7 @@ def install(app: FastAPI, panel) -> bool:
         users = await raw_subscriptions()
         user = next((item for item in users if int(item.get("id", -1)) == user_id), None)
         if user is None:
-            raise ValueError("Подписка не найдена")
+            raise ToolError("Подписка не найдена")
         if kind == "drive":
             value = user.get("drive_link")
             pending = not value
@@ -351,7 +355,7 @@ def install(app: FastAPI, panel) -> bool:
         """Sets a Render activation slot limit from 1 to 20; lowering it removes newest slots. Requires confirm=true."""
         await require_confirm(confirm)
         if not 1 <= limit <= 20:
-            raise ValueError("Лимит Render-активации должен быть от 1 до 20")
+            raise ToolError("Лимит Render-активации должен быть от 1 до 20")
         return await admin_api("PUT", f"/api/admin/users/{user_id}/activation/limit", {"limit": limit})
 
     @mcp.tool()
@@ -360,7 +364,7 @@ def install(app: FastAPI, panel) -> bool:
         await require_confirm(confirm)
         ids = _validate_ids(user_ids)
         if not 1 <= limit <= 20:
-            raise ValueError("Лимит Render-активации должен быть от 1 до 20")
+            raise ToolError("Лимит Render-активации должен быть от 1 до 20")
         async with main_database() as pool:
             async with pool.acquire() as conn:
                 async with conn.transaction():
@@ -369,7 +373,7 @@ def install(app: FastAPI, panel) -> bool:
                     )
                     found = {int(row["user_id"]) for row in existing}
                     if found != set(ids):
-                        raise ValueError("Все выбранные подписки должны иметь включённую Render-активацию")
+                        raise ToolError("Все выбранные подписки должны иметь включённую Render-активацию")
                     for user_id in ids:
                         await conn.execute("""DELETE FROM activation_devices WHERE user_id=$1 AND device_hash IN (
                             SELECT device_hash FROM activation_devices WHERE user_id=$1
@@ -382,7 +386,7 @@ def install(app: FastAPI, panel) -> bool:
 
     @mcp.tool()
     async def reset_activation(user_id: int, confirm: bool) -> dict[str, Any]:
-        """Revokes the existing activation URL and all registered slots, then issues a new URL. Requires confirm=true."""
+        """Clears registered browser slots while retaining the same activation URL. Requires confirm=true."""
         await require_confirm(confirm)
         return _public(await admin_api("POST", f"/api/admin/users/{user_id}/activation/reset", {}))
 
@@ -446,7 +450,7 @@ def install(app: FastAPI, panel) -> bool:
         """Applies staged global server name, visibility and order edits in one transaction and one Drive sync."""
         await require_confirm(confirm)
         if not servers or len(servers) > 500:
-            raise ValueError("Передай от 1 до 500 серверов")
+            raise ToolError("Передай от 1 до 500 серверов")
         return await admin_api("POST", "/api/admin/servers/batch", {"servers": servers})
 
     @mcp.tool()
@@ -458,11 +462,11 @@ def install(app: FastAPI, panel) -> bool:
         await require_confirm(confirm)
         ids = _validate_server_ids(server_ids)
         if not prefix and not suffix and not find_text:
-            raise ValueError("Укажи prefix, suffix или find_text для переименования")
+            raise ToolError("Укажи prefix, suffix или find_text для переименования")
         catalog = await admin_api("GET", "/api/admin/servers")
         selected = {str(item["id"]): item for item in catalog.get("servers", []) if str(item.get("id")) in set(ids)}
         if len(selected) != len(ids):
-            raise ValueError("Один или несколько серверов отсутствуют в каталоге")
+            raise ToolError("Один или несколько серверов отсутствуют в каталоге")
         items = []
         for server_id in ids:
             server = selected[server_id]
@@ -506,7 +510,7 @@ def install(app: FastAPI, panel) -> bool:
         """Stages per-subscription server names and visibility and saves them with one Drive sync."""
         await require_confirm(confirm)
         if not servers or len(servers) > 500:
-            raise ValueError("Передай от 1 до 500 серверов")
+            raise ToolError("Передай от 1 до 500 серверов")
         return await admin_api("POST", f"/api/admin/users/{user_id}/servers/batch", {"servers": servers})
 
     @mcp.tool()
@@ -519,7 +523,7 @@ def install(app: FastAPI, panel) -> bool:
         """Updates allowed panel settings using the existing validation and profile delivery logic. Requires confirm=true."""
         await require_confirm(confirm)
         if not values:
-            raise ValueError("Передай хотя бы одну настройку")
+            raise ToolError("Передай хотя бы одну настройку")
         return _public(await admin_api("PUT", "/api/admin/settings", {"values": values}))
 
     @mcp.tool()
@@ -560,21 +564,21 @@ def install(app: FastAPI, panel) -> bool:
 
 def _validate_ids(user_ids: list[int], *, max_count: int = _MAX_MCP_IDS) -> list[int]:
     if not isinstance(user_ids, list) or not user_ids or len(user_ids) > max_count:
-        raise ValueError(f"Передай от 1 до {max_count} ID")
+        raise ToolError(f"Передай от 1 до {max_count} ID")
     if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in user_ids):
-        raise ValueError("ID должны быть положительными целыми числами")
+        raise ToolError("ID должны быть положительными целыми числами")
     if len(set(user_ids)) != len(user_ids):
-        raise ValueError("В списке есть повторяющиеся ID")
+        raise ToolError("В списке есть повторяющиеся ID")
     return user_ids
 
 
 def _validate_server_ids(server_ids: list[str]) -> list[str]:
     if not isinstance(server_ids, list) or not server_ids or len(server_ids) > 500:
-        raise ValueError("Передай от 1 до 500 ID серверов")
+        raise ToolError("Передай от 1 до 500 ID серверов")
     if any(not isinstance(value, str) or not value or len(value) > 200 for value in server_ids):
-        raise ValueError("Каждый ID сервера должен быть строкой длиной 1–200 символов")
+        raise ToolError("Каждый ID сервера должен быть строкой длиной 1–200 символов")
     if len(set(server_ids)) != len(server_ids):
-        raise ValueError("В списке есть повторяющиеся серверы")
+        raise ToolError("В списке есть повторяющиеся серверы")
     return server_ids
 
 
@@ -582,7 +586,7 @@ def _path_part(value: str) -> str:
     from urllib.parse import quote
 
     if not value or len(value) > 200:
-        raise ValueError("Некорректный ID сервера")
+        raise ToolError("Некорректный ID сервера")
     return quote(value, safe="")
 
 
@@ -593,38 +597,38 @@ def _validate_bulk_changes(changes: dict[str, Any], panel) -> dict[str, Any]:
         "find_text", "replace_text",
     }
     if not isinstance(changes, dict) or not changes or set(changes) - allowed:
-        raise ValueError(f"Массово разрешены только поля: {', '.join(sorted(allowed))}")
+        raise ToolError(f"Массово разрешены только поля: {', '.join(sorted(allowed))}")
     result = dict(changes)
     for field in ("enabled", "include_sas", "hide_traffic_usage"):
         if field in result and not isinstance(result[field], bool):
-            raise ValueError(f"{field} должен быть логическим значением")
+            raise ToolError(f"{field} должен быть логическим значением")
     for field, limit in (("note", 2000), ("title_override", 200), ("announce_override", 4000),
                          ("name_prefix", 120), ("name_suffix", 120), ("find_text", 200),
                          ("replace_text", 200)):
         if field in result and result[field] is not None and (not isinstance(result[field], str)
                 or len(result[field]) > limit):
-            raise ValueError(f"Некорректное значение {field}")
+            raise ToolError(f"Некорректное значение {field}")
     if "traffic_limit_bytes" in result and result["traffic_limit_bytes"] is not None:
         value = result["traffic_limit_bytes"]
         if isinstance(value, bool) or not isinstance(value, int) or not 1_000_000 <= value <= 1_000_000_000_000:
-            raise ValueError("traffic_limit_bytes должен быть от 1 МБ до 1 ТБ или null")
+            raise ToolError("traffic_limit_bytes должен быть от 1 МБ до 1 ТБ или null")
     if "device_limit" in result and result["device_limit"] is not None:
         value = result["device_limit"]
         if isinstance(value, bool) or not isinstance(value, int) or not panel.happ_limit.MIN_LIMIT <= value <= panel.happ_limit.MAX_LIMIT:
-            raise ValueError(f"device_limit должен быть от {panel.happ_limit.MIN_LIMIT} до {panel.happ_limit.MAX_LIMIT} или null")
+            raise ToolError(f"device_limit должен быть от {panel.happ_limit.MIN_LIMIT} до {panel.happ_limit.MAX_LIMIT} или null")
     if "expires_at" in result and result["expires_at"] is not None:
         value = result["expires_at"]
         if not isinstance(value, str):
-            raise ValueError("expires_at должен быть ISO 8601 строкой или null")
+            raise ToolError("expires_at должен быть ISO 8601 строкой или null")
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError as exc:
-            raise ValueError("expires_at должен быть корректной ISO 8601 датой") from exc
+            raise ToolError("expires_at должен быть корректной ISO 8601 датой") from exc
         result["expires_at"] = panel._expiry_utc(parsed)
     if "replace_text" in result and "find_text" not in result:
-        raise ValueError("replace_text можно передать только вместе с find_text")
+        raise ToolError("replace_text можно передать только вместе с find_text")
     if "find_text" in result and result["find_text"] == "":
-        raise ValueError("find_text не может быть пустым")
+        raise ToolError("find_text не может быть пустым")
     if any(field in result for field in ("name_prefix", "name_suffix", "find_text", "replace_text")):
         result.setdefault("name_prefix", "")
         result.setdefault("name_suffix", "")
@@ -644,7 +648,7 @@ def _renamed_name(name: str, changes: dict[str, Any]) -> str:
     name = changes.get("name_prefix", "") + name + changes.get("name_suffix", "")
     name = name.strip()
     if not name or len(name) > 120:
-        raise ValueError("Массовое переименование создаёт пустое имя или имя длиннее 120 символов")
+        raise ToolError("Массовое переименование создаёт пустое имя или имя длиннее 120 символов")
     return name
 
 

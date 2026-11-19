@@ -1250,6 +1250,10 @@ class PanelState:
         except Exception as exc:
             self.drive_push_error = "Не удалось сразу обновить Google Drive; автоматическая попытка повторится позже"
             safe_detail = _safe_sync_error(str(exc))
+            if isinstance(exc, httpx.TimeoutException) and not _test_environment.get():
+                self.drive_push_error = "Google Drive обновляется дольше обычного; следующая синхронизация повторит попытку"
+                log.info("Immediate Drive update timed out; scheduled sync remains the recovery path")
+                return {"ok": True, "pending": True, "message": self.drive_push_error}
             log.warning("Immediate Drive update failed (%s%s)", type(exc).__name__,
                         f": {safe_detail}" if safe_detail else "")
             return {"ok": False, "pending": True, "message": self.drive_push_error}
@@ -2230,7 +2234,8 @@ def _test_activation_page(title: str, message: str, activation_id: str, token: s
                           csrf: str | None = None, *, limit: int = 1, registered: int = 0,
                           selected_platform: str = "", device_registered: bool = False,
                           happ_link: str | None = None, auto_open: bool = False,
-                          tone: str = "normal", test_mode: bool = True) -> str:
+                          tone: str = "normal", test_mode: bool = True,
+                          pending_import: bool = False, status_url: str = "") -> str:
     route_prefix = "/test" if test_mode else ""
     mode_suffix = " · ТЕСТ" if test_mode else ""
     page_tag = "ТЕСТОВАЯ СРЕДА · SECURE X" if test_mode else "SECURE X · ПОДТВЕРЖДЕНИЕ ДОСТУПА"
@@ -2251,7 +2256,11 @@ def _test_activation_page(title: str, message: str, activation_id: str, token: s
             f'<button type="submit" id="confirmDevice">{("Продолжить на этом устройстве" if device_registered else "Подтвердить устройство")}</button>'
             f'</form>')
     happ_action = ""
-    if happ_link:
+    if pending_import:
+        happ_action = ('<section class="tv-import" id="activationPending" role="status" aria-live="polite">'
+                       '<b>Готовим подписку</b><p class="foot">Подтверждение сохранено. Ссылка появится здесь автоматически.</p></section>'
+                       '<div id="activationReady" hidden></div>')
+    elif happ_link:
         if safe_selected == "appletv":
             happ_action = (f'<section class="tv-import"><b>Перенос на Apple TV{mode_suffix}</b>'
                 '<p class="foot">На Apple TV откройте Happ → Web Import. На телефоне откройте tv.happ.su, введите временный код с экрана телевизора и отправьте туда эту зашифрованную ссылку.</p>'
@@ -2264,6 +2273,15 @@ def _test_activation_page(title: str, message: str, activation_id: str, token: s
     install_action = (f'<a class="install-link" id="installLink" href="{install_url}" target="_blank" rel="noopener noreferrer">'
                       'Установить Happ для этого устройства</a>')
     links_json = json.dumps(TEST_ACTIVATION_INSTALL_LINKS, ensure_ascii=True)
+    poll_script = ""
+    if pending_import and status_url:
+        poll_script = ("(()=>{const node=document.getElementById('activationPending');const result=document.getElementById('activationReady');"
+            f"const url={json.dumps(status_url)};let attempts=0;async function check(){{try{{const response=await fetch(url,{{cache:'no-store',credentials:'same-origin',headers:{{Accept:'application/json'}}}});"
+            "const data=await response.json();if(data.ready&&data.happ_link){node.hidden=true;const link=document.createElement('a');link.className='app-button';"
+            "link.href=data.happ_link;link.rel='noreferrer';link.textContent='Открыть и добавить в Happ';result.append(link);"
+            "const note=document.createElement('p');note.className='foot';note.textContent='Подписка подготовлена. Нажмите кнопку, чтобы открыть Happ.';result.append(note);result.hidden=false;return;}"
+            "if(data.error){node.textContent=data.error;return;}}catch{}attempts++;if(attempts<45)setTimeout(check,1500);"
+            "else node.textContent='Подготовка занимает больше обычного. Обновите страницу через минуту.';}check();})();")
     meter = f'<div class="slot-meter"><b>{min(registered, limit)} / {limit}</b><span>занято устройств</span></div>'
     return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -2281,7 +2299,7 @@ select{{width:100%;min-height:48px;margin-top:8px;padding:10px 12px;border:1px s
 </style></head><body><main><p class="tag">{html.escape(page_tag)}</p><h1>{title_html}</h1>
 <p class="notice">{message_html}</p>{meter}{activation_form}{install_action}{happ_action}
 <p class="privacy">Для запоминания регистрации используется случайный cookie этого браузера. В панели сохраняются выбранная платформа, язык браузера и его тип/версия. IP-адрес и скрытый отпечаток устройства не сохраняются. Очистка cookies или другой браузер считаются новым устройством.</p>
-<script>(()=>{{const names={json.dumps(TEST_ACTIVATION_PLATFORMS, ensure_ascii=False)};const links={links_json};const select=document.querySelector('select[name="platform"]');const picker=document.getElementById('devicePicker');const detect=document.getElementById('deviceDetect');const manual=document.getElementById('manualDevice');const install=document.getElementById('installLink');const openHapp=document.getElementById('openHapp');if(openHapp&&{json.dumps(bool(auto_open))})setTimeout(()=>{{window.location.href=openHapp.href;}},350);if(!select)return;const copyButton=document.getElementById('copySubscription');if(copyButton)copyButton.addEventListener('click',async()=>{{const input=document.getElementById('subscriptionLink');try{{if(!navigator.clipboard?.writeText)throw new Error('clipboard');await navigator.clipboard.writeText(input.value);copyButton.textContent='Скопировано';}}catch{{input.focus();input.select();copyButton.textContent='Ссылка выделена для копирования';}}}});let ua=navigator.userAgent||'';let platform='';if(/AppleTV|tvOS/i.test(ua))platform='appletv';else if(/Vision/i.test(ua))platform='visionos';else if(/CrOS/i.test(ua))platform='chromeos';else if(/Android/i.test(ua)&&/TV|Leanback/i.test(ua))platform='android_tv';else if(/iPhone|iPad|iPod/i.test(ua)||(/Macintosh/i.test(ua)&&navigator.maxTouchPoints>1))platform='ios';else if(/Android/i.test(ua))platform='android';else if(/Windows/i.test(ua))platform='windows';else if(/Macintosh|Mac OS X/i.test(ua))platform='macos';else if(/Linux|X11/i.test(ua))platform='linux';const preset={json.dumps(safe_selected)};if(preset)platform=preset;if(platform&&[...select.options].some(o=>o.value===platform)){{select.value=platform;detect.textContent='Устройство: '+names[platform]+(preset?' · это устройство уже подтверждено':' · определено браузером');picker.hidden=true;manual.textContent='Определено неверно? Выбрать вручную';}}else{{select.value='';picker.hidden=false;detect.textContent='Не удалось определить устройство. Выберите платформу вручную.';manual.hidden=true;}}function syncLink(){{const key=select.value||'unknown';install.href=links[key]||links.unknown;install.textContent='Установить Happ · '+(names[key]||names.unknown);}}manual.addEventListener('click',()=>{{picker.hidden=false;select.focus();manual.hidden=true;detect.textContent='Выберите платформу вручную. Это не меняет лимит регистрации.';}});select.addEventListener('change',syncLink);syncLink();}})();</script></main></body></html>"""
+<script>(()=>{{const names={json.dumps(TEST_ACTIVATION_PLATFORMS, ensure_ascii=False)};const links={links_json};const select=document.querySelector('select[name="platform"]');const picker=document.getElementById('devicePicker');const detect=document.getElementById('deviceDetect');const manual=document.getElementById('manualDevice');const install=document.getElementById('installLink');const openHapp=document.getElementById('openHapp');if(openHapp&&{json.dumps(bool(auto_open))})setTimeout(()=>{{window.location.href=openHapp.href;}},350);if(!select)return;const copyButton=document.getElementById('copySubscription');if(copyButton)copyButton.addEventListener('click',async()=>{{const input=document.getElementById('subscriptionLink');try{{if(!navigator.clipboard?.writeText)throw new Error('clipboard');await navigator.clipboard.writeText(input.value);copyButton.textContent='Скопировано';}}catch{{input.focus();input.select();copyButton.textContent='Ссылка выделена для копирования';}}}});let ua=navigator.userAgent||'';let platform='';if(/AppleTV|tvOS/i.test(ua))platform='appletv';else if(/Vision/i.test(ua))platform='visionos';else if(/CrOS/i.test(ua))platform='chromeos';else if(/Android/i.test(ua)&&/TV|Leanback/i.test(ua))platform='android_tv';else if(/iPhone|iPad|iPod/i.test(ua)||(/Macintosh/i.test(ua)&&navigator.maxTouchPoints>1))platform='ios';else if(/Android/i.test(ua))platform='android';else if(/Windows/i.test(ua))platform='windows';else if(/Macintosh|Mac OS X/i.test(ua))platform='macos';else if(/Linux|X11/i.test(ua))platform='linux';const preset={json.dumps(safe_selected)};if(preset)platform=preset;if(platform&&[...select.options].some(o=>o.value===platform)){{select.value=platform;detect.textContent='Устройство: '+names[platform]+(preset?' · это устройство уже подтверждено':' · определено браузером');picker.hidden=true;manual.textContent='Определено неверно? Выбрать вручную';}}else{{select.value='';picker.hidden=false;detect.textContent='Не удалось определить устройство. Выберите платформу вручную.';manual.hidden=true;}}function syncLink(){{const key=select.value||'unknown';install.href=links[key]||links.unknown;install.textContent='Установить Happ · '+(names[key]||names.unknown);}}manual.addEventListener('click',()=>{{picker.hidden=false;select.focus();manual.hidden=true;detect.textContent='Выберите платформу вручную. Это не меняет лимит регистрации.';}});select.addEventListener('change',syncLink);syncLink();}})();{poll_script}</script></main></body></html>"""
 
 
 def _test_activation_gate_profile(activation_url: str, user_name: str = "", *, test_mode: bool = True) -> str:
@@ -2782,12 +2800,15 @@ async def activations_list(request: Request):
             FROM {devices_table} d JOIN {activation_table} a ON a.user_id=d.user_id
             ORDER BY d.registered_at,d.device_hash""")
     devices_by_user: dict[int, list[dict]] = {}
+    test_mode = bool(scope["test_mode"])
     for row in devices:
         item = _serialize(row)
-        item.pop("device_hash", None)
+        if test_mode:
+            item.pop("device_hash", None)
+        else:
+            item["device_id"] = item.pop("device_hash", None)
         item["platform_label"] = TEST_ACTIVATION_PLATFORMS.get(row["platform"], "Другое устройство")
         devices_by_user.setdefault(int(row["user_id"]), []).append(item)
-    test_mode = bool(scope["test_mode"])
     result = []
     base = str(request.base_url).rstrip("/")
     for row in rows:
@@ -2837,29 +2858,61 @@ async def activation_reset(user_id: int, request: Request):
     devices_table = str(scope["devices_table"])
     if test_mode:
         nonce, token_hash = _new_test_activation_credentials(user_id)
-    else:
-        nonce, token_hash = _main_activation_credentials(user_id)
     pool = await state.db()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            row = await conn.fetchrow(f"""UPDATE {activation_table} SET token_nonce=$2,token_hash=$3,
-                activated_at=NULL,drive_ready_at=NULL,updated_at=now()
-                WHERE user_id=$1 RETURNING user_id""", user_id, nonce, token_hash)
+            if test_mode:
+                row = await conn.fetchrow(f"""UPDATE {activation_table} SET token_nonce=$2,token_hash=$3,
+                    activated_at=NULL,drive_ready_at=NULL,updated_at=now()
+                    WHERE user_id=$1 RETURNING user_id""", user_id, nonce, token_hash)
+            else:
+                row = await conn.fetchrow("""UPDATE subscription_activation SET activated_at=NULL,updated_at=now()
+                    WHERE user_id=$1 RETURNING user_id,token_nonce""", user_id)
+                if row:
+                    nonce = row["token_nonce"]
             if row:
                 await conn.execute(f"DELETE FROM {devices_table} WHERE user_id=$1", user_id)
-                await conn.execute("""UPDATE users SET device_limit=NULL,happ_install_code=NULL,limited_link=NULL,
-                    device_limit_status='none',device_limit_error=NULL,updated_at=now() WHERE id=$1""", user_id)
+                if test_mode:
+                    await conn.execute("""UPDATE users SET device_limit=NULL,happ_install_code=NULL,limited_link=NULL,
+                        device_limit_status='none',device_limit_error=NULL,updated_at=now() WHERE id=$1""", user_id)
     if not row:
         raise HTTPException(404, "Render-активация не включена для этой подписки")
-    drive_sync = await state.push_drive_sync([user_id])
-    return {"ok": True, "activation_id": _activation_id(user_id, test_mode=test_mode),
-            "activation_url": _activation_url(user_id, nonce, str(request.base_url).rstrip("/"),
-                                                test_mode=test_mode),
-            "drive_sync": drive_sync}
+    activation_url = _activation_url(user_id, nonce, str(request.base_url).rstrip("/"), test_mode=test_mode)
+    if test_mode:
+        drive_sync = await state.push_drive_sync([user_id])
+        return {"ok": True, "activation_id": _activation_id(user_id, test_mode=True),
+                "activation_url": activation_url, "drive_sync": drive_sync}
+    return {"ok": True, "activation_id": _main_activation_id(user_id),
+            "activation_url": activation_url, "registered_count": 0}
+
+
+async def activation_device_delete(user_id: int, device_hash: str, request: Request):
+    _auth(request, csrf=True)
+    if _test_environment.get():
+        raise HTTPException(404, "Not found")
+    if not re.fullmatch(r"[a-f0-9]{64}", device_hash):
+        raise HTTPException(404, "Устройство не найдено")
+    pool = await state.db()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            activation = await conn.fetchval(
+                "SELECT user_id FROM subscription_activation WHERE user_id=$1 FOR UPDATE", user_id)
+            if activation is None:
+                raise HTTPException(404, "Активация не найдена")
+            deleted = await conn.fetchval("""DELETE FROM activation_devices
+                WHERE user_id=$1 AND device_hash=$2 RETURNING device_hash""", user_id, device_hash)
+            if deleted is None:
+                raise HTTPException(404, "Устройство не найдено")
+            remaining = int(await conn.fetchval(
+                "SELECT count(*) FROM activation_devices WHERE user_id=$1", user_id) or 0)
+            if remaining == 0:
+                await conn.execute("""UPDATE subscription_activation SET activated_at=NULL,updated_at=now()
+                    WHERE user_id=$1""", user_id)
+    return {"ok": True, "removed": True, "registered_count": remaining}
 
 
 @router.post("/api/admin/users/{user_id}/activation/retry")
-async def activation_retry(user_id: int, request: Request):
+async def activation_retry(user_id: int, request: Request, background_tasks: BackgroundTasks):
     _auth(request, csrf=True)
     scope = _activation_scope()
     activation_table = str(scope["activation_table"])
@@ -2868,6 +2921,9 @@ async def activation_retry(user_id: int, request: Request):
         exists = await conn.fetchval(f"SELECT EXISTS(SELECT 1 FROM {activation_table} WHERE user_id=$1)", user_id)
     if not exists:
         raise HTTPException(404, "Render-активация не включена для этой подписки")
+    if not scope["test_mode"]:
+        background_tasks.add_task(state.push_drive_sync, [user_id])
+        return {"ok": True, "message": "Синхронизация Google Drive запущена в фоне."}
     delivery = await state.push_drive_sync([user_id])
     if delivery.get("ok") and not delivery.get("pending") and int(delivery.get("processed") or 0) > 0:
         async with pool.acquire() as conn:
@@ -3263,9 +3319,13 @@ async def _ensure_activation_import_link(user_id: int, cookie_value: str,
                           if is_test else "Подписка отключена или срок её действия закончился.")
         if not row["drive_file_id"]:
             return None, "Подписка ещё готовится. Повторите подтверждение позже."
-        if not row["drive_ready_at"]:
+        if is_test and not row["drive_ready_at"]:
             return None, "Полная подписка ещё готовится. Повторите подтверждение позже."
         if row["subscription_token_hash"] == slot_token_hash and row["encrypted_link"]:
+            if not is_test:
+                async with pool.acquire() as conn:
+                    await conn.execute("""UPDATE subscription_activation SET drive_ready_at=COALESCE(drive_ready_at,now())
+                        WHERE user_id=$1""", user_id)
             return str(row["encrypted_link"]), None
 
         source_url = (_activation_slot_url(user_id, slot_token, fallback_base_url, test_mode=True)
@@ -3282,6 +3342,9 @@ async def _ensure_activation_import_link(user_id: int, cookie_value: str,
                 subscription_token_hash=$3,encrypted_link=$4,last_seen_at=now()
                 WHERE user_id=$1 AND device_hash=$2 RETURNING user_id""",
                 user_id, browser_hash, slot_token_hash, encrypted_link)
+            if saved and not is_test:
+                await conn.execute("""UPDATE subscription_activation SET drive_ready_at=COALESCE(drive_ready_at,now()),
+                    updated_at=now() WHERE user_id=$1""", user_id)
         if not saved:
             return None, "Слот регистрации изменился. Обновите страницу активации."
         return encrypted_link, None
@@ -3292,6 +3355,36 @@ async def _ensure_activation_import_link(user_id: int, cookie_value: str,
 async def _ensure_test_device_import_link(user_id: int, cookie_value: str,
                                           fallback_base_url: str | None = None) -> tuple[str | None, str | None]:
     return await _ensure_activation_import_link(user_id, cookie_value, fallback_base_url, test_mode=True)
+
+
+_main_activation_link_jobs: set[tuple[int, str]] = set()
+_main_activation_link_errors: dict[tuple[int, str], str] = {}
+
+
+def _schedule_main_activation_link(background_tasks: BackgroundTasks, user_id: int, cookie_value: str) -> None:
+    device_hash = _main_activation_browser_hash(cookie_value)
+    job_key = (int(user_id), device_hash)
+    if job_key in _main_activation_link_jobs:
+        return
+    _main_activation_link_errors.pop(job_key, None)
+    _main_activation_link_jobs.add(job_key)
+    background_tasks.add_task(_prepare_main_activation_link, int(user_id), cookie_value, job_key)
+
+
+async def _prepare_main_activation_link(user_id: int, cookie_value: str,
+                                        job_key: tuple[int, str]) -> None:
+    context = _test_environment.set(False)
+    try:
+        _, error = await _ensure_activation_import_link(user_id, cookie_value, test_mode=False)
+        if error:
+            _main_activation_link_errors[job_key] = error
+            log.info("Activation import link is not ready yet: user=%d reason=%s", user_id, error[:120])
+    except Exception as exc:
+        _main_activation_link_errors[job_key] = "Не удалось подготовить ссылку. Обновите страницу, чтобы повторить попытку."
+        log.warning("Activation import link preparation failed: user=%d error=%s", user_id, type(exc).__name__)
+    finally:
+        _main_activation_link_jobs.discard(job_key)
+        _test_environment.reset(context)
 
 
 async def test_activation_reset(user_id: int, request: Request):
@@ -3819,7 +3912,8 @@ async def _sync_activated_test_subscription(user_id: int):
         _test_environment.reset(token)
 
 
-async def _activation_get_current(activation_id: str, token: str, request: Request):
+async def _activation_get_current(activation_id: str, token: str, request: Request,
+                                 background_tasks: BackgroundTasks | None = None):
     scope = _activation_scope()
     test_mode = bool(scope["test_mode"])
     activation_table = str(scope["activation_table"])
@@ -3883,7 +3977,7 @@ async def _activation_get_current(activation_id: str, token: str, request: Reque
     known_device = None
     async with pool.acquire() as conn:
         if not set_cookie:
-            known_device = await conn.fetchrow(f"""SELECT platform FROM {devices_table}
+            known_device = await conn.fetchrow(f"""SELECT platform,subscription_token_hash,encrypted_link FROM {devices_table}
                 WHERE user_id=$1 AND device_hash=$2""", activation_user_id, browser_hash)
         registered = int(await conn.fetchval(f"SELECT count(*) FROM {devices_table} WHERE user_id=$1",
                                              activation_user_id) or 0)
@@ -3904,9 +3998,21 @@ async def _activation_get_current(activation_id: str, token: str, request: Reque
         selected = known_device["platform"] if known_device else ""
         import_link = None
         import_error = None
+        import_pending = False
         if known:
-            import_link, import_error = await _ensure_activation_import_link(
-                activation_user_id, cookie_value, str(request.base_url).rstrip("/"), test_mode=test_mode)
+            if test_mode:
+                import_link, import_error = await _ensure_activation_import_link(
+                    activation_user_id, cookie_value, str(request.base_url).rstrip("/"), test_mode=True)
+            else:
+                slot_token = _main_slot_token(activation_user_id, cookie_value)
+                current_link_hash = hashlib.sha256(f"drive-v1:{slot_token}".encode()).hexdigest()
+                if (known_device["subscription_token_hash"] == current_link_hash and known_device["encrypted_link"]):
+                    import_link = str(known_device["encrypted_link"])
+                elif background_tasks is not None:
+                    _schedule_main_activation_link(background_tasks, activation_user_id, cookie_value)
+                    import_pending = True
+                else:
+                    import_error = "Персональная ссылка готовится. Обновите страницу через несколько секунд."
         message = (f"Это устройство уже зарегистрировано. Лимит устройств: {row['device_limit']}."
                    if known else f"Выберите платформу и подтвердите браузер. Лимит устройств: {row['device_limit']}.")
         if import_error:
@@ -3914,7 +4020,9 @@ async def _activation_get_current(activation_id: str, token: str, request: Reque
         page = _test_activation_page(
             ("Добавить Secure X в Happ" if not known else "Устройство подтверждено") + (" · ТЕСТ" if test_mode else ""),
             message, activation_id, token, csrf, limit=int(row["device_limit"]), registered=registered,
-            selected_platform=selected, device_registered=known, happ_link=import_link, test_mode=test_mode)
+            selected_platform=selected, device_registered=known, happ_link=import_link, test_mode=test_mode,
+            pending_import=import_pending,
+            status_url=f"/activate/{activation_id}/{token}/status" if import_pending and not test_mode else "")
     response = HTMLResponse(page, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
     if response_cookie:
         response.set_cookie(cookie_name, cookie_value, max_age=365 * 24 * 60 * 60,
@@ -3930,15 +4038,63 @@ async def _test_activation_get(activation_id: str, token: str, request: Request)
         _test_environment.reset(context)
 
 
-async def _main_activation_get(activation_id: str, token: str, request: Request):
+async def _main_activation_get(activation_id: str, token: str, request: Request,
+                               background_tasks: BackgroundTasks):
     context = _test_environment.set(False)
     try:
-        return await _activation_get_current(activation_id, token, request)
+        return await _activation_get_current(activation_id, token, request, background_tasks)
     finally:
         _test_environment.reset(context)
 
 
-async def _activation_post_current(activation_id: str, token: str, request: Request):
+async def _main_activation_status(activation_id: str, token: str, request: Request,
+                                  background_tasks: BackgroundTasks):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{40,48}", token):
+        return JSONResponse({"error": "Ссылка активации недействительна."}, status_code=404)
+    user_id = _activation_user_id(activation_id, test_mode=False)
+    if user_id is None:
+        return JSONResponse({"error": "Ссылка активации недействительна."}, status_code=404)
+    cookie_value = request.cookies.get("subscription_activation_browser", "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{30,64}", cookie_value):
+        return JSONResponse({"error": "Откройте страницу активации в этом же браузере."}, status_code=403)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    browser_hash = _main_activation_browser_hash(cookie_value)
+    try:
+        pool = await state.db()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("""SELECT a.device_limit,u.status,u.enabled,u.expires_at,u.drive_file_id,
+                d.device_hash,d.subscription_token_hash,d.encrypted_link
+                FROM subscription_activation a JOIN users u ON u.id=a.user_id
+                LEFT JOIN activation_devices d ON d.user_id=a.user_id AND d.device_hash=$3
+                WHERE a.user_id=$1 AND a.token_hash=$2""", user_id, token_hash, browser_hash)
+    except Exception as exc:
+        log.info("Activation status lookup unavailable: user=%d reason=%s", user_id, type(exc).__name__)
+        return JSONResponse({"error": "Не удалось проверить подтверждение. Повторите попытку."}, status_code=503)
+    if not row:
+        return JSONResponse({"error": "Ссылка активации недействительна."}, status_code=404)
+    if row["device_hash"] is None:
+        return JSONResponse({"error": "Это устройство не зарегистрировано. Обновите страницу активации."},
+                            status_code=403)
+    if row["status"] != "active" or not row["enabled"] or (
+            row["expires_at"] and row["expires_at"] <= datetime.now(timezone.utc)):
+        return JSONResponse({"error": "Подписка отключена или срок её действия закончился."}, status_code=409)
+    if not row["drive_file_id"]:
+        return JSONResponse({"error": "Файл подписки ещё готовится. Обновите страницу позже."}, status_code=409)
+    slot_token = _main_slot_token(user_id, cookie_value)
+    expected_hash = hashlib.sha256(f"drive-v1:{slot_token}".encode()).hexdigest()
+    if row["subscription_token_hash"] == expected_hash and row["encrypted_link"]:
+        return JSONResponse({"ready": True, "happ_link": str(row["encrypted_link"])},
+                            headers={"Cache-Control": "no-store"})
+    job_key = (user_id, browser_hash)
+    if job_key in _main_activation_link_errors:
+        return JSONResponse({"error": _main_activation_link_errors[job_key]},
+                            headers={"Cache-Control": "no-store"})
+    _schedule_main_activation_link(background_tasks, user_id, cookie_value)
+    return JSONResponse({"ready": False, "pending": True}, headers={"Cache-Control": "no-store"})
+
+
+async def _activation_post_current(activation_id: str, token: str, request: Request,
+                                  background_tasks: BackgroundTasks | None = None):
     scope = _activation_scope()
     test_mode = bool(scope["test_mode"])
     activation_table = str(scope["activation_table"])
@@ -3998,6 +4154,8 @@ async def _activation_post_current(activation_id: str, token: str, request: Requ
                 return form_error("Подписка недоступна",
                     "Тестовая подписка отключена или срок её действия закончился." if test_mode
                     else "Подписка отключена или срок её действия закончился.", 409)
+            if not row["drive_file_id"]:
+                return form_error("Профиль готовится", "Файл подписки ещё не создан. Повторите попытку позже.", 409)
             limit = int(row["device_limit"])
             existing = await conn.fetchrow(f"""SELECT device_hash FROM {devices_table}
                 WHERE user_id=$1 AND device_hash=$2 FOR UPDATE""", activation_user_id, browser_hash)
@@ -4023,21 +4181,31 @@ async def _activation_post_current(activation_id: str, token: str, request: Requ
                 registered += 1
             await conn.execute(f"""UPDATE {activation_table} SET activated_at=COALESCE(activated_at,now()),
                 updated_at=now() WHERE user_id=$1""", activation_user_id)
-    delivery = {"ok": True, "pending": False}
-    if needs_drive_sync:
-        delivery = await state.push_drive_sync([activation_user_id])
-        drive_ready = (delivery.get("ok") and not delivery.get("pending")
-                       and int(delivery.get("processed") or 0) > 0)
-        if drive_ready:
-            async with pool.acquire() as conn:
-                await conn.execute(f"""UPDATE {activation_table} SET drive_ready_at=now(),updated_at=now()
-                    WHERE user_id=$1 AND activated_at IS NOT NULL""", activation_user_id)
+    import_pending = False
+    if test_mode:
+        delivery = {"ok": True, "pending": False}
+        if needs_drive_sync:
+            delivery = await state.push_drive_sync([activation_user_id])
+            drive_ready = (delivery.get("ok") and not delivery.get("pending")
+                           and int(delivery.get("processed") or 0) > 0)
+            if drive_ready:
+                async with pool.acquire() as conn:
+                    await conn.execute(f"""UPDATE {activation_table} SET drive_ready_at=now(),updated_at=now()
+                        WHERE user_id=$1 AND activated_at IS NOT NULL""", activation_user_id)
+        else:
+            drive_ready = True
+        share_link, link_error = (await _ensure_activation_import_link(
+            activation_user_id, cookie_value, str(request.base_url).rstrip("/"), test_mode=True)
+            if drive_ready else
+            (None, "Подписка ещё готовится. Повторите подтверждение с этого же браузера позже."))
     else:
-        drive_ready = True
-    share_link, link_error = (await _ensure_activation_import_link(
-        activation_user_id, cookie_value, str(request.base_url).rstrip("/"), test_mode=test_mode)
-        if drive_ready else
-        (None, "Подписка ещё готовится. Повторите подтверждение с этого же браузера позже."))
+        # Confirmation only consumes a browser slot. Do not hold the customer's
+        # page open while Apps Script and Happ prepare the import link.
+        share_link = None
+        link_error = None
+        import_pending = True
+        if background_tasks is not None:
+            _schedule_main_activation_link(background_tasks, activation_user_id, cookie_value)
     message = ("Регистрация этого браузера уже была сохранена." if already_registered else
                ("Устройство зарегистрировано. Добавьте индивидуальную тестовую подписку кнопкой ниже."
                 if test_mode else "Устройство зарегистрировано. Добавьте индивидуальную подписку кнопкой ниже."))
@@ -4049,7 +4217,9 @@ async def _activation_post_current(activation_id: str, token: str, request: Requ
     page = _test_activation_page("Устройство зарегистрировано" + (" · ТЕСТ" if test_mode else ""),
         message, activation_id, token, csrf,
         limit=limit, registered=registered, selected_platform=platform, device_registered=True,
-        happ_link=share_link, auto_open=bool(share_link and platform != "appletv"), tone=tone, test_mode=test_mode)
+        happ_link=share_link, auto_open=bool(share_link and platform != "appletv"), tone=tone, test_mode=test_mode,
+        pending_import=import_pending,
+        status_url=f"/activate/{activation_id}/{token}/status" if import_pending else "")
     response = HTMLResponse(page, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
     response.set_cookie(cookie_name, cookie_value, max_age=365 * 24 * 60 * 60,
         httponly=True, secure=True, samesite="lax", path=cookie_path)
@@ -4064,10 +4234,11 @@ async def _test_activation_post(activation_id: str, token: str, request: Request
         _test_environment.reset(context)
 
 
-async def _main_activation_post(activation_id: str, token: str, request: Request):
+async def _main_activation_post(activation_id: str, token: str, request: Request,
+                               background_tasks: BackgroundTasks):
     context = _test_environment.set(False)
     try:
-        return await _activation_post_current(activation_id, token, request)
+        return await _activation_post_current(activation_id, token, request, background_tasks)
     finally:
         _test_environment.reset(context)
 
@@ -4216,8 +4387,12 @@ def install(app: FastAPI):
                       methods=["GET"], include_in_schema=False)
     app.add_api_route("/activate/{activation_id}/{token}", _main_activation_post,
                       methods=["POST"], include_in_schema=False)
+    app.add_api_route("/activate/{activation_id}/{token}/status", _main_activation_status,
+                      methods=["GET"], include_in_schema=False)
     app.add_api_route("/sub/{activation_id}/{slot_token}", _main_slot_subscription_get,
                       methods=["GET", "HEAD"], include_in_schema=False)
+    app.add_api_route("/api/admin/users/{user_id}/activation/devices/{device_hash}", activation_device_delete,
+                      methods=["DELETE"], include_in_schema=False)
     app.add_api_route("/test/api/admin/users/{user_id}/test-activation/reset", test_activation_reset,
                       methods=["POST"], include_in_schema=False)
     app.add_api_route("/test/api/admin/users/{user_id}/test-activation/retry", test_activation_retry,
