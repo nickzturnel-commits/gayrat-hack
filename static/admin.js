@@ -488,14 +488,19 @@
     const data = await api(panelUrl('/api/admin/activations'));
     const activations = data.activations || [];
     const marker = testMode ? ' · ТЕСТ' : '';
+    const activationHeading = testMode ? 'Отдельный Render-доступ для каждого браузерного слота'
+      : 'Отдельная регистрация браузерного слота';
+    const activationIntro = testMode
+      ? 'Ссылку можно добавить в Happ: сначала появится заглушка с кнопкой подтверждения. После подтверждения Render выдаст этому слоту отдельную зашифрованную ссылку на профиль Google Drive. Лимит считает Render, Happ Provider API не используется. Данные этой среды изолированы.'
+      : 'Render подтверждает браузер и считает занятые слоты. После подтверждения Happ получает зашифрованную ссылку напрямую на профиль Google Drive, поэтому обновления подписки не проходят через Render.';
     root.innerHTML = pageHead(`Активация${marker}`, `<button type="button" id="refreshActivations" class="button button-secondary">${svg('refresh')}<span>Обновить статус</span></button>`)
-      + `<div class="setting-note activation-intro"><b>Отдельный Render-доступ для каждого браузерного слота</b><span>Ссылку можно добавить в Happ: сначала появится заглушка с кнопкой подтверждения. После подтверждения Render выдаст этому слоту отдельную зашифрованную ссылку на профиль Google Drive. Лимит считает Render, Happ Provider API не используется.${testMode ? ' Данные этой среды изолированы.' : ''}</span></div>`
+      + `<div class="setting-note activation-intro"><b>${activationHeading}</b><span>${activationIntro}</span></div>`
       + (activations.length ? `<div class="card-list activation-list">${activations.map(item => {
         const count = Number(item.registered_count) || 0;
         const limit = Number(item.device_limit) || 1;
         const status = item.status !== 'active' || !item.enabled ? 'Отключена' : item.expires_at && new Date(item.expires_at).getTime() <= Date.now() ? 'Истекла' : 'Активна';
         const tone = status === 'Активна' ? 'badge-good' : 'badge-warn';
-        const devices = item.devices?.length ? `<div class="activation-device-list">${item.devices.map(device => `<div class="activation-device-row"><div><b>${esc(device.platform_label || 'Устройство')}</b><span>${esc(device.browser || 'Браузер не определён')}${device.language ? ` · ${esc(device.language)}` : ''} · ${device.import_link_ready ? 'ссылка Happ готова' : 'ссылка создастся при подтверждении'}</span></div><small>Добавлено ${esc(date(device.registered_at))}<br>Последний вход ${esc(date(device.last_seen_at))}</small></div>`).join('')}</div>` : '<p class="field-hint">Пока нет зарегистрированных браузеров.</p>';
+        const devices = item.devices?.length ? `<div class="activation-device-list">${item.devices.map(device => `<div class="activation-device-row"><div><b>${esc(device.platform_label || 'Устройство')}</b><span>${esc(device.browser || 'Браузер не определён')}${device.language ? ` · ${esc(device.language)}` : ''} · ${device.import_link_ready ? 'ссылка Happ готова' : 'ссылка создастся при подтверждении'}</span></div><small>Добавлено ${esc(date(device.registered_at))}<br>Последний вход ${esc(date(device.last_seen_at))}</small>${!testMode && device.device_id ? `<button type="button" class="button button-danger activation-device-remove" data-remove-activation-device="${esc(device.device_id)}">Удалить</button>` : ''}</div>`).join('')}</div>` : '<p class="field-hint">Пока нет зарегистрированных браузеров.</p>';
         return `<article class="surface-card activation-card" data-activation-card="${item.id}">
           <div class="activation-card-head"><div><p class="eyebrow">${esc(item.activation_id)}${marker}</p><h2>${esc(item.name)}</h2></div><span class="badge ${tone}">${status}</span></div>
           <div class="activation-meter"><strong>${count} <span>/ ${limit}</span></strong><small>слотов браузера · готовых зашифрованных ссылок: ${Number(item.render_links_ready) || 0}</small></div>
@@ -503,7 +508,7 @@
           <p class="field-hint">В Happ сначала появится заглушка. Откройте в профиле кнопку «Подтвердить устройство», затем нажмите на сайте «Открыть и добавить в Happ».</p>
           <div class="activation-actions"><button type="button" class="button button-secondary" data-copy-activation>${svg('copy')}<span>Копировать ссылку</span></button><label>Лимит устройств<input data-activation-limit type="number" min="1" max="20" step="1" value="${limit}"></label><button type="button" class="button button-primary" data-save-activation-limit>${svg('edit')}<span>Сохранить лимит</span></button>${count && !item.drive_ready_at ? `<button type="button" class="button button-secondary" data-retry-activation>${svg('refresh')}<span>Повторить синхронизацию Drive</span></button>` : ''}<button type="button" class="button button-danger" data-reset-activation>${svg('refresh')}<span>Сбросить регистрации</span></button></div>
           <section class="activation-devices"><div class="section-heading"><h3>Зарегистрированные браузеры</h3><span>${count} занято · лимит ${limit}</span></div>${devices}</section>
-          <p class="field-hint">Сброс создаёт новый адрес, удаляет регистрации и отзывает все старые Render-ссылки этой подписки.</p>
+          <p class="field-hint">${testMode ? 'Сброс создаёт новый адрес, удаляет регистрации и отзывает все старые Render-ссылки этой подписки.' : 'Сброс удаляет все регистрации, но сохраняет адрес активации. Уже добавленная ссылка Google Drive не отзывается отдельно для устройства.'}</p>
         </article>`;
       }).join('')}</div>` : `<div class="empty-state"><div class="empty-orbit">${testMode ? 'Т' : 'A'}</div><h2>Пока нет ссылок активации</h2><p>Включите Render-активацию при создании или изменении подписки.</p><button type="button" class="button button-primary" data-go-users>Открыть подписки</button></div>`);
     root.onclick = async event => {
@@ -532,11 +537,23 @@
           await activations(root);
           return;
         }
+        if (button.dataset.removeActivationDevice !== undefined) {
+          if (!confirm('Удалить эту регистрацию и освободить один слот? Уже добавленная в Happ ссылка Google Drive останется доступна этому клиенту.')) return;
+          button.disabled = true;
+          const deviceId = button.dataset.removeActivationDevice;
+          await api(panelUrl(`/api/admin/users/${userId}/activation/devices/${deviceId}`), {method:'DELETE', body:{}});
+          toast('Регистрация удалена, слот освобождён');
+          await activations(root);
+          return;
+        }
         if (button.dataset.resetActivation !== undefined) {
-          if (!confirm('Сбросить регистрации, отозвать старые Render-ссылки и выдать новый адрес активации?')) return;
+          const resetPrompt = testMode
+            ? 'Сбросить регистрации, отозвать старые Render-ссылки и выдать новый адрес активации?'
+            : 'Сбросить все регистрации? Адрес активации останется прежним. Уже добавленные ссылки Google Drive не отзываются.';
+          if (!confirm(resetPrompt)) return;
           button.disabled = true;
           const result = await api(panelUrl(`/api/admin/users/${userId}/activation/reset`), {method:'POST', body:{}});
-          toast(resultText(result, 'Ссылка обновлена, регистрации очищены'));
+          toast(resultText(result, testMode ? 'Ссылка обновлена, регистрации очищены' : 'Регистрации очищены, ссылка сохранена'));
           await activations(root);
           return;
         }
@@ -573,10 +590,12 @@
       } else if (button.dataset.preview) {
         const result = await api(`/api/admin/users/${button.dataset.preview}/preview`);
         openModal('Предпросмотр профиля', `<pre class="preview">${esc(result)}</pre>`);
-      } else if (button.dataset.activationReset && confirm(`Сбросить регистрации и выдать новый адрес? Drive-профиль станет заглушкой до новой активации. Все старые Render-ссылки этой подписки перестанут работать.${testMode ? ' Это тестовая среда.' : ''}`)) {
+      } else if (button.dataset.activationReset && confirm(testMode
+          ? 'Сбросить регистрации и выдать новый адрес? Drive-профиль станет заглушкой до новой активации. Все старые Render-ссылки этой подписки перестанут работать. Это тестовая среда.'
+          : 'Сбросить регистрации? Адрес активации останется прежним. Уже добавленные ссылки Google Drive не отзываются.')) {
         button.disabled = true;
         const result = await api(panelUrl(`/api/admin/users/${button.dataset.activationReset}/activation/reset`), { method: 'POST', body: {} });
-        toast(resultText(result, testMode ? 'Тестовые регистрации сброшены' : 'Регистрации сброшены'));
+        toast(resultText(result, testMode ? 'Тестовые регистрации сброшены' : 'Регистрации очищены, ссылка сохранена'));
         await render();
       } else if (button.dataset.activationRetry) {
         button.disabled = true;

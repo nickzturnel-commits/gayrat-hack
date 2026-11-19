@@ -162,6 +162,7 @@ input:focus,textarea:focus,select:focus{border-color:#82c79b;background:#0e1512;
 .activation-link-field{margin-top:12px}.activation-actions{display:flex;flex-wrap:wrap;align-items:end;gap:8px;margin-top:12px}.activation-actions>label{width:150px}.activation-actions .button{min-height:42px}
 .activation-devices{margin-top:20px;padding-top:14px;border-top:1px solid var(--line)}.activation-devices .section-heading{align-items:center}.activation-devices .section-heading h3{margin:0;font-size:14px}.activation-devices .section-heading>span{color:var(--muted);font-size:11px}
 .activation-device-list{display:grid;gap:0;border-top:1px solid var(--line)}.activation-device-row{display:flex;justify-content:space-between;gap:16px;padding:12px 3px;border-bottom:1px solid var(--line)}.activation-device-row>div{display:grid;gap:3px}.activation-device-row b{font-size:12px}.activation-device-row span,.activation-device-row small{color:var(--muted);font-size:10px}.activation-device-row small{text-align:right;line-height:1.6}
+.activation-device-remove{flex:0 0 auto;min-height:32px;padding:5px 10px;font-size:11px}
 .test-environment .activation-meter{border-left-color:var(--amber)}
 .mobile-login{width:min(480px,calc(100% - 28px));margin:26px auto 30px}.mobile-login-mark{display:none}.mobile-login .login-card{padding:25px 20px}.mobile-login .login-card h1{font-size:25px}
 .mobile-ui .modal-shell{width:calc(100vw - 18px);max-height:calc(100dvh - 26px);border-radius:10px}
@@ -177,7 +178,7 @@ input:focus,textarea:focus,select:focus{border-color:#82c79b;background:#0e1512;
 .mobile-content .bulk-actions .button{flex:1}.mobile-content .source-health-grid{grid-template-columns:1fr}
 .mobile-content .collection-tools{width:100%}.mobile-content .search-box{width:100%}
 .mobile-content .page-head>.button{min-height:36px;padding:7px 9px;font-size:10px}
-.mobile-content .activation-card{padding:14px}.mobile-content .activation-actions>label{flex:1 1 115px;width:auto}.mobile-content .activation-actions>.button{flex:1 1 auto}.mobile-content .activation-device-row{gap:8px}.mobile-content .activation-device-row small{max-width:45%}
+.mobile-content .activation-card{padding:14px}.mobile-content .activation-actions>label{flex:1 1 115px;width:auto}.mobile-content .activation-actions>.button{flex:1 1 auto}.mobile-content .activation-device-row{gap:8px}.mobile-content .activation-device-row small{max-width:45%}.mobile-content .activation-device-remove{max-width:none}
 
 /* Legacy standalone panel */
 body:not(.desktop-ui):not(.mobile-ui){background:var(--bg)!important;color:var(--text)!important}
