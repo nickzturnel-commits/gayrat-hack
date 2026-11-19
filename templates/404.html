@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#080a09">
+  <title>Страница не найдена · Secure X</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #080a09;
+      --panel: #101512;
+      --line: #28352d;
+      --muted: #9aa79e;
+      --text: #f0f2ef;
+      --accent: #d5a84e;
+      --green: #a6d3b4;
+    }
+    * { box-sizing: border-box; }
+    html { min-height: 100%; background: var(--bg); }
+    body {
+      min-height: 100svh;
+      margin: 0;
+      padding: clamp(18px, 5vw, 64px);
+      display: grid;
+      place-items: center;
+      color: var(--text);
+      background:
+        radial-gradient(ellipse at 50% 0%, rgba(38, 61, 46, .24), transparent 54%),
+        var(--bg);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    .page {
+      width: min(100%, 760px);
+      border: 1px solid var(--line);
+      background: linear-gradient(145deg, rgba(19, 27, 22, .98), rgba(13, 17, 15, .98));
+      box-shadow: 0 28px 90px rgba(0, 0, 0, .38);
+    }
+    .topbar {
+      min-height: 64px;
+      padding: 0 clamp(20px, 4vw, 34px);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand { display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 750; letter-spacing: .025em; }
+    .brand-mark { width: 9px; height: 9px; background: var(--accent); transform: rotate(45deg); }
+    .status { color: var(--muted); font: 600 10px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .13em; }
+    .content {
+      padding: clamp(28px, 6vw, 58px) clamp(20px, 6vw, 58px) clamp(26px, 5vw, 48px);
+      display: grid;
+      grid-template-columns: minmax(112px, .65fr) 1.35fr;
+      gap: clamp(22px, 5vw, 54px);
+      align-items: center;
+    }
+    .error-code {
+      color: var(--accent);
+      font: 750 clamp(72px, 15vw, 132px)/.82 ui-monospace, SFMono-Regular, Consolas, monospace;
+      letter-spacing: -.12em;
+    }
+    .eyebrow { margin: 0 0 12px; color: var(--green); font: 650 10px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .16em; }
+    h1 { margin: 0; font-size: clamp(26px, 4.5vw, 38px); line-height: 1.12; letter-spacing: -.04em; }
+    .description { max-width: 430px; margin: 14px 0 22px; color: #b6c0b9; font-size: 15px; line-height: 1.65; }
+    .device {
+      width: fit-content;
+      max-width: 100%;
+      min-height: 40px;
+      margin-bottom: 24px;
+      padding: 9px 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .device-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: var(--green); }
+    .device strong { color: var(--text); font-weight: 650; }
+    .back {
+      min-height: 46px;
+      padding: 0 19px;
+      border: 1px solid #a98138;
+      border-radius: 2px;
+      color: #17140d;
+      background: var(--accent);
+      font: inherit;
+      font-size: 13px;
+      font-weight: 750;
+      cursor: pointer;
+      transition: background-color .16s ease, transform .16s ease;
+    }
+    .back:hover { background: #e2ba6c; transform: translateY(-1px); }
+    .back:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
+    .foot {
+      padding: 15px clamp(20px, 4vw, 34px);
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      border-top: 1px solid var(--line);
+      color: #748178;
+      font: 600 9px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+      letter-spacing: .11em;
+    }
+    .foot strong { color: var(--green); font-weight: 650; }
+    @media (max-width: 560px) {
+      body { padding: 14px; }
+      .page { width: 100%; }
+      .topbar { min-height: 56px; }
+      .status { font-size: 9px; }
+      .content { grid-template-columns: 1fr; gap: 26px; padding-top: 30px; }
+      .error-code { font-size: clamp(74px, 24vw, 112px); }
+      .description { font-size: 14px; }
+      .back { width: 100%; }
+      .foot { font-size: 8px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"></span><span>Secure X</span></div>
+      <div class="status">PAGE STATUS&nbsp; / &nbsp;404</div>
+    </header>
+    <section class="content" aria-labelledby="title">
+      <div class="error-code" aria-hidden="true">404</div>
+      <div>
+        <p class="eyebrow">АДРЕС НЕ НАЙДЕН</p>
+        <h1 id="title">Такой страницы нет</h1>
+        <p class="description">Проверьте адрес или вернитесь на предыдущую страницу. Возможно, ссылка устарела или была введена с ошибкой.</p>
+        <div class="device" role="status" aria-live="polite">
+          <span class="device-dot" aria-hidden="true"></span>
+          <strong>Устройство:</strong>
+          <span id="deviceType">{{DEVICE_TYPE}}</span>
+        </div>
+        <button class="back" id="backButton" type="button">Вернуться назад</button>
+      </div>
+    </section>
+    <footer class="foot"><span>ЗАПРОШЕННАЯ СТРАНИЦА</span><strong>НЕ НАЙДЕНА</strong></footer>
+  </main>
+  <script>
+    (() => {
+      const output = document.getElementById("deviceType");
+      const ua = (navigator.userAgent || "").toLowerCase();
+      const platform = (navigator.userAgentData?.platform || navigator.platform || "").toLowerCase();
+      const touchMac = /mac/.test(platform) && navigator.maxTouchPoints > 1;
+      let type = "не удалось определить";
+
+      if (/smart-tv|smarttv|hbbtv|tizen|webos|appletv|android tv/.test(ua)) type = "телевизор";
+      else if (/ipad|tablet|playbook|silk/.test(ua) || touchMac || (/android/.test(ua) && !/mobile/.test(ua))) type = "планшет";
+      else if (navigator.userAgentData?.mobile || /iphone|ipod|windows phone|mobile/.test(ua) || /android/.test(ua)) type = "телефон";
+      else if (/windows|mac|linux|cros/.test(platform + " " + ua)) type = "компьютер";
+
+      output.textContent = type;
+      document.getElementById("backButton").addEventListener("click", () => {
+        if (window.history.length > 1) window.history.back();
+        else output.textContent = "откройте нужную ссылку заново";
+      });
+    })();
+  </script>
+</body>
+</html>
