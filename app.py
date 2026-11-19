@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import html
 import logging
 import os
 import re
@@ -7,11 +8,14 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import PlainTextResponse
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.responses import HTMLResponse, PlainTextResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import panel as admin_panel
 
@@ -361,6 +365,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="VPN subscription relay", lifespan=lifespan)
+NOT_FOUND_TEMPLATE = (Path(__file__).resolve().parent / "templates" / "404.html").read_text(encoding="utf-8")
 
 
 async def serve_subscription(request: Request) -> Response:
@@ -373,14 +378,55 @@ async def serve_subscription(request: Request) -> Response:
     return Response(content=snapshot.body, headers=snapshot.headers)
 
 
+def _device_type(user_agent: str) -> str:
+    """Coarsely classify the requesting device without storing its user agent."""
+    ua = (user_agent or "").lower()
+    if any(marker in ua for marker in ("smart-tv", "smarttv", "hbbtv", "tizen", "webos", "appletv", "android tv")):
+        return "телевизор"
+    if any(marker in ua for marker in ("ipad", "tablet", "playbook", "silk")):
+        return "планшет"
+    if "android" in ua and "mobile" not in ua:
+        return "планшет"
+    if any(marker in ua for marker in ("iphone", "ipod", "windows phone", "mobile")) or "android" in ua:
+        return "телефон"
+    if any(marker in ua for marker in ("windows nt", "macintosh", "x11", "linux", "cros")):
+        return "компьютер"
+    return "не удалось определить"
+
+
+def _wants_html_404(request: Request) -> bool:
+    accept = request.headers.get("accept", "").lower()
+    return "text/html" in accept or "application/xhtml+xml" in accept
+
+
+def _not_found_response(request: Request, status_code: int = 404) -> Response:
+    headers = {
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+        "Vary": "Accept, User-Agent",
+    }
+    if request.method == "HEAD" or not _wants_html_404(request):
+        return Response(status_code=status_code, headers=headers)
+
+    device = html.escape(_device_type(request.headers.get("user-agent", "")))
+    page = NOT_FOUND_TEMPLATE.replace("{{DEVICE_TYPE}}", device)
+    return HTMLResponse(page, status_code=status_code, headers=headers)
+
+
 @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
 async def latest_subscription(request: Request):
-    return Response(status_code=200 if request.method == "HEAD" else 404)
+    # Keep the root HEAD probe successful while never serving subscription data
+    # from the root address.
+    if request.method == "HEAD":
+        return Response(status_code=200, headers={"Cache-Control": "no-store"})
+    return _not_found_response(request)
 
 
 @app.api_route("/sub.txt", methods=["GET", "HEAD"], include_in_schema=False)
 async def subscription_file(request: Request):
-    return Response(status_code=404)
+    return _not_found_response(request)
 
 
 @app.api_route("/server/hash/{path_key}", methods=["GET", "HEAD"], include_in_schema=False)
@@ -389,7 +435,7 @@ async def keyed_subscription(path_key: str, request: Request):
     if (not SUBSCRIPTION_PATH_KEY_PATTERN.fullmatch(path_key)
             or not SUBSCRIPTION_PATH_KEY_PATTERN.fullmatch(expected)
             or not secrets.compare_digest(path_key, expected)):
-        return Response(status_code=404)
+        return _not_found_response(request)
     return await serve_subscription(request)
 
 
@@ -399,3 +445,21 @@ async def health():
 
 
 admin_panel.install(app)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def not_found_exception_handler(request: Request, exc: StarletteHTTPException):
+    # Keep API errors machine-readable; browser navigation to missing pages and
+    # static assets gets the branded page instead.
+    if exc.status_code == 404 and _wants_html_404(request) and not request.url.path.startswith(("/api/", "/test/api/")):
+        return _not_found_response(request, status_code=404)
+    return await http_exception_handler(request, exc)
+
+
+@app.api_route(
+    "/{unmatched_path:path}",
+    methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    include_in_schema=False,
+)
+async def unmatched_path(unmatched_path: str, request: Request):
+    return _not_found_response(request)
