@@ -5,6 +5,8 @@ const SX = {
   TEST_DRIVE_FOLDER: 'TEST_DRIVE_FOLDER_ID',
   CURSOR: 'SYNC_CURSOR',
   PENDING_SYNC: 'DRIVE_SYNC_PENDING',
+  PENDING_MAIN_ALL: 'DRIVE_SYNC_PENDING_MAIN_ALL',
+  PENDING_MAIN_USER_PREFIX: 'DRIVE_SYNC_PENDING_MAIN_USER_',
   WEATHER_CACHE: 'ASHGABAT_WEATHER_V1',
   WEATHER_CACHE_SECONDS: 240,
   WEATHER_URL: 'https://api.open-meteo.com/v1/forecast?latitude=37.9601&longitude=58.3261&current=temperature_2m&timezone=Asia%2FAshgabat',
@@ -44,11 +46,15 @@ function doPost(e) {
     }
     const pendingKey = environmentKey_(SX.PENDING_SYNC, environment);
     const wasPending = props.getProperty(pendingKey) === '1';
+    // Main admin edits should reuse Render's warm source snapshots. Scheduled
+    // refreshes and the isolated test flow keep their full provider refresh.
+    const refreshSources = environment === 'test' || data.refresh_sources === true;
     // Remember this request before trying the lock. If another delivery or the
     // five-minute trigger is using Drive, it will be retried automatically.
     props.setProperty(pendingKey, '1');
     lock = LockService.getScriptLock();
     if (!lock.tryLock(1500)) {
+      if (environment === 'main') rememberMainSyncTargets_(props, data.user_ids);
       Logger.log('Drive занят; запрос сохранён для автоматической синхронизации.');
       return json_({ ok: true, pending: true, processed: 0, failed: 0 });
     }
@@ -63,7 +69,8 @@ function doPost(e) {
     // pass reads the latest manifest; more changes remain queued for updateSub.
     while (pass < 2) {
       props.deleteProperty(pendingKey);
-      const manifest = fetchManifest_(base, key, userIds, environment);
+      if (environment === 'main' && !userIds) clearMainSyncTargets_(props);
+      const manifest = fetchManifest_(base, key, userIds, environment, refreshSources);
       if (!manifest || !Array.isArray(manifest.users) || !manifest.users.length) {
         props.setProperty(pendingKey, '1');
         return json_({ ok: false, pending: true, error: 'Манифест пуст или недоступен.' });
@@ -87,7 +94,8 @@ function doPost(e) {
           if (user && user.id != null) {
             try {
               const rememberedId = props.getProperty(pendingFileKey_(user.id, environment));
-              report_(base, key, user.id, user.drive_file_id || rememberedId || null, false, message, environment);
+              report_(base, key, user.id, user.drive_file_id || rememberedId || null, false, message, environment,
+                user.activation_generation);
             } catch (reportErr) {
               Logger.log('Не удалось отправить отчёт для id=' + String(user.id) + '.');
             }
@@ -144,13 +152,18 @@ function updateSub() {
   // updateSub always fetches the complete current manifest, so it also drains
   // any request left queued when an immediate delivery found Drive busy.
   props.deleteProperty(SX.PENDING_SYNC);
+  clearMainSyncTargets_(props);
   if ((props.getProperty(SX.TEST_DRIVE_FOLDER) || '').trim()) {
     props.setProperty(environmentKey_(SX.PENDING_SYNC, 'test'), '1');
   }
 
-  const manifest = fetchManifest_(base, key);
+  const manifest = fetchManifest_(base, key, null, 'main', true);
   if (!manifest || !Array.isArray(manifest.users) || manifest.users.length === 0) {
     Logger.log('Манифест пустой или некорректный; файлы Drive не изменены.');
+    props.setProperty(SX.PENDING_SYNC, '1');
+    // A broken production source must not prevent the independently routed
+    // test manifest (for example, pending test revocations) from being tried.
+    updatePendingTest_(base, key, started, props);
     return;
   }
   if (manifest.partial) Logger.log('Апстрим недоступен; обрабатываются только отзываемые подписки, остальные файлы не меняются.');
@@ -172,7 +185,8 @@ function updateSub() {
       if (user && user.id != null) {
         try {
           const rememberedId = PropertiesService.getScriptProperties().getProperty(pendingFileKey_(user.id, 'main'));
-          report_(base, key, user.id, user.drive_file_id || rememberedId || null, false, message);
+          report_(base, key, user.id, user.drive_file_id || rememberedId || null, false, message,
+            'main', user.activation_generation);
         } catch (reportErr) {
           Logger.log('Не удалось отправить отчёт для id=' + String(user.id) + ': ' + safeError_(reportErr));
         }
@@ -187,16 +201,113 @@ function updateSub() {
     Logger.log('Остановлено по бюджету времени; продолжение начнётся с элемента ' + next + '.');
   }
   Logger.log('Синхронизация завершена: обработано ' + processed + ' из ' + users.length + '.');
+  // A main admin or activation change can arrive while this trigger owns the
+  // Drive lock. Its doPost records a pending marker and returns immediately;
+  // fetch one fresh warm-cache manifest now so confirmed profiles do not wait
+  // for the next five-minute trigger. Remaining work stays queued if the
+  // Apps Script time budget is nearly exhausted.
+  drainPendingMainSync_(base, key, started, props);
   updatePendingTest_(base, key, started, props);
   } finally {
     lock.releaseLock();
   }
 }
 
+function drainPendingMainSync_(base, key, started, props) {
+  const pendingKey = SX.PENDING_SYNC;
+  if (props.getProperty(pendingKey) !== '1' && !hasPendingMainSyncTargets_(props)) return;
+  if (Date.now() - started > SX.START_BUDGET_MS - 15000) {
+    Logger.log('Изменения основной среды оставлены в очереди из-за лимита времени.');
+    return;
+  }
+
+  // Clear before fetching. If another request arrives during this pass it
+  // sets the marker again and is preserved for the next scheduled run.
+  props.deleteProperty(pendingKey);
+  const target = takeMainSyncTargets_(props);
+  const manifest = fetchManifest_(base, key, target.userIds, 'main', false);
+  if (!manifest || !Array.isArray(manifest.users) || manifest.partial
+      || (!manifest.users.length && target.userIds === null)) {
+    props.setProperty(pendingKey, '1');
+    Logger.log('Повторный манифест основной среды недоступен или неполный; запрос оставлен в очереди.');
+    return;
+  }
+
+  let processed = 0;
+  let failed = false;
+  for (const user of manifest.users) {
+    if (Date.now() - started > SX.START_BUDGET_MS - 10000) {
+      failed = true;
+      break;
+    }
+    try {
+      processUserWithRetry_(base, key, user, 'main');
+    } catch (err) {
+      failed = true;
+      const message = safeError_(err);
+      Logger.log('Повторная синхронизация не удалась для id=' + String(user && user.id) + ': ' + message);
+      if (user && user.id != null) {
+        try {
+          const rememberedId = props.getProperty(pendingFileKey_(user.id, 'main'));
+          report_(base, key, user.id, user.drive_file_id || rememberedId || null, false, message,
+            'main', user.activation_generation);
+        } catch (reportErr) {
+          Logger.log('Не удалось отправить повторный отчёт для id=' + String(user.id) + '.');
+        }
+      }
+    }
+    processed++;
+  }
+
+  // Do not clear a marker set by a request that arrived while this pass ran.
+  if (failed || processed < manifest.users.length || props.getProperty(pendingKey) === '1') {
+    props.setProperty(pendingKey, '1');
+  } else {
+    props.deleteProperty(pendingKey);
+  }
+  Logger.log('Повторная синхронизация основной среды: обработано ' + processed + ' из '
+    + manifest.users.length + (props.getProperty(pendingKey) === '1' ? '; оставлено в очереди.' : '.'));
+}
+
+function rememberMainSyncTargets_(props, userIds) {
+  if (!Array.isArray(userIds) || !userIds.length || userIds.length > 500
+      || userIds.some(id => !Number.isInteger(Number(id)) || Number(id) < 1)) {
+    props.setProperty(SX.PENDING_MAIN_ALL, '1');
+  } else {
+    userIds.forEach(id => props.setProperty(SX.PENDING_MAIN_USER_PREFIX + String(Number(id)), '1'));
+  }
+}
+
+function hasPendingMainSyncTargets_(props) {
+  const all = props.getProperty(SX.PENDING_MAIN_ALL) === '1';
+  if (all) return true;
+  return Object.keys(props.getProperties()).some(name => name.indexOf(SX.PENDING_MAIN_USER_PREFIX) === 0);
+}
+
+function takeMainSyncTargets_(props) {
+  const all = props.getProperty(SX.PENDING_MAIN_ALL) === '1';
+  const properties = props.getProperties();
+  const userIds = Object.keys(properties)
+    .filter(name => name.indexOf(SX.PENDING_MAIN_USER_PREFIX) === 0)
+    .map(name => Number(name.slice(SX.PENDING_MAIN_USER_PREFIX.length)))
+    .filter(id => Number.isInteger(id) && id > 0);
+  clearMainSyncTargets_(props);
+  return { userIds: all || !userIds.length ? null : Array.from(new Set(userIds)).sort((a, b) => a - b) };
+}
+
+function clearMainSyncTargets_(props) {
+  const properties = props.getProperties();
+  Object.keys(properties).forEach(name => {
+    if (name === SX.PENDING_MAIN_ALL || name.indexOf(SX.PENDING_MAIN_USER_PREFIX) === 0) {
+      props.deleteProperty(name);
+    }
+  });
+}
+
 function updatePendingTest_(base, key, started, props) {
   const pendingKey = environmentKey_(SX.PENDING_SYNC, 'test');
   if (props.getProperty(pendingKey) !== '1' || Date.now() - started > 5 * 60 * 1000) return;
-  const manifest = fetchManifest_(base, key, null, 'test');
+  const manifest = fetchManifest_(base, key, null, 'test', true);
   if (!manifest || !Array.isArray(manifest.users)) return;
   if (!manifest.users.length) {
     props.deleteProperty(environmentKey_(SX.CURSOR, 'test'));
@@ -248,9 +359,12 @@ function pendingFileKey_(userId, environment) {
   return 'PENDING_FILE_' + (environment === 'test' ? 'TEST_' : '') + userId;
 }
 
-function fetchManifest_(base, key, userIds, environment) {
+function fetchManifest_(base, key, userIds, environment, refreshSources) {
   environment = environment || 'main';
-  const suffix = userIds && userIds.length ? '?user_ids=' + encodeURIComponent(userIds.map(String).join(',')) : '';
+  const query = [];
+  if (userIds && userIds.length) query.push('user_ids=' + encodeURIComponent(userIds.map(String).join(',')));
+  if (refreshSources) query.push('refresh_sources=1');
+  const suffix = query.length ? '?' + query.join('&') : '';
   const prefix = environment === 'test' ? '/test' : '';
   const url = base + prefix + '/api/sync/manifest' + suffix;
   const weatherHeader = Utilities.base64EncodeWebSafe(JSON.stringify(fetchAshgabatWeather_()));
@@ -350,7 +464,7 @@ function processUser_(base, key, user, environment) {
     // one-node profile. Deleting the file makes Happ retain its last imported
     // servers when its next refresh gets a 404.
     if (fileId) replaceDriveFileWithRevocation_(fileId, environment);
-    report_(base, key, user.id, fileId, true, null, environment);
+    report_(base, key, user.id, fileId, true, null, environment, user.activation_generation);
     props.deleteProperty(fileKey);
     Logger.log('Подписка пользователя id=' + user.id + ' отозвана: Drive-ссылка обновлена заглушкой.');
     return;
@@ -379,7 +493,7 @@ function processUser_(base, key, user, environment) {
   if (file.getBlob().getDataAsString('UTF-8') !== user.content) {
     file.setContent(user.content);
   }
-  report_(base, key, user.id, fileId, true, null, environment);
+  report_(base, key, user.id, fileId, true, null, environment, user.activation_generation);
   props.deleteProperty(fileKey);
   Logger.log('Пользователь id=' + user.id + ': файл синхронизирован.');
 }
@@ -445,9 +559,12 @@ function replaceDriveFileWithRevocation_(fileId, environment) {
   }
 }
 
-function report_(base, key, userId, fileId, ok, error, environment) {
+function report_(base, key, userId, fileId, ok, error, environment, activationGeneration) {
   const prefix = environment === 'test' ? '/test' : '';
   const payload = { user_id: Number(userId), drive_file_id: fileId || null, ok: Boolean(ok) };
+  if (activationGeneration != null && Number.isInteger(Number(activationGeneration)) && Number(activationGeneration) >= 0) {
+    payload.activation_generation = Number(activationGeneration);
+  }
   if (!ok && error) payload.error = String(error).slice(0, 700);
   const response = UrlFetchApp.fetch(base + prefix + '/api/sync/report', {
     method: 'post',
