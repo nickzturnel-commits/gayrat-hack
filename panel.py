@@ -1041,6 +1041,10 @@ class PanelState:
         self.announce_quote: str | None = None
         self.login_fails: dict[str, tuple[int, float]] = {}
         self.happ_tasks: set[asyncio.Task] = set()
+        self._main_drive_sync_task: asyncio.Task | None = None
+        self._main_drive_sync_targets: set[int] = set()
+        self._main_drive_sync_all = False
+        self._drive_sync_reported_at: dict[int, float] = {}
 
     @property
     def db_configured(self):
@@ -1077,6 +1081,7 @@ class PanelState:
             async with self.pool.acquire() as conn:
                 schema = open(os.path.join(os.path.dirname(__file__), "schema.sql"), encoding="utf-8").read()
                 await conn.execute(schema)
+                await conn.execute("ALTER TABLE subscription_activation ADD COLUMN IF NOT EXISTS drive_generation BIGINT NOT NULL DEFAULT 0")
                 await self.seed(conn, include_legacy=True)
             self.db_error = ""
             log.info("Admin database connected and schema initialized")
@@ -1206,6 +1211,8 @@ class PanelState:
 
     async def push_drive_sync(self, user_ids: list[int] | None = None) -> dict:
         """Ask the authenticated Apps Script web app to update Drive immediately."""
+        attempt_started = time.time()
+        test_mode = _test_environment.get()
         target = os.getenv("DRIVE_SYNC_URL", "").strip()
         key = os.getenv("SYNC_KEY", "").strip()
         if not target or not key:
@@ -1214,7 +1221,6 @@ class PanelState:
             return {"ok": False, "pending": True, "message": message}
         try:
             async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(150.0, connect=12.0)) as client:
-                test_mode = _test_environment.get()
                 response = await client.post(target, headers={"X-Sync-Key": key, "Accept": "application/json"},
                                              json={"action": "sync", "user_ids": user_ids, "sync_key": key,
                                                    "environment": "test" if test_mode else "main"})
@@ -1229,7 +1235,13 @@ class PanelState:
             failed = int(result.get("failed", 0) or 0)
             processed = int(result.get("processed", 0) or 0)
             if result.get("pending") and result.get("ok"):
-                self.drive_push_error = None
+                # A lock-busy acknowledgement means only that Apps Script
+                # queued the work. In particular, processed=0 is not a
+                # successful Drive write and must not clear an existing error.
+                if test_mode:
+                    self.drive_push_error = None
+                elif processed > 0:
+                    self.drive_push_last = max(self.drive_push_last or 0.0, time.time())
                 return {"ok": True, "pending": True,
                         "message": "Изменения приняты; Google Drive обновится при ближайшей автоматической синхронизации.",
                         "processed": processed, "failed": 0}
@@ -1242,21 +1254,88 @@ class PanelState:
                         "processed": processed, "failed": failed}
             if not result.get("ok"):
                 raise ValueError(_safe_sync_error(result.get("error")) or "Apps Script не подтвердил доставку")
-            self.drive_push_last = time.time()
-            self.drive_push_error = None
+            if not test_mode:
+                self.drive_push_last = max(self.drive_push_last or 0.0, time.time())
+            else:
+                self.drive_push_last = time.time()
+                self.drive_push_error = None
             return {"ok": True, "pending": False,
                     "message": self.drive_push_error or "Изменения сразу отправлены в Google Drive",
                     "processed": processed, "failed": 0}
         except Exception as exc:
-            self.drive_push_error = "Не удалось сразу обновить Google Drive; автоматическая попытка повторится позже"
             safe_detail = _safe_sync_error(str(exc))
-            if isinstance(exc, httpx.TimeoutException) and not _test_environment.get():
+            if isinstance(exc, httpx.TimeoutException) and not test_mode:
+                if user_ids and all(self._drive_sync_reported_at.get(int(user_id), 0.0) >= attempt_started
+                                    for user_id in user_ids):
+                    # GAS can finish writing and reporting before its HTTP
+                    # response reaches Render. Trust the per-user reports.
+                    return {"ok": True, "pending": False,
+                            "message": "Google Drive обновлён; Apps Script не успел вернуть HTTP-ответ.",
+                            "processed": len(user_ids), "failed": 0}
+                if self.drive_push_last is not None and self.drive_push_last >= attempt_started:
+                    # Reports arrived during this request, so a late HTTP
+                    # timeout alone is not evidence that Drive failed.
+                    return {"ok": True, "pending": True,
+                            "message": "Отчёты синхронизации получены; ожидается завершение запроса Apps Script."}
                 self.drive_push_error = "Google Drive обновляется дольше обычного; следующая синхронизация повторит попытку"
                 log.info("Immediate Drive update timed out; scheduled sync remains the recovery path")
                 return {"ok": True, "pending": True, "message": self.drive_push_error}
+            self.drive_push_error = "Не удалось сразу обновить Google Drive; автоматическая попытка повторится позже"
             log.warning("Immediate Drive update failed (%s%s)", type(exc).__name__,
                         f": {safe_detail}" if safe_detail else "")
             return {"ok": False, "pending": True, "message": self.drive_push_error}
+
+    async def request_drive_sync(self, user_ids: list[int] | None = None) -> dict:
+        """Queue primary Drive delivery so admin requests never wait on Apps Script."""
+        if _test_environment.get():
+            # Preserve the isolated test workflow and its existing response semantics.
+            return await self.push_drive_sync(user_ids)
+        if not os.getenv("DRIVE_SYNC_URL", "").strip() or not os.getenv("SYNC_KEY", "").strip():
+            return await self.push_drive_sync(user_ids)
+
+        if user_ids is None:
+            self._main_drive_sync_all = True
+            self._main_drive_sync_targets.clear()
+        elif not self._main_drive_sync_all:
+            self._main_drive_sync_targets.update(int(value) for value in user_ids)
+
+        if self._main_drive_sync_task is None or self._main_drive_sync_task.done():
+            task = asyncio.create_task(self._drain_main_drive_sync_queue())
+            self._main_drive_sync_task = task
+            self.happ_tasks.add(task)
+            task.add_done_callback(self.happ_tasks.discard)
+        return {"ok": True, "pending": True,
+                "message": "Синхронизация Google Drive поставлена в очередь и выполняется в фоне."}
+
+    async def _drain_main_drive_sync_queue(self) -> None:
+        try:
+            while self._main_drive_sync_all or self._main_drive_sync_targets:
+                if self._main_drive_sync_all:
+                    user_ids = None
+                    self._main_drive_sync_all = False
+                    self._main_drive_sync_targets.clear()
+                else:
+                    user_ids = sorted(self._main_drive_sync_targets)
+                    self._main_drive_sync_targets.clear()
+                context = _test_environment.set(False)
+                try:
+                    result = await self.push_drive_sync(user_ids)
+                    if not result.get("ok"):
+                        log.info("Queued Drive sync needs retry: pending=%s", bool(result.get("pending")))
+                finally:
+                    _test_environment.reset(context)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Queued Drive sync worker failed (%s)", type(exc).__name__)
+        finally:
+            self._main_drive_sync_task = None
+            # Do not lose a request that arrived as the previous worker ended.
+            if self._main_drive_sync_all or self._main_drive_sync_targets:
+                task = asyncio.create_task(self._drain_main_drive_sync_queue())
+                self._main_drive_sync_task = task
+                self.happ_tasks.add(task)
+                task.add_done_callback(self.happ_tasks.discard)
 
     def _upstream_headers_for_panel(self) -> dict[str, str]:
         headers = {}
@@ -2280,7 +2359,7 @@ def _test_activation_page(title: str, message: str, activation_id: str, token: s
             "const data=await response.json();if(data.ready&&data.happ_link){node.hidden=true;const link=document.createElement('a');link.className='app-button';"
             "link.href=data.happ_link;link.rel='noreferrer';link.textContent='Открыть и добавить в Happ';result.append(link);"
             "const note=document.createElement('p');note.className='foot';note.textContent='Подписка подготовлена. Нажмите кнопку, чтобы открыть Happ.';result.append(note);result.hidden=false;return;}"
-            "if(data.error){node.textContent=data.error;return;}}catch{}attempts++;if(attempts<45)setTimeout(check,1500);"
+            "if(data.error){node.textContent=data.error;return;}}catch{}attempts++;if(attempts<90)setTimeout(check,2000);"
             "else node.textContent='Подготовка занимает больше обычного. Обновите страницу через минуту.';}check();})();")
     meter = f'<div class="slot-meter"><b>{min(registered, limit)} / {limit}</b><span>занято устройств</span></div>'
     return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
@@ -2602,11 +2681,15 @@ async def me(request: Request):
 @router.get("/api/admin/dashboard")
 async def dashboard(request: Request):
     _auth(request)
-    try:
-        await state.fetch_upstream()
-    except HTTPException:
-        # The overview should remain accessible even while a source is down.
-        pass
+    # MCP asks for a lightweight status snapshot. Source refreshes are available
+    # explicitly through the server refresh tool and should not make a status
+    # read wait on two sequential provider requests.
+    if request.query_params.get("cached") != "1":
+        try:
+            await state.fetch_upstream()
+        except HTTPException:
+            # The overview should remain accessible even while a source is down.
+            pass
     pool = await state.db(required=False)
     db_error = state.test_db_error if _test_environment.get() else state.db_error
     db_info = {"connected": pool is not None, "error": db_error if pool is None else None}
@@ -2662,7 +2745,11 @@ async def dashboard(request: Request):
             "last_script_request": last_script, "sync_errors": errors, "sync_enabled": state.sync_configured,
             "drive_delivery": {"configured": state.drive_push_configured,
                                "last_success_at": state.drive_push_last or None,
-                               "warning": state.drive_push_error}}
+                               "warning": state.drive_push_error,
+                               "pending": (not _test_environment.get() and
+                                           (state._main_drive_sync_task is not None
+                                            or state._main_drive_sync_all
+                                            or bool(state._main_drive_sync_targets)))}}
 
 
 @router.get("/api/admin/users")
@@ -2850,7 +2937,7 @@ async def activation_limit_update(user_id: int, data: TestActivationLimitBody, r
 
 
 @router.post("/api/admin/users/{user_id}/activation/reset")
-async def activation_reset(user_id: int, request: Request):
+async def activation_reset(user_id: int, request: Request, background_tasks: BackgroundTasks):
     _auth(request, csrf=True)
     scope = _activation_scope()
     test_mode = bool(scope["test_mode"])
@@ -2866,7 +2953,8 @@ async def activation_reset(user_id: int, request: Request):
                     activated_at=NULL,drive_ready_at=NULL,updated_at=now()
                     WHERE user_id=$1 RETURNING user_id""", user_id, nonce, token_hash)
             else:
-                row = await conn.fetchrow("""UPDATE subscription_activation SET activated_at=NULL,updated_at=now()
+                row = await conn.fetchrow("""UPDATE subscription_activation SET activated_at=NULL,drive_ready_at=NULL,
+                    drive_generation=drive_generation+1,updated_at=now()
                     WHERE user_id=$1 RETURNING user_id,token_nonce""", user_id)
                 if row:
                     nonce = row["token_nonce"]
@@ -2879,14 +2967,18 @@ async def activation_reset(user_id: int, request: Request):
         raise HTTPException(404, "Render-активация не включена для этой подписки")
     activation_url = _activation_url(user_id, nonce, str(request.base_url).rstrip("/"), test_mode=test_mode)
     if test_mode:
-        drive_sync = await state.push_drive_sync([user_id])
+        drive_sync = await state.request_drive_sync([user_id])
         return {"ok": True, "activation_id": _activation_id(user_id, test_mode=True),
                 "activation_url": activation_url, "drive_sync": drive_sync}
+    background_tasks.add_task(state.push_drive_sync, [user_id])
     return {"ok": True, "activation_id": _main_activation_id(user_id),
-            "activation_url": activation_url, "registered_count": 0}
+            "activation_url": activation_url, "registered_count": 0,
+            "drive_sync": {"ok": True, "pending": True,
+                           "message": "Ссылка сохранена; обновление профиля Google Drive запущено в фоне."}}
 
 
-async def activation_device_delete(user_id: int, device_hash: str, request: Request):
+async def activation_device_delete(user_id: int, device_hash: str, request: Request,
+                                   background_tasks: BackgroundTasks):
     _auth(request, csrf=True)
     if _test_environment.get():
         raise HTTPException(404, "Not found")
@@ -2905,10 +2997,16 @@ async def activation_device_delete(user_id: int, device_hash: str, request: Requ
                 raise HTTPException(404, "Устройство не найдено")
             remaining = int(await conn.fetchval(
                 "SELECT count(*) FROM activation_devices WHERE user_id=$1", user_id) or 0)
-            if remaining == 0:
-                await conn.execute("""UPDATE subscription_activation SET activated_at=NULL,updated_at=now()
+            needs_drive_sync = remaining == 0
+            if needs_drive_sync:
+                await conn.execute("""UPDATE subscription_activation SET activated_at=NULL,drive_ready_at=NULL,
+                    drive_generation=drive_generation+1,updated_at=now()
                     WHERE user_id=$1""", user_id)
-    return {"ok": True, "removed": True, "registered_count": remaining}
+    if needs_drive_sync:
+        background_tasks.add_task(state.push_drive_sync, [user_id])
+    return {"ok": True, "removed": True, "registered_count": remaining,
+            "drive_sync": {"ok": True, "pending": needs_drive_sync,
+                           "message": "Профиль Google Drive обновляется." if needs_drive_sync else None}}
 
 
 @router.post("/api/admin/users/{user_id}/activation/retry")
@@ -2924,7 +3022,7 @@ async def activation_retry(user_id: int, request: Request, background_tasks: Bac
     if not scope["test_mode"]:
         background_tasks.add_task(state.push_drive_sync, [user_id])
         return {"ok": True, "message": "Синхронизация Google Drive запущена в фоне."}
-    delivery = await state.push_drive_sync([user_id])
+    delivery = await state.request_drive_sync([user_id])
     if delivery.get("ok") and not delivery.get("pending") and int(delivery.get("processed") or 0) > 0:
         async with pool.acquire() as conn:
             await conn.execute(f"UPDATE {activation_table} SET drive_ready_at=COALESCE(drive_ready_at,now()),updated_at=now() WHERE user_id=$1",
@@ -3008,7 +3106,7 @@ async def users_create(data: UserBody, request: Request):
                 VALUES($1,$2,$3,$4)""", row["id"], nonce, token_hash, data.activation_limit)
     if row["device_limit"] is not None and not (test_mode and data.test_activation_enabled):
         _schedule_limited_link(row["id"])
-    drive_sync = await state.push_drive_sync([row["id"]])
+    drive_sync = await state.request_drive_sync([row["id"]])
     return {"user": _serialize(row), "drive_sync": drive_sync}
 
 
@@ -3107,7 +3205,7 @@ async def users_update(user_id: int, data: UserBody, request: Request):
     if not row: raise HTTPException(404, "Пользователь не найден")
     if row["device_limit"] is not None and not (test_mode and data.test_activation_enabled):
         _schedule_limited_link(user_id)
-    drive_sync = await state.push_drive_sync([user_id])
+    drive_sync = await state.request_drive_sync([user_id])
     return {"user": _serialize(row), "drive_sync": drive_sync}
 
 
@@ -3118,7 +3216,7 @@ async def users_delete(user_id: int, request: Request):
     async with pool.acquire() as conn:
         row = await conn.fetchrow("UPDATE users SET status='pending_delete',enabled=FALSE,updated_at=now() WHERE id=$1 RETURNING id", user_id)
     if not row: raise HTTPException(404, "Пользователь не найден")
-    drive_sync = await state.push_drive_sync([user_id])
+    drive_sync = await state.request_drive_sync([user_id])
     return {"ok": True, "status": "pending_delete", "drive_sync": drive_sync}
 
 
@@ -3319,7 +3417,7 @@ async def _ensure_activation_import_link(user_id: int, cookie_value: str,
                           if is_test else "Подписка отключена или срок её действия закончился.")
         if not row["drive_file_id"]:
             return None, "Подписка ещё готовится. Повторите подтверждение позже."
-        if is_test and not row["drive_ready_at"]:
+        if not row["drive_ready_at"]:
             return None, "Полная подписка ещё готовится. Повторите подтверждение позже."
         if row["subscription_token_hash"] == slot_token_hash and row["encrypted_link"]:
             if not is_test:
@@ -3359,6 +3457,7 @@ async def _ensure_test_device_import_link(user_id: int, cookie_value: str,
 
 _main_activation_link_jobs: set[tuple[int, str]] = set()
 _main_activation_link_errors: dict[tuple[int, str], str] = {}
+_main_activation_drive_jobs: dict[tuple[int, int], asyncio.Task] = {}
 
 
 def _schedule_main_activation_link(background_tasks: BackgroundTasks, user_id: int, cookie_value: str) -> None:
@@ -3367,14 +3466,116 @@ def _schedule_main_activation_link(background_tasks: BackgroundTasks, user_id: i
     if job_key in _main_activation_link_jobs:
         return
     _main_activation_link_errors.pop(job_key, None)
+    while len(_main_activation_link_errors) > 2048:
+        _main_activation_link_errors.pop(next(iter(_main_activation_link_errors)))
     _main_activation_link_jobs.add(job_key)
     background_tasks.add_task(_prepare_main_activation_link, int(user_id), cookie_value, job_key)
+
+
+async def _deliver_main_activation_profile(user_id: int, generation: int) -> str | None:
+    """Push one activation generation to Drive; concurrent devices share this delivery."""
+    context = _test_environment.set(False)
+    try:
+        pool = await state.db()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("""SELECT activated_at,drive_ready_at,drive_generation
+                FROM subscription_activation WHERE user_id=$1""", user_id)
+        if not row or row["activated_at"] is None or int(row["drive_generation"]) != generation:
+            return "Подтверждение устройства изменилось. Откройте страницу активации заново."
+        if row["drive_ready_at"] is not None:
+            return None
+        if not state.drive_push_configured:
+            return "Не настроена синхронизация Google Drive. Обратитесь к администратору."
+
+        # Share the primary queue with admin edits and the scheduled sync. A
+        # direct Apps Script call here can collide with updateSub's Drive lock
+        # and leave the confirmed profile stale until the next timer run.
+        delivery_task = asyncio.create_task(state.request_drive_sync([user_id]))
+        state.happ_tasks.add(delivery_task)
+        delivery_task.add_done_callback(state.happ_tasks.discard)
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            await asyncio.sleep(1)
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow("""SELECT activated_at,drive_ready_at,drive_generation
+                    FROM subscription_activation WHERE user_id=$1""", user_id)
+            if not row or row["activated_at"] is None or int(row["drive_generation"]) != generation:
+                return "Подтверждение устройства изменилось. Откройте страницу активации заново."
+            if row["drive_ready_at"] is not None:
+                return None
+            if delivery_task.done():
+                try:
+                    delivery = delivery_task.result()
+                except Exception as exc:
+                    log.info("Activation Drive delivery failed: user=%d reason=%s", user_id, type(exc).__name__)
+                    return "Не удалось обновить файл Google Drive. Повторите подтверждение позже."
+                if not delivery.get("ok") and not delivery.get("pending"):
+                    return "Не удалось обновить файл Google Drive. Проверьте синхронизацию и повторите попытку."
+                if delivery.get("ok") and not delivery.get("pending"):
+                    return "Google Drive не подтвердил обновление профиля. Обновите и повторно разверните Code.gs в Apps Script."
+        return "Google Drive пока не подтвердил обновление профиля. Попробуйте снова через минуту."
+    except Exception as exc:
+        log.info("Activation Drive preparation failed: user=%d reason=%s", user_id, type(exc).__name__)
+        return "Не удалось подготовить Google Drive. Повторите подтверждение позже."
+    finally:
+        _test_environment.reset(context)
+
+
+async def _ensure_main_activation_profile(user_id: int, generation: int) -> str | None:
+    job_key = (int(user_id), int(generation))
+    task = _main_activation_drive_jobs.get(job_key)
+    if task is None or task.done():
+        task = asyncio.create_task(_deliver_main_activation_profile(*job_key))
+        _main_activation_drive_jobs[job_key] = task
+        state.happ_tasks.add(task)
+        task.add_done_callback(state.happ_tasks.discard)
+
+        def clear_finished(done_task: asyncio.Task) -> None:
+            if _main_activation_drive_jobs.get(job_key) is done_task:
+                _main_activation_drive_jobs.pop(job_key, None)
+
+        task.add_done_callback(clear_finished)
+    return await asyncio.shield(task)
 
 
 async def _prepare_main_activation_link(user_id: int, cookie_value: str,
                                         job_key: tuple[int, str]) -> None:
     context = _test_environment.set(False)
     try:
+        pool = await state.db()
+        device_hash = _main_activation_browser_hash(cookie_value)
+
+        async def current_slot():
+            async with pool.acquire() as conn:
+                return await conn.fetchrow("""SELECT a.activated_at,a.drive_ready_at,a.drive_generation,
+                    u.status,u.enabled,u.expires_at,u.drive_file_id
+                    FROM subscription_activation a
+                    JOIN activation_devices d ON d.user_id=a.user_id
+                    JOIN users u ON u.id=a.user_id
+                    WHERE a.user_id=$1 AND d.device_hash=$2""", user_id, device_hash)
+
+        row = await current_slot()
+        if not row or row["activated_at"] is None:
+            _main_activation_link_errors[job_key] = "Подтверждение устройства больше не активно. Откройте страницу активации заново."
+            return
+        if row["status"] != "active" or not row["enabled"] or (
+                row["expires_at"] and row["expires_at"] <= datetime.now(timezone.utc)):
+            _main_activation_link_errors[job_key] = "Подписка отключена или срок её действия закончился."
+            return
+        if not row["drive_file_id"]:
+            _main_activation_link_errors[job_key] = "Файл подписки ещё не создан. Обновите страницу позже."
+            return
+
+        if row["drive_ready_at"] is None:
+            error = await _ensure_main_activation_profile(user_id, int(row["drive_generation"]))
+            if error:
+                _main_activation_link_errors[job_key] = error
+                return
+            row = await current_slot()
+            if not row or row["activated_at"] is None or row["drive_ready_at"] is None:
+                _main_activation_link_errors[job_key] = "Подтверждение устройства было сброшено. Откройте страницу активации заново."
+                return
+
         _, error = await _ensure_activation_import_link(user_id, cookie_value, test_mode=False)
         if error:
             _main_activation_link_errors[job_key] = error
@@ -3404,7 +3605,7 @@ async def test_activation_reset(user_id: int, request: Request):
                     device_limit_status='none',device_limit_error=NULL,updated_at=now() WHERE id=$1""", user_id)
     if not row:
         raise HTTPException(404, "Тестовое подтверждение не включено для этой подписки")
-    drive_sync = await state.push_drive_sync([user_id])
+    drive_sync = await state.request_drive_sync([user_id])
     return {"ok": True, "test_activation_id": _test_activation_id(user_id),
             "test_activation_url": _test_activation_url(user_id, nonce, str(request.base_url).rstrip("/")),
             "drive_sync": drive_sync}
@@ -3489,15 +3690,20 @@ async def limited_qr(user_id: int, request: Request):
 @router.post("/api/admin/drive/sync")
 async def drive_sync_now(request: Request):
     _auth(request, csrf=True)
-    return await state.push_drive_sync()
+    return await state.request_drive_sync()
 
 
 @router.get("/api/admin/servers")
 async def servers_list(request: Request):
     _auth(request)
-    body, _, stale = await state.fetch_upstream()
-    if stale:
-        raise HTTPException(503, "Не удалось обновить список серверов из апстрима. Повторите позже.")
+    if request.query_params.get("cached") == "1":
+        body = state.combined_body or state.upstream_body
+        if body is None:
+            raise HTTPException(503, "Снимок источников ещё не загружен. Сначала обнови источники.")
+    else:
+        body, _, stale = await state.fetch_upstream()
+        if stale:
+            raise HTTPException(503, "Не удалось обновить список серверов из апстрима. Повторите позже.")
     pool = await state.db()
     async with pool.acquire() as conn:
         await _sync_servers(conn, body, primary_body=state.upstream_body, sas_body=state.sas_body)
@@ -3544,7 +3750,7 @@ async def servers_update(server_id: str, data: ServerBody, request: Request):
     async with pool.acquire() as conn:
         row = await conn.fetchrow("UPDATE servers SET custom_name=$2,hidden=$3,sort_order=$4 WHERE id=$1 AND present_upstream=TRUE RETURNING *", server_id, data.custom_name, data.hidden, data.sort_order)
     if not row: raise HTTPException(404, "Сервер не найден")
-    return {"server": _serialize(row), "drive_sync": await state.push_drive_sync()}
+    return {"server": _serialize(row), "drive_sync": await state.request_drive_sync()}
 
 
 class BulkServerBody(BaseModel):
@@ -3567,7 +3773,7 @@ async def servers_batch(data: ServerBatchBody, request: Request):
                     item.server_id, item.custom_name, item.hidden, item.sort_order)
                 if not row:
                     raise HTTPException(409, "Один из серверов уже отсутствует в источнике. Обновите каталог и повторите.")
-    return {"ok": True, "updated": len(data.servers), "drive_sync": await state.push_drive_sync()}
+    return {"ok": True, "updated": len(data.servers), "drive_sync": await state.request_drive_sync()}
 
 
 @router.post("/api/admin/servers/bulk")
@@ -3576,7 +3782,7 @@ async def servers_bulk(data: BulkServerBody, request: Request):
     pool = await state.db()
     async with pool.acquire() as conn:
         result = await conn.execute("UPDATE servers SET hidden=$1 WHERE id=ANY($2::text[]) AND present_upstream=TRUE", data.hidden, data.server_ids)
-    return {"ok": True, "updated": int(result.rsplit(" ", 1)[-1]), "drive_sync": await state.push_drive_sync()}
+    return {"ok": True, "updated": int(result.rsplit(" ", 1)[-1]), "drive_sync": await state.request_drive_sync()}
 
 
 @router.post("/api/admin/servers/refresh")
@@ -3584,7 +3790,7 @@ async def servers_refresh(request: Request):
     _auth(request, csrf=True)
     servers, source_counts = await _refresh_server_catalog()
     return {"count": len(servers), "source_counts": source_counts, "order_reset": True,
-            "drive_sync": await state.push_drive_sync()}
+            "drive_sync": await state.request_drive_sync()}
 
 
 @router.post("/api/admin/cache/refresh")
@@ -3592,7 +3798,7 @@ async def admin_cache_refresh(request: Request):
     _auth(request, csrf=True)
     servers, source_counts = await _refresh_server_catalog()
     return {"ok": True, "count": len(servers), "source_counts": source_counts, "order_reset": True,
-            "drive_sync": await state.push_drive_sync()}
+            "drive_sync": await state.request_drive_sync()}
 
 
 @router.put("/api/admin/users/{user_id}/servers/{server_id}")
@@ -3606,7 +3812,7 @@ async def user_server_update(user_id: int, server_id: str, data: UserServerBody,
         if not server_exists: raise HTTPException(404, "Сервер больше не находится в апстриме")
         await conn.execute("""INSERT INTO user_servers(user_id,server_id,hidden,custom_name) VALUES($1,$2,$3,$4)
             ON CONFLICT(user_id,server_id) DO UPDATE SET hidden=EXCLUDED.hidden,custom_name=EXCLUDED.custom_name""", user_id, server_id, data.hidden, data.custom_name)
-    return {"ok": True, "drive_sync": await state.push_drive_sync([user_id])}
+    return {"ok": True, "drive_sync": await state.request_drive_sync([user_id])}
 
 
 @router.post("/api/admin/users/{user_id}/servers/batch")
@@ -3627,7 +3833,7 @@ async def user_servers_batch(user_id: int, data: UserServerBatchBody, request: R
                 await conn.execute("""INSERT INTO user_servers(user_id,server_id,hidden,custom_name) VALUES($1,$2,$3,$4)
                     ON CONFLICT(user_id,server_id) DO UPDATE SET hidden=EXCLUDED.hidden,custom_name=EXCLUDED.custom_name""",
                     user_id, item.server_id, item.hidden, item.custom_name)
-    return {"ok": True, "updated": len(data.servers), "drive_sync": await state.push_drive_sync([user_id])}
+    return {"ok": True, "updated": len(data.servers), "drive_sync": await state.request_drive_sync([user_id])}
 
 
 @router.get("/api/admin/users/{user_id}/servers")
@@ -3652,11 +3858,12 @@ async def user_servers_list(user_id: int, request: Request):
 @router.get("/api/admin/settings")
 async def settings_get(request: Request):
     _auth(request)
-    try:
-        await state.fetch_upstream()
-    except HTTPException:
-        # Keep all admin controls available during a temporary source outage.
-        pass
+    if request.query_params.get("cached") != "1":
+        try:
+            await state.fetch_upstream()
+        except HTTPException:
+            # Keep all admin controls available during a temporary source outage.
+            pass
     pool = await state.db()
     async with pool.acquire() as conn:
         sas_uris = []
@@ -3744,7 +3951,7 @@ async def settings_put(data: SettingsBody, request: Request):
             for key, value in values.items():
                 await conn.execute("INSERT INTO settings(key,value) VALUES($1,$2::jsonb) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", key, json.dumps(value, ensure_ascii=False))
     state.announce_cache = None
-    drive_sync = await state.push_drive_sync() if set(values) - {
+    drive_sync = await state.request_drive_sync() if set(values) - {
         "default_traffic_limit_bytes", "hide_traffic_for_new_users", "include_sas_for_new_users",
         "device_limit_for_new_users"
     } else None
@@ -3786,7 +3993,8 @@ async def sync_manifest(request: Request):
             selected_ids = list(dict.fromkeys(int(part) for part in selected.split(",") if part))
         except ValueError:
             raise HTTPException(422, "Некорректный список пользователей")
-        if not selected_ids or len(selected_ids) > 30 or any(value <= 0 for value in selected_ids):
+        max_selected = 30 if _test_environment.get() else 500
+        if not selected_ids or len(selected_ids) > max_selected or any(value <= 0 for value in selected_ids):
             raise HTTPException(422, "Некорректный список пользователей")
 
     pool = await state.db()
@@ -3807,12 +4015,15 @@ async def sync_manifest(request: Request):
     # A cold start or expired cache makes this request fetch the upstream itself.
     # If that fails, return only pending deletions so they can still be revoked;
     # active profiles remain untouched and the regular retry will refresh them.
+    refresh_sources = request.query_params.get("refresh_sources") == "1"
     try:
         # The five-minute Apps Script poll bypasses the SAS cache so every
         # scheduled manifest request checks for newly posted Telegram servers.
+        # Main admin edits use the warm provider snapshots instead of forcing
+        # two external subscription downloads for every Drive write.
         needs_sas = any(_user_needs_sas(user) for user in rows_before_fetch)
         body, headers, _stale = await state.fetch_upstream(
-            force_sas=True, allow_sas_failure=not needs_sas)
+            force_sas=bool(_test_environment.get() or refresh_sources), allow_sas_failure=not needs_sas)
     except HTTPException:
         activation_table = str(_activation_scope()["activation_table"])
         async with pool.acquire() as conn:
@@ -3854,6 +4065,12 @@ async def sync_manifest(request: Request):
             rows = await conn.fetch("SELECT * FROM users WHERE id=ANY($1::bigint[]) ORDER BY id", selected_ids)
         else:
             rows = await conn.fetch("SELECT * FROM users ORDER BY id")
+        activation_generations: dict[int, int] = {}
+        if not _test_environment.get() and rows:
+            generation_rows = await conn.fetch("""SELECT user_id,drive_generation FROM subscription_activation
+                WHERE user_id=ANY($1::bigint[])""", [int(user["id"]) for user in rows])
+            activation_generations = {int(item["user_id"]): int(item["drive_generation"])
+                                      for item in generation_rows}
         # Same announcement text shared across every user in this manifest response.
         weather_payload = _weather_payload_from_sync_request(request)
         announce = await _announce(settings, weather_payload) if settings.get("announce_enabled", True) else ""
@@ -3862,8 +4079,12 @@ async def sync_manifest(request: Request):
             content = "" if user["status"] == "pending_delete" else await build_manifest_content(
                 conn, user, body, headers, settings, announce, servers,
                 public_base_url=str(request.base_url).rstrip("/"))
-            manifest.append({"id": user["id"], "slug": user["slug"], "status": user["status"], "enabled": user["enabled"],
-                             "drive_file_id": user["drive_file_id"], "name": user["name"], "content": content})
+            item = {"id": user["id"], "slug": user["slug"], "status": user["status"], "enabled": user["enabled"],
+                    "drive_file_id": user["drive_file_id"], "name": user["name"], "content": content}
+            generation = activation_generations.get(int(user["id"]))
+            if generation is not None:
+                item["activation_generation"] = generation
+            manifest.append(item)
     log.info("Apps Script manifest generated: users=%d stale-cache=%s", len(manifest), "yes" if _stale else "no")
     return {"users": manifest, "generated_at": datetime.now(timezone.utc).isoformat()}
 
@@ -3871,6 +4092,7 @@ async def sync_manifest(request: Request):
 class SyncReport(BaseModel):
     user_id: int
     drive_file_id: str | None = Field(default=None, max_length=256)
+    activation_generation: int | None = Field(default=None, ge=0)
     ok: bool
     error: str | None = Field(default=None, max_length=1000)
 
@@ -3883,7 +4105,8 @@ async def sync_report(data: SyncReport, request: Request, background_tasks: Back
     safe_error = _safe_sync_error(data.error) if not data.ok else None
     async with pool.acquire() as conn:
         await conn.execute("INSERT INTO app_state(key,value) VALUES('last_script_request',to_jsonb(now())) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value")
-        user = await conn.fetchrow(f"""SELECT id,status,device_limit,
+        user = await conn.fetchrow(f"""SELECT id,status,device_limit,device_limit_status,
+            (limited_link IS NOT NULL) AS limited_link_ready,
             EXISTS(SELECT 1 FROM {activation_table} a WHERE a.user_id=users.id) AS render_activation
             FROM users WHERE id=$1""", data.user_id)
         if not user: return {"ok": True, "ignored": True}
@@ -3892,7 +4115,39 @@ async def sync_report(data: SyncReport, request: Request, background_tasks: Back
             return {"ok": True, "deleted": True}
         await conn.execute("""UPDATE users SET drive_file_id=COALESCE($2,drive_file_id),last_synced_at=CASE WHEN $3 THEN now() ELSE last_synced_at END,
             last_sync_error=$4,updated_at=now() WHERE id=$1""", data.user_id, data.drive_file_id, data.ok, safe_error)
-    if data.ok and user["device_limit"] is not None and not user["render_activation"]:
+        if (data.ok and not _test_environment.get() and user["render_activation"]
+                and data.activation_generation is not None):
+            await conn.execute("""UPDATE subscription_activation SET drive_ready_at=COALESCE(drive_ready_at,now())
+                WHERE user_id=$1 AND activated_at IS NOT NULL AND drive_generation=$2""",
+                data.user_id, data.activation_generation)
+        elif (data.ok and not _test_environment.get() and user["render_activation"]
+              and data.activation_generation is None):
+            log.warning("Drive report omitted activation generation: user_id=%d", data.user_id)
+        if not _test_environment.get():
+            if data.ok:
+                reported_at = time.time()
+                state._drive_sync_reported_at[data.user_id] = reported_at
+                if len(state._drive_sync_reported_at) > 2000:
+                    cutoff = reported_at - 24 * 60 * 60
+                    state._drive_sync_reported_at = {
+                        user_id: timestamp for user_id, timestamp in state._drive_sync_reported_at.items()
+                        if timestamp >= cutoff
+                    }
+                state.drive_push_last = max(state.drive_push_last or 0.0, reported_at)
+                error_count = int(await conn.fetchval(
+                    "SELECT count(*) FROM users WHERE last_sync_error IS NOT NULL AND status<>'pending_delete'"
+                ) or 0)
+                state.drive_push_error = (
+                    f"У {int(error_count)} подписок есть ошибки синхронизации Google Drive"
+                    if error_count else None
+                )
+            else:
+                state.drive_push_error = (
+                    f"Google Drive не обновил профиль пользователя {data.user_id}"
+                    + (f": {safe_error}" if safe_error else "")
+                )
+    if (data.ok and user["device_limit"] is not None and not user["render_activation"]
+            and (not user["limited_link_ready"] or user["device_limit_status"] != "ready")):
         _schedule_limited_link(data.user_id)
     return {"ok": True}
 
@@ -3906,7 +4161,7 @@ GEO_FILE_SOURCES = {
 async def _sync_activated_test_subscription(user_id: int):
     token = _test_environment.set(True)
     try:
-        delivery = await state.push_drive_sync([user_id])
+        delivery = await state.request_drive_sync([user_id])
         log.info("Test subscription geo activation: user_id=%d, drive_sync_ok=%s", user_id, bool(delivery.get("ok")))
     finally:
         _test_environment.reset(token)
@@ -3934,7 +4189,7 @@ async def _activation_get_current(activation_id: str, token: str, request: Reque
     try:
         pool = await state.db()
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(f"""SELECT a.user_id,a.token_hash,a.token_nonce,a.activated_at,a.device_limit,
+            row = await conn.fetchrow(f"""SELECT a.user_id,a.token_hash,a.token_nonce,a.activated_at,a.drive_ready_at,a.device_limit,
                 u.name,u.status,u.enabled,u.expires_at,u.drive_file_id
                 FROM {activation_table} a JOIN users u ON u.id=a.user_id
                 WHERE a.token_hash=$1 AND a.user_id=$2""", token_hash, activation_user_id)
@@ -4006,7 +4261,9 @@ async def _activation_get_current(activation_id: str, token: str, request: Reque
             else:
                 slot_token = _main_slot_token(activation_user_id, cookie_value)
                 current_link_hash = hashlib.sha256(f"drive-v1:{slot_token}".encode()).hexdigest()
-                if (known_device["subscription_token_hash"] == current_link_hash and known_device["encrypted_link"]):
+                if (row["drive_ready_at"] is not None
+                        and known_device["subscription_token_hash"] == current_link_hash
+                        and known_device["encrypted_link"]):
                     import_link = str(known_device["encrypted_link"])
                 elif background_tasks is not None:
                     _schedule_main_activation_link(background_tasks, activation_user_id, cookie_value)
@@ -4062,7 +4319,8 @@ async def _main_activation_status(activation_id: str, token: str, request: Reque
     try:
         pool = await state.db()
         async with pool.acquire() as conn:
-            row = await conn.fetchrow("""SELECT a.device_limit,u.status,u.enabled,u.expires_at,u.drive_file_id,
+            row = await conn.fetchrow("""SELECT a.device_limit,a.activated_at,a.drive_ready_at,
+                u.status,u.enabled,u.expires_at,u.drive_file_id,
                 d.device_hash,d.subscription_token_hash,d.encrypted_link
                 FROM subscription_activation a JOIN users u ON u.id=a.user_id
                 LEFT JOIN activation_devices d ON d.user_id=a.user_id AND d.device_hash=$3
@@ -4082,7 +4340,8 @@ async def _main_activation_status(activation_id: str, token: str, request: Reque
         return JSONResponse({"error": "Файл подписки ещё готовится. Обновите страницу позже."}, status_code=409)
     slot_token = _main_slot_token(user_id, cookie_value)
     expected_hash = hashlib.sha256(f"drive-v1:{slot_token}".encode()).hexdigest()
-    if row["subscription_token_hash"] == expected_hash and row["encrypted_link"]:
+    if (row["drive_ready_at"] is not None and row["subscription_token_hash"] == expected_hash
+            and row["encrypted_link"]):
         return JSONResponse({"ready": True, "happ_link": str(row["encrypted_link"])},
                             headers={"Cache-Control": "no-store"})
     job_key = (user_id, browser_hash)
@@ -4149,7 +4408,7 @@ async def _activation_post_current(activation_id: str, token: str, request: Requ
                 WHERE a.token_hash=$1 AND a.user_id=$2 FOR UPDATE OF a,u""", token_hash, activation_user_id)
             if not row:
                 return form_error("Ссылка активации устарела", "Попросите администратора выдать новую ссылку.", 404)
-            needs_drive_sync = row["drive_ready_at"] is None
+            needs_drive_sync = row["drive_ready_at"] is None or row["activated_at"] is None
             if row["status"] != "active" or not row["enabled"] or (row["expires_at"] and row["expires_at"] <= datetime.now(timezone.utc)):
                 return form_error("Подписка недоступна",
                     "Тестовая подписка отключена или срок её действия закончился." if test_mode
@@ -4179,13 +4438,19 @@ async def _activation_post_current(activation_id: str, token: str, request: Requ
                 await conn.execute(f"""INSERT INTO {devices_table}(user_id,device_hash,platform,browser,language)
                     VALUES($1,$2,$3,$4,$5)""", activation_user_id, browser_hash, platform, browser, language)
                 registered += 1
-            await conn.execute(f"""UPDATE {activation_table} SET activated_at=COALESCE(activated_at,now()),
-                updated_at=now() WHERE user_id=$1""", activation_user_id)
+            if test_mode:
+                await conn.execute(f"""UPDATE {activation_table} SET activated_at=COALESCE(activated_at,now()),
+                    updated_at=now() WHERE user_id=$1""", activation_user_id)
+            else:
+                await conn.execute("""UPDATE subscription_activation SET activated_at=COALESCE(activated_at,now()),
+                    drive_ready_at=CASE WHEN activated_at IS NULL THEN NULL ELSE drive_ready_at END,
+                    drive_generation=drive_generation+CASE WHEN activated_at IS NULL THEN 1 ELSE 0 END,
+                    updated_at=now() WHERE user_id=$1""", activation_user_id)
     import_pending = False
     if test_mode:
         delivery = {"ok": True, "pending": False}
         if needs_drive_sync:
-            delivery = await state.push_drive_sync([activation_user_id])
+            delivery = await state.request_drive_sync([activation_user_id])
             drive_ready = (delivery.get("ok") and not delivery.get("pending")
                            and int(delivery.get("processed") or 0) > 0)
             if drive_ready:
@@ -4199,8 +4464,8 @@ async def _activation_post_current(activation_id: str, token: str, request: Requ
             if drive_ready else
             (None, "Подписка ещё готовится. Повторите подтверждение с этого же браузера позже."))
     else:
-        # Confirmation only consumes a browser slot. Do not hold the customer's
-        # page open while Apps Script and Happ prepare the import link.
+        # Drive must receive the activated profile before the encrypted direct
+        # Drive link is generated. Run both steps behind the pending page.
         share_link = None
         link_error = None
         import_pending = True

@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import httpx
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 
 import panel
 from test_panel import FakeConn, FakePool, make_request
@@ -293,8 +293,10 @@ class DeviceLimitSettingsAndManifestTests(unittest.IsolatedAsyncioTestCase):
     async def test_successful_drive_report_schedules_link_but_failed_report_does_not(self):
         class ReportConn(FakeConn):
             async def fetchrow(self, query, *args):
-                if "SELECT id,status,device_limit FROM users" in query:
-                    return {"id": args[0], "status": "active", "device_limit": 4}
+                if "SELECT id,status,device_limit" in query and "FROM users" in query:
+                    return {"id": args[0], "status": "active", "device_limit": 4,
+                            "device_limit_status": "waiting", "limited_link_ready": False,
+                            "render_activation": False}
                 return await super().fetchrow(query, *args)
 
         for ok in (True, False):
@@ -304,7 +306,7 @@ class DeviceLimitSettingsAndManifestTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(panel.state, "db", new=AsyncMock(return_value=FakePool(conn))), \
                  patch.object(panel, "_schedule_limited_link") as schedule:
                 result = await panel.sync_report(panel.SyncReport(user_id=9, drive_file_id="new-drive-id", ok=ok),
-                                                 make_request({"X-Sync-Key": "sync"}))
+                                                 make_request({"X-Sync-Key": "sync"}), BackgroundTasks())
             self.assertTrue(result["ok"])
             self.assertEqual(schedule.call_count, 1 if ok else 0)
 

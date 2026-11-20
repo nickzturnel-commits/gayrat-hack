@@ -91,6 +91,14 @@ def install(app: FastAPI, panel) -> bool:
         ),
         version="1.0.0",
     )
+    # MCP tools call the local FastAPI admin routes in-process. Reuse one
+    # ASGI client/connection pool instead of rebuilding the transport and
+    # client for every tool invocation.
+    admin_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="https://zeva-online.onrender.com",
+        timeout=httpx.Timeout(60.0, connect=5.0),
+    )
 
     async def admin_api(method: str, path: str, data: dict | None = None) -> Any:
         """Call an existing primary admin API route in-process using a short-lived signed session."""
@@ -107,20 +115,14 @@ def install(app: FastAPI, panel) -> bool:
             "environment": "main",
             "exp": int(time.time()) + 120,
         })
-        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
         try:
-            async with httpx.AsyncClient(
-                transport=transport,
-                base_url="https://zeva-online.onrender.com",
-                timeout=httpx.Timeout(120.0),
+            response = await admin_client.request(
+                method,
+                path,
+                json=data,
                 cookies={"admin_session": session},
-            ) as client:
-                response = await client.request(
-                    method,
-                    path,
-                    json=data,
-                    headers={"x-csrf-token": csrf, "accept": "application/json"},
-                )
+                headers={"x-csrf-token": csrf, "accept": "application/json"},
+            )
         except httpx.TimeoutException as exc:
             raise ToolError(f"Панель не ответила вовремя ({type(exc).__name__}); проверь состояние операции отдельно.") from None
         content_type = response.headers.get("content-type", "")
@@ -129,7 +131,8 @@ def install(app: FastAPI, panel) -> bool:
                 detail = response.json().get("detail", "")
             except Exception:
                 detail = response.text[:500]
-            raise ToolError(f"Панель вернула HTTP {response.status_code}: {detail}")
+            safe_detail = panel._safe_sync_error(str(detail)) if detail else ""
+            raise ToolError(f"Панель вернула HTTP {response.status_code}: {safe_detail}")
         if "application/json" in content_type:
             return response.json()
         return response.text
@@ -139,6 +142,8 @@ def install(app: FastAPI, panel) -> bool:
         token = panel._test_environment.set(False)
         try:
             pool = await panel.state.db()
+            if pool is None:
+                raise ToolError("Основная база данных недоступна")
             yield pool
         finally:
             panel._test_environment.reset(token)
@@ -151,17 +156,39 @@ def install(app: FastAPI, panel) -> bool:
         result = await admin_api("GET", "/api/admin/users")
         return list(result.get("users", []))
 
+    async def raw_subscription(user_id: int) -> dict | None:
+        """Load one primary subscription without serializing the whole subscriber list."""
+        async with main_database() as pool:
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow("""SELECT u.*,
+                    (a.user_id IS NOT NULL) AS activation_enabled,
+                    a.token_nonce AS activation_nonce,a.activated_at AS activation_at,
+                    a.device_limit AS activation_limit,
+                    (SELECT count(*) FROM activation_devices d WHERE d.user_id=a.user_id) AS activation_devices_count,
+                    (SELECT count(*) FROM activation_devices d WHERE d.user_id=a.user_id
+                        AND d.encrypted_link IS NOT NULL) AS activation_links_count
+                    FROM users u LEFT JOIN subscription_activation a ON a.user_id=u.id
+                    WHERE u.id=$1""", user_id)
+        if row is None:
+            return None
+        user = panel._serialize(row)
+        nonce = user.pop("activation_nonce", None)
+        user["activation_id"] = panel._main_activation_id(user_id) if user.get("activation_enabled") else None
+        user["activation_url"] = (panel._main_activation_url(user_id, nonce)
+                                  if user.get("activation_enabled") and nonce else None)
+        return user
+
     @mcp.tool()
     async def get_dashboard() -> dict[str, Any]:
-        """Показывает сводку /admin: источники, серверы, пользователи, БД, Drive-доставка и ошибки."""
-        return _public(await admin_api("GET", "/api/admin/dashboard"))
+        """Быстро показывает кэшированную сводку /admin; источники обновляются отдельно."""
+        return _public(await admin_api("GET", "/api/admin/dashboard?cached=1"))
 
     @mcp.tool()
     async def get_operational_status() -> dict[str, Any]:
         """Возвращает статус БД, провайдеров, Happ и синхронизации из настроек панели."""
         dashboard, settings = await asyncio.gather(
-            admin_api("GET", "/api/admin/dashboard"),
-            admin_api("GET", "/api/admin/settings"),
+            admin_api("GET", "/api/admin/dashboard?cached=1"),
+            admin_api("GET", "/api/admin/settings?cached=1"),
         )
         return _public({"dashboard": dashboard, "settings_status": settings})
 
@@ -175,8 +202,7 @@ def install(app: FastAPI, panel) -> bool:
     @mcp.tool()
     async def get_subscription(user_id: int) -> dict[str, Any]:
         """Показывает одну подписку по ID без bearer-ссылок и секретных идентификаторов."""
-        users = await raw_subscriptions()
-        user = next((item for item in users if int(item.get("id", -1)) == user_id), None)
+        user = await raw_subscription(user_id)
         if user is None:
             raise ToolError("Подписка с таким ID не найдена в основной среде. Сначала проверь ID через list_subscriptions.")
         return _public(user)
@@ -199,8 +225,7 @@ def install(app: FastAPI, panel) -> bool:
         }
         if not changes or set(changes) - allowed:
             raise ToolError(f"Изменения должны содержать только поля: {', '.join(sorted(allowed))}")
-        users = await raw_subscriptions()
-        current = next((item for item in users if int(item.get("id", -1)) == user_id), None)
+        current = await raw_subscription(user_id)
         if current is None:
             raise ToolError("Подписка не найдена")
         body = {key: current.get(key) for key in (
@@ -249,6 +274,7 @@ def install(app: FastAPI, panel) -> bool:
                     changed_ids: list[int] = []
                     rebuild_ids: list[int] = []
                     skipped = []
+                    update_batches: dict[tuple[str, ...], list[tuple[Any, ...]]] = {}
                     for row in rows:
                         user_id = int(row["id"])
                         if row["status"] != "active":
@@ -275,17 +301,19 @@ def install(app: FastAPI, panel) -> bool:
                             })
                         if not values:
                             continue
-                        columns = list(values)
-                        args = [user_id, *(values[column] for column in columns)]
-                        setters = [f"{column}=${index}" for index, column in enumerate(columns, 2)]
-                        setters.append("updated_at=now()")
-                        await conn.execute(
-                            f"UPDATE users SET {', '.join(setters)} WHERE id=$1", *args,
-                        )
+                        columns = tuple(values)
+                        update_batches.setdefault(columns, []).append(
+                            (user_id, *(values[column] for column in columns)))
                         changed_ids.append(user_id)
                         if limit_changed and normalized["device_limit"] is not None and row["enabled"]:
                             rebuild_ids.append(user_id)
-        delivery = await panel.state.push_drive_sync(changed_ids) if changed_ids else None
+                    for columns, batch in update_batches.items():
+                        setters = [f"{column}=${index}" for index, column in enumerate(columns, 2)]
+                        setters.append("updated_at=now()")
+                        await conn.executemany(
+                            f"UPDATE users SET {', '.join(setters)} WHERE id=$1", batch,
+                        )
+        delivery = await panel.state.request_drive_sync(changed_ids) if changed_ids else None
         for user_id in rebuild_ids:
             panel._schedule_limited_link(user_id)
         return {"updated": changed_ids, "skipped_inactive": skipped,
@@ -316,7 +344,7 @@ def install(app: FastAPI, panel) -> bool:
                         "UPDATE users SET status='pending_delete',enabled=FALSE,updated_at=now() "
                         "WHERE id=ANY($1::bigint[])", ids,
                     )
-        delivery = await panel.state.push_drive_sync(ids)
+        delivery = await panel.state.request_drive_sync(ids)
         return {"pending_delete": ids, "drive_sync": delivery}
 
     @mcp.tool()
@@ -328,12 +356,13 @@ def install(app: FastAPI, panel) -> bool:
     @mcp.tool()
     async def get_subscription_link(user_id: int, kind: Literal["drive", "limited", "activation"]) -> dict[str, Any]:
         """Returns a private bearer link only on explicit request. Kinds: drive, limited, activation."""
-        users = await raw_subscriptions()
-        user = next((item for item in users if int(item.get("id", -1)) == user_id), None)
+        user = await raw_subscription(user_id)
         if user is None:
             raise ToolError("Подписка не найдена")
         if kind == "drive":
-            value = user.get("drive_link")
+            file_id = user.get("drive_file_id")
+            value = (panel._drive_subscription_link(file_id)
+                     if file_id and os.getenv("DRIVE_API_KEY", "") else None)
             pending = not value
         elif kind == "limited":
             value = user.get("limited_link")
@@ -374,14 +403,17 @@ def install(app: FastAPI, panel) -> bool:
                     found = {int(row["user_id"]) for row in existing}
                     if found != set(ids):
                         raise ToolError("Все выбранные подписки должны иметь включённую Render-активацию")
-                    for user_id in ids:
-                        await conn.execute("""DELETE FROM activation_devices WHERE user_id=$1 AND device_hash IN (
-                            SELECT device_hash FROM activation_devices WHERE user_id=$1
-                            ORDER BY registered_at,device_hash OFFSET $2)""", user_id, limit)
-                        await conn.execute(
-                            "UPDATE subscription_activation SET device_limit=$2,updated_at=now() WHERE user_id=$1",
-                            user_id, limit,
+                    await conn.execute("""WITH ranked AS (
+                            SELECT user_id,device_hash,
+                                row_number() OVER (PARTITION BY user_id ORDER BY registered_at,device_hash) AS slot
+                            FROM activation_devices WHERE user_id=ANY($1::bigint[])
                         )
+                        DELETE FROM activation_devices d USING ranked r
+                        WHERE d.user_id=r.user_id AND d.device_hash=r.device_hash AND r.slot>$2""", ids, limit)
+                    await conn.execute(
+                        "UPDATE subscription_activation SET device_limit=$2,updated_at=now() "
+                        "WHERE user_id=ANY($1::bigint[])", ids, limit,
+                    )
         return {"updated": ids, "limit": limit}
 
     @mcp.tool()
@@ -389,6 +421,17 @@ def install(app: FastAPI, panel) -> bool:
         """Clears registered browser slots while retaining the same activation URL. Requires confirm=true."""
         await require_confirm(confirm)
         return _public(await admin_api("POST", f"/api/admin/users/{user_id}/activation/reset", {}))
+
+    @mcp.tool()
+    async def remove_activation_device(user_id: int, device_id: str, confirm: bool) -> dict[str, Any]:
+        """Removes one registered browser slot, freeing one place without resetting other devices. Requires confirm=true."""
+        await require_confirm(confirm)
+        _validate_ids([user_id])
+        if not isinstance(device_id, str) or not re.fullmatch(r"[a-f0-9]{64}", device_id):
+            raise ToolError("device_id должен быть 64-символьным идентификатором из списка активаций")
+        return _public(await admin_api(
+            "DELETE", f"/api/admin/users/{user_id}/activation/devices/{device_id}"
+        ))
 
     @mcp.tool()
     async def retry_activation_sync(user_id: int, confirm: bool) -> dict[str, Any]:
@@ -432,8 +475,8 @@ def install(app: FastAPI, panel) -> bool:
 
     @mcp.tool()
     async def list_servers() -> dict[str, Any]:
-        """Lists the current provider catalog; Secure X and SAS order follows the panel catalog."""
-        return await admin_api("GET", "/api/admin/servers")
+        """Quickly lists the latest cached provider catalog; use refresh_server_sources for a fresh fetch."""
+        return await admin_api("GET", "/api/admin/servers?cached=1")
 
     @mcp.tool()
     async def update_server(
@@ -463,7 +506,7 @@ def install(app: FastAPI, panel) -> bool:
         ids = _validate_server_ids(server_ids)
         if not prefix and not suffix and not find_text:
             raise ToolError("Укажи prefix, suffix или find_text для переименования")
-        catalog = await admin_api("GET", "/api/admin/servers")
+        catalog = await admin_api("GET", "/api/admin/servers?cached=1")
         selected = {str(item["id"]): item for item in catalog.get("servers", []) if str(item.get("id")) in set(ids)}
         if len(selected) != len(ids):
             raise ToolError("Один или несколько серверов отсутствуют в каталоге")
@@ -516,7 +559,7 @@ def install(app: FastAPI, panel) -> bool:
     @mcp.tool()
     async def get_settings() -> dict[str, Any]:
         """Reads primary panel configuration and safe integration readiness flags."""
-        return await admin_api("GET", "/api/admin/settings")
+        return await admin_api("GET", "/api/admin/settings?cached=1")
 
     @mcp.tool()
     async def update_settings(values: dict[str, Any], confirm: bool) -> dict[str, Any]:
@@ -553,9 +596,12 @@ def install(app: FastAPI, panel) -> bool:
 
     @asynccontextmanager
     async def combined_lifespan(application):
-        async with previous_lifespan(application):
-            async with mcp.session_manager.run():
-                yield
+        try:
+            async with previous_lifespan(application):
+                async with mcp.session_manager.run():
+                    yield
+        finally:
+            await admin_client.aclose()
 
     app.router.lifespan_context = combined_lifespan
     log.info("MCP admin endpoint mounted (secret hidden)")

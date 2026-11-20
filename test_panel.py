@@ -1,13 +1,15 @@
 import base64
+import asyncio
 import json
 import os
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import AsyncMock, patch
 
 import httpx
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 
 import app
 import panel
@@ -105,6 +107,8 @@ class FakeConn:
                 ids = set(args[0])
                 rows = [row for row in rows if row.get("id") in ids]
             return rows
+        if "FROM users u LEFT JOIN subscription_activation a" in query:
+            return self.users
         if "SELECT * FROM servers" in query:
             if "WHERE present_upstream=TRUE" in query:
                 return [row for row in self.servers if row.get("present_upstream", True)]
@@ -138,13 +142,18 @@ class FakeConn:
         return []
 
     async def fetchrow(self, query, *args):
-        if "SELECT id,status" in query and "FROM users" in query:
+        if "SELECT id,status,device_limit" in query and "FROM users" in query:
             matching = next((user for user in self.users if user.get("id") == args[0]), None)
             if matching is not None:
                 return {"id": args[0], "status": matching.get("status", self.status),
-                        "device_limit": matching.get("device_limit")}
+                        "device_limit": matching.get("device_limit"),
+                        "device_limit_status": matching.get("device_limit_status", "waiting"),
+                        "limited_link_ready": bool(matching.get("limited_link")),
+                        "render_activation": False}
             if self.status in {"active", "pending_delete"}:
-                return {"id": args[0], "status": self.status, "device_limit": None}
+                return {"id": args[0], "status": self.status, "device_limit": None,
+                        "device_limit_status": "none", "limited_link_ready": False,
+                        "render_activation": False}
         return None
 
     async def fetchval(self, query, *args):
@@ -1057,6 +1066,34 @@ class DriveQrTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(qr_result.headers["content-type"].startswith("image/svg+xml"))
         self.assertEqual(qr_result.headers["cache-control"], "no-store")
 
+
+class MainActivationDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrent_devices_share_one_drive_profile_delivery(self):
+        original_jobs = dict(panel._main_activation_drive_jobs)
+        panel._main_activation_drive_jobs.clear()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def deliver(user_id, generation):
+            started.set()
+            await release.wait()
+            return None
+
+        try:
+            with patch.object(panel, "_deliver_main_activation_profile", new=AsyncMock(side_effect=deliver)) as delivery:
+                first = asyncio.create_task(panel._ensure_main_activation_profile(71, 3))
+                await started.wait()
+                second = asyncio.create_task(panel._ensure_main_activation_profile(71, 3))
+                await asyncio.sleep(0)
+                self.assertEqual(delivery.await_count, 1)
+                release.set()
+                self.assertEqual(await asyncio.gather(first, second), [None, None])
+                await asyncio.sleep(0)
+                self.assertNotIn((71, 3), panel._main_activation_drive_jobs)
+        finally:
+            panel._main_activation_drive_jobs.clear()
+            panel._main_activation_drive_jobs.update(original_jobs)
+
     async def test_qr_route_is_mounted_and_returns_image_response(self):
         class DriveConn(FakeConn):
             async def fetchrow(self, query, *args):
@@ -1105,9 +1142,49 @@ class DriveSyncPushTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ошибок: 1", result["message"])
         self.assertIsNotNone(state.drive_push_last)
 
+    async def test_lock_busy_ack_does_not_clear_existing_main_error(self):
+        class FakeResponse:
+            status_code = 200
+            def json(self): return {"ok": True, "pending": True, "processed": 0, "failed": 0}
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): return False
+            async def post(self, *args, **kwargs): return FakeResponse()
+
+        state = panel.PanelState()
+        state.drive_push_error = "Предыдущая ошибка Drive"
+        with patch.dict(os.environ, {"DRIVE_SYNC_URL": "https://script.example/exec", "SYNC_KEY": "sync"}, clear=False), \
+             patch.object(panel.httpx, "AsyncClient", FakeClient):
+            result = await state.push_drive_sync([7])
+
+        self.assertTrue(result["pending"])
+        self.assertEqual(state.drive_push_error, "Предыдущая ошибка Drive")
+        self.assertEqual(state.drive_push_last, 0.0)
+
+    async def test_timeout_after_target_profile_report_is_not_marked_as_failed(self):
+        state = panel.PanelState()
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): return False
+            async def post(self, *args, **kwargs):
+                state._drive_sync_reported_at[7] = time.time()
+                raise httpx.ReadTimeout("timed out")
+
+        with patch.dict(os.environ, {"DRIVE_SYNC_URL": "https://script.example/exec", "SYNC_KEY": "sync"}, clear=False), \
+             patch.object(panel.httpx, "AsyncClient", FakeClient):
+            result = await state.push_drive_sync([7])
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["pending"])
+        self.assertIsNone(state.drive_push_error)
+
 
 class ManifestTests(unittest.IsolatedAsyncioTestCase):
-    async def test_manifest_forces_sas_refresh_and_includes_servers_in_every_profile(self):
+    async def test_manifest_uses_warm_sources_and_includes_servers_in_every_profile(self):
         body = b"vless://main@main.example:443#Main\nvless://sas@sas.example:443#SAS"
         users = [
             {"id": 40, "slug": "legacy", "name": "Main profile", "note": "", "enabled": True,
@@ -1126,11 +1203,24 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
                  panel.DEFAULT_SETTINGS, announce_enabled=False))):
             result = await panel.sync_manifest(make_request({"X-Sync-Key": "sync"}))
 
-        fetch.assert_awaited_once_with(force_sas=True, allow_sas_failure=False)
+        fetch.assert_awaited_once_with(force_sas=False, allow_sas_failure=False)
         self.assertEqual(len(result["users"]), 2)
         for user in result["users"]:
             self.assertIn("vless://main@main.example:443#Main", user["content"])
             self.assertIn("vless://sas@sas.example:443#SAS", user["content"])
+
+    async def test_manifest_can_explicitly_refresh_sources(self):
+        fetch = AsyncMock(return_value=(b"vless://main@main.example:443#Main", {}, False))
+        conn = FakeConn(users=[{"id": 1, "slug": "refresh", "name": "Refresh", "note": "",
+                                "enabled": True, "expires_at": None, "title_override": None,
+                                "announce_override": "", "status": "active", "drive_file_id": None}])
+        with patch.dict(os.environ, {"SYNC_KEY": "sync"}, clear=False), \
+             patch.object(panel.state, "db", new=AsyncMock(return_value=FakePool(conn))), \
+             patch.object(panel.state, "fetch_upstream", new=fetch), \
+             patch.object(panel, "_settings", new=AsyncMock(return_value=dict(
+                 panel.DEFAULT_SETTINGS, announce_enabled=False))):
+            await panel.sync_manifest(make_request({"X-Sync-Key": "sync"}, b"refresh_sources=1"))
+        fetch.assert_awaited_once_with(force_sas=True, allow_sas_failure=False)
 
     async def test_sync_manifest_delivers_all_new_nodes_from_base64_with_spaced_names(self):
         provider_text = "\n".join([
@@ -1421,12 +1511,12 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mobile.status_code, 200)
         self.assertIn('class="desktop-ui"', desktop.text)
         self.assertIn('class="mobile-ui"', mobile.text)
-        self.assertIn("/static/admin.js?v=20261118-7", desktop.text)
-        self.assertIn("/static/admin.js?v=20261118-7", mobile.text)
+        self.assertIn("/static/admin.js?v=20261120-3", desktop.text)
+        self.assertIn("/static/admin.js?v=20261120-3", mobile.text)
         self.assertIn("/static/admin-actions.js?v=20261029-2", desktop.text)
         self.assertIn("/static/admin-actions.js?v=20261029-2", mobile.text)
-        self.assertIn("/static/admin.css?v=20261118-6", desktop.text)
-        self.assertIn("/static/admin.css?v=20261118-6", mobile.text)
+        self.assertIn("/static/admin.css?v=20261120-1", desktop.text)
+        self.assertIn("/static/admin.css?v=20261120-1", mobile.text)
         self.assertIn('class="mobile-nav-glider"', mobile.text)
         self.assertIn('data-active-index="0"', mobile.text)
         self.assertEqual(javascript.status_code, 200)
@@ -1434,13 +1524,13 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Подписка отключена, ссылка заменена заглушкой", javascript.text)
         self.assertIn("dataset.activeIndex = String(index)", javascript.text)
         self.assertIn('class="button button-secondary user-qr-action" data-action="qr" data-limited=', javascript.text)
-        self.assertIn("const mainLink = hasLimit ? (user.limited_link || '') : (user.drive_link || '');", javascript.text)
+        self.assertIn("const mainLink = renderActivation ? activationLink : hasLimit ? (user.limited_link || '') : (user.drive_link || '');", javascript.text)
         self.assertIn("Скопировать зашифрованную подписку Happ с лимитом", javascript.text)
         self.assertIn('aria-label="${esc(mainLinkTitle)}" title="${esc(mainLinkTitle)}"', javascript.text)
-        self.assertIn('hasLimit && user.drive_link ? `<button class="button button-secondary" data-action="copy-link"', javascript.text)
+        self.assertIn('hasLimit && user.drive_link && !renderActivation ? `<button class="button button-secondary" data-action="copy-link"', javascript.text)
         self.assertIn('data-action="copy-link" data-link=', javascript.text)
         self.assertNotIn('data-action="qr" data-link=', javascript.text)
-        self.assertIn("showDriveQr(shareAction.userId, button.dataset.limited === 'yes')", javascript.text)
+        self.assertIn("showDriveQr(shareAction.userId, button.dataset.limited === 'yes', button.dataset.activationQr === 'yes')", javascript.text)
         self.assertIn("driveQrLoadingContent()", javascript.text)
         self.assertIn("credentials: 'same-origin'", javascript.text)
         self.assertIn("window.PanelAdminActions.formatDate(value)", javascript.text)
@@ -1478,7 +1568,7 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         fake_pool = FakePool(conn)
         data = panel.SyncReport(user_id=9, drive_file_id="drive-id", ok=True)
         with patch.dict(os.environ, {"SYNC_KEY": "sync"}, clear=False), patch.object(panel.state, "db", new=AsyncMock(return_value=fake_pool)):
-            result = await panel.sync_report(data, make_request({"X-Sync-Key": "sync"}))
+            result = await panel.sync_report(data, make_request({"X-Sync-Key": "sync"}), BackgroundTasks())
         self.assertTrue(result["deleted"])
         self.assertTrue(conn.deleted)
 
@@ -1487,7 +1577,7 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         fake_pool = FakePool(conn)
         data = panel.SyncReport(user_id=10, drive_file_id="drive-id", ok=False, error="Drive update failed")
         with patch.dict(os.environ, {"SYNC_KEY": "sync"}, clear=False), patch.object(panel.state, "db", new=AsyncMock(return_value=fake_pool)):
-            result = await panel.sync_report(data, make_request({"X-Sync-Key": "sync"}))
+            result = await panel.sync_report(data, make_request({"X-Sync-Key": "sync"}), BackgroundTasks())
         self.assertNotIn("deleted", result)
         self.assertFalse(conn.deleted)
 
@@ -1515,7 +1605,7 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
         fake_pool = FakePool(conn)
         data = panel.SyncReport(user_id=92, drive_file_id="drive-id", ok=True)
         with patch.dict(os.environ, {"SYNC_KEY": "sync"}, clear=False), patch.object(panel.state, "db", new=AsyncMock(return_value=fake_pool)):
-            result = await panel.sync_report(data, make_request({"X-Sync-Key": "sync"}))
+            result = await panel.sync_report(data, make_request({"X-Sync-Key": "sync"}), BackgroundTasks())
         self.assertNotIn("deleted", result)
         self.assertFalse(conn.deleted)
 
