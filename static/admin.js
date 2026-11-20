@@ -188,6 +188,7 @@
       !data.database.connected ? `<div class="alert-card">${esc(data.database.error || 'База данных недоступна')}</div>` : '',
       data.upstream.warning ? `<div class="alert-card">Апстрим: ${esc(data.upstream.warning)}. Используется последняя удачная копия, если она доступна.</div>` : '',
       !delivery.configured ? '<div class="alert-card">Для мгновенной отправки изменений задайте в Render DRIVE_SYNC_URL — адрес развёрнутого Apps Script Web App.</div>' : '',
+      delivery.pending ? '<div class="alert-card">Синхронизация Google Drive выполняется в фоне.</div>' : '',
       delivery.warning ? `<div class="alert-card">${esc(delivery.warning)}</div>` : ''
     ].filter(Boolean).join('');
     root.innerHTML = pageHead('Обзор', `<button id="retryDriveSync" class="button button-secondary">${svg('refresh')}<span>Обновить Drive</span></button>`)
@@ -198,7 +199,7 @@
         <article class="stat-card"><div class="stat-icon">${svg('users')}</div><p>Пользователи</p><strong>${data.users.active} <span class="stat-divider">/</span> ${data.users.total}</strong><small>активны · отключено ${data.users.disabled}</small></article>
         <article class="stat-card"><div class="stat-icon">${svg('refresh')}</div><p>Трафик аккаунта провайдера</p><strong>${traffic.total ? `${esc(bytes((traffic.upload || 0) + (traffic.download || 0)))} / ${esc(bytes(traffic.total))}` : 'Безлимит'}</strong><small>Загрузка ${esc(bytes(traffic.upload))} · скачивание ${esc(bytes(traffic.download))}</small></article>
         <article class="stat-card"><div class="stat-icon">${svg('users')}</div><p>Лимит устройств Happ</p><strong>${Number(data.device_limits?.count) || 0}</strong><small>Ошибок создания ссылки: ${Number(data.device_limits?.errors) || 0}</small></article>
-        <article class="stat-card"><div class="stat-icon">${svg('link')}</div><p>Google Drive</p><strong class="${delivery.configured ? 'tone-good' : 'tone-warn'}">${delivery.configured ? 'Синхронизация включена' : 'Не настроено'}</strong><small>Последнее обновление: ${esc(date(delivery.last_success_at))}</small></article>
+        <article class="stat-card"><div class="stat-icon">${svg('link')}</div><p>Google Drive</p><strong class="${delivery.configured ? 'tone-good' : 'tone-warn'}">${delivery.pending ? 'Обновление выполняется' : delivery.configured ? 'Синхронизация включена' : 'Не настроено'}</strong><small>Последнее обновление: ${esc(date(delivery.last_success_at))}</small></article>
       </div>
       <section class="section-block source-health-block"><div class="section-heading"><div><p class="eyebrow">ПОДКЛЮЧЁННЫЕ ИСТОЧНИКИ</p><h2>Состав каталога</h2></div><span class="source-refresh-note">Обновление SAS каждые 5 минут</span></div>
         <div class="source-health-grid">
@@ -485,7 +486,7 @@
   }
 
   async function activations(root) {
-    const data = await api(panelUrl('/api/admin/activations'));
+    const data = await api('/api/admin/activations');
     const activations = data.activations || [];
     const marker = testMode ? ' · ТЕСТ' : '';
     const activationHeading = testMode ? 'Отдельный Render-доступ для каждого браузерного слота'
@@ -531,7 +532,7 @@
           const limit = Number(field.value);
           if (!Number.isInteger(limit) || limit < 1 || limit > 20) return toast('Лимит должен быть целым числом от 1 до 20');
           button.disabled = true;
-          const result = await api(panelUrl(`/api/admin/users/${userId}/activation/limit`), {method:'PUT', body:{limit}});
+          const result = await api(`/api/admin/users/${userId}/activation/limit`, {method:'PUT', body:{limit}});
           toast(result.changed ? `Лимит Render ${result.limit} сохранён`
             : `Лимит Render ${result.limit} без изменений`);
           await activations(root);
@@ -541,7 +542,7 @@
           if (!confirm('Удалить эту регистрацию и освободить один слот? Уже добавленная в Happ ссылка Google Drive останется доступна этому клиенту.')) return;
           button.disabled = true;
           const deviceId = button.dataset.removeActivationDevice;
-          await api(panelUrl(`/api/admin/users/${userId}/activation/devices/${deviceId}`), {method:'DELETE', body:{}});
+          await api(`/api/admin/users/${userId}/activation/devices/${deviceId}`, {method:'DELETE', body:{}});
           toast('Регистрация удалена, слот освобождён');
           await activations(root);
           return;
@@ -552,14 +553,14 @@
             : 'Сбросить все регистрации? Адрес активации останется прежним. Уже добавленные ссылки Google Drive не отзываются.';
           if (!confirm(resetPrompt)) return;
           button.disabled = true;
-          const result = await api(panelUrl(`/api/admin/users/${userId}/activation/reset`), {method:'POST', body:{}});
+          const result = await api(`/api/admin/users/${userId}/activation/reset`, {method:'POST', body:{}});
           toast(resultText(result, testMode ? 'Ссылка обновлена, регистрации очищены' : 'Регистрации очищены, ссылка сохранена'));
           await activations(root);
           return;
         }
         if (button.dataset.retryActivation !== undefined) {
           button.disabled = true;
-          const result = await api(panelUrl(`/api/admin/users/${userId}/activation/retry`), {method:'POST', body:{}});
+          const result = await api(`/api/admin/users/${userId}/activation/retry`, {method:'POST', body:{}});
           toast(result.message || 'Синхронизация Google Drive запущена');
           await activations(root);
         }
@@ -594,12 +595,12 @@
           ? 'Сбросить регистрации и выдать новый адрес? Drive-профиль станет заглушкой до новой активации. Все старые Render-ссылки этой подписки перестанут работать. Это тестовая среда.'
           : 'Сбросить регистрации? Адрес активации останется прежним. Уже добавленные ссылки Google Drive не отзываются.')) {
         button.disabled = true;
-        const result = await api(panelUrl(`/api/admin/users/${button.dataset.activationReset}/activation/reset`), { method: 'POST', body: {} });
+        const result = await api(`/api/admin/users/${button.dataset.activationReset}/activation/reset`, { method: 'POST', body: {} });
         toast(resultText(result, testMode ? 'Тестовые регистрации сброшены' : 'Регистрации очищены, ссылка сохранена'));
         await render();
       } else if (button.dataset.activationRetry) {
         button.disabled = true;
-        const result = await api(panelUrl(`/api/admin/users/${button.dataset.activationRetry}/activation/retry`), { method: 'POST', body: {} });
+        const result = await api(`/api/admin/users/${button.dataset.activationRetry}/activation/retry`, { method: 'POST', body: {} });
         toast(result.message || 'Повторное шифрование запущено');
         setTimeout(() => { if (page === 'users') render(); }, 900);
       } else if (button.dataset.delete && confirm('Отключить подписку и убрать пользователя из панели? Ссылка Drive останется, но при обновлении покажет один нерабочий сервер. Уже загруженные в клиент серверы могут работать до обновления подписки.')) {
