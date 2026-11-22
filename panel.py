@@ -2639,6 +2639,37 @@ async def users_list(request: Request):
     return {"users": users, "device_limit_bounds": {"min": happ_limit.MIN_LIMIT, "max": happ_limit.MAX_LIMIT}}
 
 
+@router.get("/api/admin/users/by-public-id/{public_id}")
+async def users_get_by_public_id(public_id: str, request: Request):
+    """Look up one current primary subscription by the six-character profile ID."""
+    _auth(request)
+    if _test_environment.get():
+        raise HTTPException(404, "Not found")
+    code = public_id.strip().upper()
+    if not re.fullmatch(r"[A-HJ-NP-Z2-9]{6}", code):
+        raise HTTPException(422, "Введите шестисимвольный ID подписки")
+
+    pool = await state.db()
+    async with pool.acquire() as conn:
+        # Release expired or disabled IDs before lookup, so an old profile ID
+        # cannot continue to resolve after its subscription has ended.
+        await _release_expired_public_ids(conn)
+        row = await conn.fetchrow("""SELECT u.id,u.public_id,u.name,u.note,u.status,u.enabled,
+                u.created_at,u.expires_at,u.last_synced_at,u.last_sync_error,
+                (a.user_id IS NOT NULL) AS activation_enabled,a.device_limit AS activation_limit,
+                a.activated_at AS activation_at,
+                (SELECT count(*) FROM activation_devices d WHERE d.user_id=u.id) AS activation_devices_count
+            FROM users u LEFT JOIN subscription_activation a ON a.user_id=u.id
+            WHERE u.public_id=$1""", code)
+    if not row:
+        raise HTTPException(404, "Активная подписка с таким ID не найдена")
+    user = dict(row)
+    expires_at = user["expires_at"]
+    user["remaining_days"] = (None if expires_at is None else
+        max(0, math.ceil((_expiry_utc(expires_at) - datetime.now(timezone.utc)).total_seconds() / 86400)))
+    return {"user": user}
+
+
 @router.get("/api/admin/test-activations")
 async def test_activations_list(request: Request):
     _auth(request)

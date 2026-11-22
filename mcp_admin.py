@@ -86,6 +86,8 @@ def install(app: FastAPI, panel) -> bool:
         description="Управление основной админ-панелью Zeva Online.",
         instructions=(
             "Работай только с основной средой /admin. Для любых изменений используй инструменты панели. "
+            "Для поиска подписки по шестисимвольному ID профиля используй find_subscription_by_public_id; "
+            "он вернёт внутренний user_id, который передавай существующим инструментам управления подписками. "
             "Массовые изменения выполняй пакетными инструментами. Перед созданием, изменением, удалением, "
             "сбросом или синхронизацией передай confirm=true. Секретные ссылки возвращай только по явному запросу."
         ),
@@ -205,6 +207,16 @@ def install(app: FastAPI, panel) -> bool:
         user = await raw_subscription(user_id)
         if user is None:
             raise ToolError("Подписка с таким ID не найдена в основной среде. Сначала проверь ID через list_subscriptions.")
+        return _public(user)
+
+    @mcp.tool()
+    async def find_subscription_by_public_id(public_id: str) -> dict[str, Any]:
+        """Точно находит подписку по шестисимвольному ID из описания профиля. Возвращённый user_id подходит для всех инструментов управления."""
+        code = _validate_public_id(public_id)
+        result = await admin_api("GET", f"/api/admin/users/by-public-id/{code}")
+        user = result.get("user")
+        if not user:
+            raise ToolError("Активная подписка с таким ID не найдена в основной среде")
         return _public(user)
 
     @mcp.tool()
@@ -613,6 +625,15 @@ def install(app: FastAPI, panel) -> bool:
     app.router.lifespan_context = combined_lifespan
     log.info("MCP admin endpoint mounted (secret hidden)")
     return True
+
+
+def _validate_public_id(public_id: str) -> str:
+    if not isinstance(public_id, str):
+        raise ToolError("public_id должен состоять из шести букв или цифр")
+    code = public_id.strip().upper()
+    if not re.fullmatch(r"[A-HJ-NP-Z2-9]{6}", code):
+        raise ToolError("public_id должен состоять ровно из шести букв или цифр")
+    return code
 
 
 def _validate_ids(user_ids: list[int], *, max_count: int = _MAX_MCP_IDS) -> list[int]:
