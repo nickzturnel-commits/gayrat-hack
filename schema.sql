@@ -6,8 +6,8 @@ CREATE TABLE IF NOT EXISTS users (
     expires_at TIMESTAMPTZ,
     note TEXT NOT NULL DEFAULT '',
     drive_file_id TEXT UNIQUE,
+    public_id TEXT,
     title_override TEXT,
-    announce_override TEXT,
     traffic_limit_bytes BIGINT CHECK (traffic_limit_bytes IS NULL OR traffic_limit_bytes BETWEEN 1000000 AND 1000000000000),
     hide_traffic_usage BOOLEAN NOT NULL DEFAULT FALSE,
     include_sas BOOLEAN NOT NULL DEFAULT TRUE,
@@ -32,6 +32,18 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS device_limit_status TEXT NOT NULL DEF
 ALTER TABLE users ADD COLUMN IF NOT EXISTS device_limit_error TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS happ_install_code TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS limited_link TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS public_id TEXT;
+ALTER TABLE users DROP COLUMN IF EXISTS announce_override;
+
+DO $$
+BEGIN
+    ALTER TABLE users ADD CONSTRAINT users_public_id_format_check
+        CHECK (public_id IS NULL OR public_id ~ '^[A-HJ-NP-Z2-9]{6}$');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS users_public_id_unique_idx
+    ON users(public_id) WHERE public_id IS NOT NULL;
 
 -- Keep the range synchronized when upgrading databases that used the initial
 -- 1..20 device-limit constraint.

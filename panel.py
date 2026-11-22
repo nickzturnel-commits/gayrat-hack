@@ -13,12 +13,13 @@ import hmac
 import html
 import json
 import logging
+import math
 import os
 import re
 import secrets
 import time
 import unicodedata
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Literal
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
@@ -40,10 +41,9 @@ _test_environment = contextvars.ContextVar("panel_test_environment", default=Fal
 
 LEGACY_DRIVE_FILE_ID = "160lsZ2nDrSXTzA09r9jeGHnd6QyFylw9"
 PANEL_UPSTREAM_DEFAULT_USER_AGENT = "Happ"
-ASHGABAT_WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
-ASHGABAT_LATITUDE = 37.9601
-ASHGABAT_LONGITUDE = 58.3261
-ASHGABAT_WEATHER_UNAVAILABLE = "🌡 Ашхабад: текущая погода временно недоступна"
+PUBLIC_ID_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+PUBLIC_ID_LENGTH = 6
+PUBLIC_ID_ALLOCATION_ATTEMPTS = 32
 UPSTREAM_TIMEOUT_SECONDS = 20.0
 PANEL_CACHE_TTL_SECONDS = 300
 GEO_FILE_CACHE_TTL_SECONDS = 24 * 60 * 60
@@ -60,34 +60,15 @@ SKIP_UPSTREAM_HEADERS = {"host", "content-length", "connection", "accept-encodin
 class UnsupportedProxyConfig(ValueError):
     """A source contains proxy entries that cannot safely be converted yet."""
 
-DAY_DEFAULTS = ["💪 Понедельник — начинаем бодро", "🔥 Вторник — продуктивного дня", "⚡ Среда — середина недели",
-                "😎 Четверг — почти пятница", "🎉 Пятница — выходные близко", "🛋 Суббота — отдыхаем", "🌴 Воскресенье — набираемся сил"]
-FOOTER_DEFAULTS = ["✅ Обновлено в {t} • 💬 Поддержка 24/7", "🔄 Свежее обновление: {t} • 💬 Мы на связи",
-                   "⏱ Актуально на {t} • 💬 Поддержка 24/7", "🆕 Обновили в {t} • 💬 Пиши, поможем",
-                   "✨ Всё свежее с {t} • 💬 Поддержка 24/7"]
-QUOTE_DEFAULTS = ["🚀 Скорость — наш конёк", "🔒 Твои данные только твои", "🌍 Интернет без границ", "😴 Включил и забыл",
-                  "🎬 Стримы без буферизации", "🎮 Пинг, который радует", "💡 Маленькие шаги ведут далеко", "🌱 Сегодня лучше, чем вчера",
-                  "🔥 Не откладывай на завтра", "🧠 Учись — и мир станет шире", "🏔 Каждая вершина начинается с шага", "⏳ Время — лучший вклад",
-                  "🌊 Плыви, а не тони", "🎯 Цель ясна — путь найдётся", "😎 Спокойствие — тоже сила", "🍀 Удача любит упорных",
-                  "☕ Хороший день начинается с кофе", "🌙 Отдых — часть работы", "📚 Знание — лучший капитал", "🛡 Безопасность — это спокойный сон",
-                  "🦁 Будь смелее, чем вчера", "🌅 Новый день — новые шансы", "🧩 Всё получится, шаг за шагом", "🕊 Свобода в мелочах",
-                  "🎶 Музыка без границ", "📡 Связь всегда рядом", "🧭 Знай свой курс", "🌟 Верь в себя", "💎 Качество важнее количества",
-                  "🤝 Вместе мы сильнее", "🐢 Тише едешь — дальше будешь", "🐇 Но скорость тоже не помешает", "🎈 Лёгкость — залог успеха",
-                  "🔭 Смотри шире", "🧗 Трудности делают сильнее", "🍉 Лето бывает круглый год", "🎲 Рискни — и получишь опыт",
-                  "📈 Растём каждый день", "🧘 Дыши глубже, всё решаемо", "🛠 Мастерство приходит с практикой", "🌍 Мир открыт — заходи",
-                  "⚙️ Всё работает, пока ты спокоен", "🔑 Ключ к успеху — начать", "🏁 Финиш ближе, чем кажется", "🌈 После дождя будет радуга",
-                  "🍿 Фильм, сериал и никаких лагов", "🎧 Включи любимое и вперёд", "🕹 Сегодня точно выиграем", "🌐 Любой сайт — в один клик",
-                  "🧊 Холодная голова, быстрый интернет"]
 DEFAULT_SETTINGS = {
     "title": "Secure X", "support_url": "https://t.me/moserrr1", "web_page_url": "", "update_interval": 1,
-    "timezone": "Asia/Ashgabat", "announce_enabled": True, "announce_refresh_minutes": 5,
+    "timezone": "Asia/Ashgabat",
     # Individual profiles share provider usage. Admins may hide the counter on
     # new user profiles, while the legacy account profile stays visible.
     "default_traffic_limit_bytes": None,
     "hide_traffic_for_new_users": False,
     "include_sas_for_new_users": True,
     "device_limit_for_new_users": None,
-    "quotes": QUOTE_DEFAULTS, "footers": FOOTER_DEFAULTS, "days": DAY_DEFAULTS,
 }
 
 # Applied only to test subscriptions. Happ accepts custom color-profile metadata
@@ -1037,8 +1018,6 @@ class PanelState:
         self.test_geo_file_cache: dict[str, tuple[bytes, float]] = {}
         self.test_geo_file_lock = asyncio.Lock()
         self.upstream_lock = asyncio.Lock()
-        self.announce_cache: tuple[tuple, str] | None = None
-        self.announce_quote: str | None = None
         self.login_fails: dict[str, tuple[int, float]] = {}
         self.happ_tasks: set[asyncio.Task] = set()
         self._main_drive_sync_task: asyncio.Task | None = None
@@ -1178,6 +1157,10 @@ class PanelState:
             log.warning("Test database unavailable (%s)", type(exc).__name__)
 
     async def seed(self, conn, *, include_legacy=True):
+        # Retire former rotating-announcement settings from both database scopes.
+        await conn.execute("DELETE FROM settings WHERE key=ANY($1::text[])",
+                           ["announce_enabled", "announce_refresh_minutes", "quotes", "footers", "days"])
+        await _release_expired_public_ids(conn)
         for key, value in DEFAULT_SETTINGS.items():
             await conn.execute("INSERT INTO settings(key,value) VALUES($1,$2::jsonb) ON CONFLICT(key) DO NOTHING", key, json.dumps(value, ensure_ascii=False))
         if include_legacy:
@@ -1542,7 +1525,6 @@ class UserBody(BaseModel):
     enabled: bool = True
     expires_at: datetime | None = None
     title_override: str | None = Field(default=None, max_length=200)
-    announce_override: str | None = Field(default=None, max_length=4000)
     traffic_limit_bytes: int | None = Field(default=None, ge=1_000_000, le=1_000_000_000_000)
     hide_traffic_usage: bool | None = None
     include_sas: bool | None = None
@@ -1626,217 +1608,72 @@ async def _settings(conn) -> dict:
     return values
 
 
-def _now_for_tz(name):
-    try:
-        from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo(name))
-    except Exception:
-        return datetime.now(timezone.utc)
+def _russian_day_word(value: int) -> str:
+    value = abs(int(value))
+    last_two = value % 100
+    if 11 <= last_two <= 14:
+        return 'дней'
+    last = value % 10
+    if last == 1:
+        return 'день'
+    if 2 <= last <= 4:
+        return 'дня'
+    return 'дней'
 
 
-def _format_ashgabat_weather(data: dict) -> str:
-    """Format Open-Meteo current weather; accepts its current and legacy fields."""
-    if not isinstance(data, dict):
-        raise ValueError("weather response is not an object")
-    current = data.get("current") or data.get("current_weather")
-    if not isinstance(current, dict):
-        raise ValueError("weather response has no current conditions")
-
-    temperature = current.get("temperature_2m", current.get("temperature"))
-    weather_code = current.get("weather_code", current.get("weathercode"))
-    weather_time = current.get("time")
-    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
-        raise ValueError("weather temperature is missing")
-    if weather_code is not None and (
-            isinstance(weather_code, bool) or not isinstance(weather_code, (int, float))):
-        raise ValueError("weather code is invalid")
-    if not isinstance(weather_time, str):
-        raise ValueError("weather valid time is missing")
-
-    temperature = float(temperature)
-    if not -100 <= temperature <= 100:
-        raise ValueError("weather values are outside valid ranges")
-
-    conditions = {
-        0: ("☀️", "ясно"),
-        1: ("🌤", "преимущественно ясно"),
-        2: ("⛅", "переменная облачность"),
-        3: ("☁️", "пасмурно"),
-        45: ("🌫", "туман"),
-        48: ("🌫", "туман с изморозью"),
-        51: ("🌦", "слабая морось"),
-        53: ("🌦", "умеренная морось"),
-        55: ("🌧", "сильная морось"),
-        56: ("🌧", "слабая ледяная морось"),
-        57: ("🌧", "сильная ледяная морось"),
-        61: ("🌧", "небольшой дождь"),
-        63: ("🌧", "умеренный дождь"),
-        65: ("🌧", "сильный дождь"),
-        66: ("🌧", "слабый ледяной дождь"),
-        67: ("🌧", "сильный ледяной дождь"),
-        71: ("❄️", "небольшой снегопад"),
-        73: ("❄️", "умеренный снегопад"),
-        75: ("❄️", "сильный снегопад"),
-        77: ("❄️", "снежная крупа"),
-        80: ("🌧", "небольшие ливни"),
-        81: ("🌧", "умеренные ливни"),
-        82: ("🌧", "сильные ливни"),
-        85: ("❄️", "слабый снег с перерывами"),
-        86: ("❄️", "сильный снег с перерывами"),
-        95: ("⛈", "гроза"),
-        96: ("⛈", "гроза с небольшим градом"),
-        97: ("⛈", "сильная гроза"),
-        99: ("⛈", "гроза с сильным градом"),
-    }
-    condition = None
-    if weather_code is not None:
-        code = int(weather_code)
-        if not 0 <= code <= 99:
-            raise ValueError("weather code is outside valid range")
-        condition = conditions.get(code)
-        if condition is None:
-            raise ValueError("weather code is not recognized")
-
-    offset_seconds = data.get("utc_offset_seconds")
-    if isinstance(offset_seconds, float) and offset_seconds.is_integer():
-        offset_seconds = int(offset_seconds)
-    if (isinstance(offset_seconds, int) and not isinstance(offset_seconds, bool)
-            and abs(offset_seconds) <= 14 * 60 * 60):
-        ashgabat_timezone = timezone(timedelta(seconds=offset_seconds))
+def _subscription_announcement(expires_at: datetime | None, public_id: str, now: datetime | None = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    expires_at = _expiry_utc(expires_at)
+    if expires_at is None:
+        remaining = 'Срок действия: без ограничения'
     else:
-        try:
-            from zoneinfo import ZoneInfo
-            ashgabat_timezone = ZoneInfo("Asia/Ashgabat")
-        except Exception:
-            # Open-Meteo normally includes utc_offset_seconds. This fixed
-            # offset fallback also lets local Windows runs validate the data.
-            ashgabat_timezone = timezone(timedelta(hours=5))
+        days = max(0, math.ceil((expires_at - now).total_seconds() / 86400))
+        remaining = f'Осталось: {days} {_russian_day_word(days)}'
+    return '\n'.join((remaining, f'ID: {public_id}', 'Спасибо за покупку!', 'С вами команда SecureX.'))
 
+
+async def _release_expired_public_ids(conn) -> int:
+    """Forget public IDs as soon as a profile is expired, disabled, or revoked."""
+    result = await conn.execute("""UPDATE users SET public_id=NULL
+        WHERE public_id IS NOT NULL AND
+          (status<>'active' OR enabled=FALSE OR (expires_at IS NOT NULL AND expires_at<=now()))""")
     try:
-        observed_at = datetime.fromisoformat(weather_time)
-    except ValueError as exc:
-        raise ValueError("weather valid time is invalid") from exc
-    local_now = datetime.now(ashgabat_timezone)
-    if observed_at.tzinfo is None:
-        observed_at = observed_at.replace(tzinfo=ashgabat_timezone)
-    else:
-        observed_at = observed_at.astimezone(ashgabat_timezone)
-    age_seconds = (local_now - observed_at).total_seconds()
-    # Open-Meteo's current fields are model-based and may be hourly in this
-    # region. Allow one model interval plus margin, but never present an older
-    # response as current.
-    if age_seconds > 2 * 60 * 60 or age_seconds < -15 * 60:
-        raise ValueError("weather valid time is stale or in the future")
-
-    shown_temperature = f"{temperature:g}"
-    if condition is None:
-        description = f"🌡 Ашхабад сейчас: {shown_temperature}°C"
-    else:
-        emoji, text = condition
-        description = f"{emoji} Ашхабад сейчас: {text}, {shown_temperature}°C"
-    return f"{description} · данные на {observed_at:%H:%M}"
+        return int(result.rsplit(' ', 1)[-1])
+    except (AttributeError, ValueError):
+        return 0
 
 
-async def _current_ashgabat_weather() -> str:
-    """Fetch fresh city weather independently from the VPN upstream client/cache."""
-    try:
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=5.0,
-            headers={
-                "User-Agent": "SecureX-Weather/1.0",
-                "Cache-Control": "no-cache",
-            },
-        ) as client:
-            response = await client.get(
-                ASHGABAT_WEATHER_URL,
-                params={
-                    "latitude": ASHGABAT_LATITUDE,
-                    "longitude": ASHGABAT_LONGITUDE,
-                    "current": "temperature_2m",
-                    "timezone": "Asia/Ashgabat",
-                },
-            )
-            response.raise_for_status()
-            return _format_ashgabat_weather(response.json())
-    except httpx.HTTPStatusError as exc:
-        response = exc.response
-        reason = ""
-        try:
-            payload = response.json()
-            if isinstance(payload, dict):
-                candidate = payload.get("reason")
-                if isinstance(candidate, str):
-                    # Open-Meteo's error JSON may explain 400/429/5xx responses.
-                    # Keep only this bounded diagnostic; never log the URL/body.
-                    reason = re.sub(r"[\x00-\x1f\x7f]+", " ", candidate).strip()[:180]
-        except Exception:
-            pass
-        log.warning(
-            "Ashgabat weather request failed (Open-Meteo HTTP %d%s)",
-            response.status_code,
-            f": {reason}" if reason else "",
-        )
-        return ASHGABAT_WEATHER_UNAVAILABLE
-    except Exception as exc:
-        # Keep diagnostics useful without logging response bodies or request data.
-        log.warning("Ashgabat weather request failed (%s)", type(exc).__name__)
-        return ASHGABAT_WEATHER_UNAVAILABLE
+async def _ensure_public_id(conn, user_id: int) -> str | None:
+    """Allocate a collision-checked, six-character ID for a live profile."""
+    async with conn.transaction():
+        user = await conn.fetchrow("""SELECT id,enabled,status,expires_at,public_id
+            FROM users WHERE id=$1 FOR UPDATE""", user_id)
+        if not user:
+            return None
+        expires_at = _expiry_utc(user['expires_at'])
+        active = (bool(user['enabled']) and user['status'] == 'active'
+                  and (expires_at is None or expires_at > datetime.now(timezone.utc)))
+        if not active:
+            if user['public_id'] is not None:
+                await conn.execute('UPDATE users SET public_id=NULL WHERE id=$1', user_id)
+            return None
+        if user['public_id']:
+            return str(user['public_id'])
 
-
-def _weather_payload_from_sync_request(request: Request) -> dict | None:
-    """Decode the small weather snapshot supplied by the trusted Apps Script."""
-    encoded = request.headers.get("x-weather-data")
-    if not encoded:
-        return None
-    if len(encoded) > 4096:
-        return {}
-    try:
-        padded = encoded + "=" * (-len(encoded) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
-    except Exception:
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-async def _announce(settings: dict, weather_payload: dict | None = None) -> str:
-    # Weather is deliberately fetched for every generated manifest. Other
-    # announcement elements rotate on stable time slots, so a five-minute
-    # trigger gets a fresh quote/footer even if its execution time drifts.
-    if weather_payload is None:
-        weather_line = await _current_ashgabat_weather()
-    else:
-        try:
-            weather_line = _format_ashgabat_weather(weather_payload)
-        except Exception:
-            weather_line = ASHGABAT_WEATHER_UNAVAILABLE
-    refresh = max(5, int(settings.get("announce_refresh_minutes", 5))) * 60
-    refresh_slot = int(time.time() // refresh)
-    settings_key = hashlib.sha256(json.dumps(settings, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
-    cache_key = ("test" if _test_environment.get() else "main", refresh_slot, settings_key)
-    if state.announce_cache and cache_key == state.announce_cache[0]:
-        return state.announce_cache[1].replace("__CURRENT_ASHGABAT_WEATHER__", weather_line)
-    local = _now_for_tz(settings.get("timezone", "Asia/Ashgabat"))
-    lines = []
-    days = settings.get("days") or DAY_DEFAULTS
-    quotes = settings.get("quotes") or QUOTE_DEFAULTS
-    footers = settings.get("footers") or FOOTER_DEFAULTS
-    day_line = str(days[local.isoweekday() - 1]) if len(days) >= 7 else ""
-    greeting = "🌙 Доброй ночи!" if local.hour < 5 else "🌅 Доброе утро!" if local.hour < 12 else "☀️ Добрый день!" if local.hour < 18 else "🌆 Добрый вечер!"
-    top_lines = [line for line in (day_line, greeting) if line]
-    lines.append(secrets.choice(top_lines) if top_lines else greeting)
-    lines.append("__CURRENT_ASHGABAT_WEATHER__")
-    candidates = [str(q) for q in quotes if str(q)]
-    quote_text = secrets.choice(candidates) if candidates else ""
-    if len(candidates) > 1 and quote_text == state.announce_quote:
-        quote_text = candidates[(candidates.index(quote_text) + 1) % len(candidates)]
-    state.announce_quote = quote_text
-    footer_tpl = secrets.choice([str(x) for x in footers if str(x)]) if footers else ""
-    lines.extend(["", quote_text, "", footer_tpl.replace("{t}", local.strftime("%H:%M:%S"))])
-    template = "\n".join(lines).strip()
-    state.announce_cache = (cache_key, template)
-    return template.replace("__CURRENT_ASHGABAT_WEATHER__", weather_line)
-
+        for _ in range(PUBLIC_ID_ALLOCATION_ATTEMPTS):
+            candidate = ''.join(secrets.choice(PUBLIC_ID_ALPHABET) for _ in range(PUBLIC_ID_LENGTH))
+            try:
+                # The nested transaction gives each collision its own savepoint;
+                # the unique index is the final authority under concurrent syncs.
+                async with conn.transaction():
+                    allocated = await conn.fetchval("""UPDATE users SET public_id=$2
+                        WHERE id=$1 AND public_id IS NULL
+                        RETURNING public_id""", user_id, candidate)
+            except asyncpg.UniqueViolationError:
+                continue
+            if allocated:
+                return str(allocated)
+        raise HTTPException(503, 'Не удалось выделить уникальный ID подписки')
 
 def _userinfo(headers: dict, expire_override: int | None = None) -> str:
     value = headers.get("subscription-userinfo", "")
@@ -2410,7 +2247,7 @@ def _request_wants_subscription(request: Request) -> bool:
 
 
 async def build_manifest_content(conn, user, body: bytes, headers: dict, settings: dict,
-                                 announce: str | None = None, servers: list[dict] | None = None,
+                                 servers: list[dict] | None = None,
                                  public_base_url: str | None = None) -> str:
     if servers is None:
         servers = await _sync_servers(conn, body)
@@ -2419,14 +2256,13 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
     active = bool(user["enabled"]) and not expired and user["status"] == "active"
     if not active:
         announcement = "⛔ Время подписки закончилось, обратитесь в поддержку" if expired else "⛔ Подписка отключена, обратитесь в поддержку"
-    elif user["announce_override"] is not None:
-        announcement = user["announce_override"]
-    elif not settings.get("announce_enabled", True):
-        announcement = ""
-    elif announce is not None:
-        announcement = announce
     else:
-        announcement = await _announce(settings)
+        public_id = await _ensure_public_id(conn, int(user["id"]))
+        if public_id is None:
+            active = False
+            announcement = "⛔ Подписка отключена, обратитесь в поддержку"
+        else:
+            announcement = _subscription_announcement(user["expires_at"], public_id, now)
     # Give every generated Drive profile a distinct default name in Happ. The
     # underlying server credentials remain those from the shared upstream.
     title = user["title_override"] or f"{settings.get('title', 'Secure X')} · {user.get('name', user.get('slug', 'Пользователь'))}"
@@ -2540,8 +2376,6 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
             # metadata-only file that Happ rejects as having no server links.
             raise HTTPException(502, "Для этой подписки нет доступных серверов. Обновите список серверов и проверьте, что они не скрыты.")
         if geo_locked:
-            waiting_announcement = "🧪 ТЕСТ · Загрузите geo-файлы, затем обновите подписку в Happ, чтобы получить все серверы."
-            lines[2] = "#announce: base64:" + base64.b64encode(waiting_announcement.encode()).decode()
             if not first_visible_uri:
                 raise HTTPException(502, "Нет рабочего тестового сервера для начальной подписки")
             server_lines = [rename_server_uri(first_visible_uri, "Скачать geo-файлы · ТЕСТ")]
@@ -3090,9 +2924,9 @@ async def users_create(data: UserBody, request: Request):
             if not happ_limit.MIN_LIMIT <= device_limit <= happ_limit.MAX_LIMIT:
                 raise HTTPException(422, f"Лимит устройств должен быть целым числом от {happ_limit.MIN_LIMIT} до {happ_limit.MAX_LIMIT}")
         device_status = "waiting" if device_limit is not None else "none"
-        row = await conn.fetchrow("""INSERT INTO users(name,slug,note,enabled,expires_at,title_override,announce_override,traffic_limit_bytes,hide_traffic_usage,include_sas,device_limit,device_limit_status)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *""", data.name.strip(), slug, data.note, data.enabled,
-            _expiry_utc(data.expires_at), data.title_override, data.announce_override, data.traffic_limit_bytes, hide_traffic, include_sas,
+        row = await conn.fetchrow("""INSERT INTO users(name,slug,note,enabled,expires_at,title_override,traffic_limit_bytes,hide_traffic_usage,include_sas,device_limit,device_limit_status)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *""", data.name.strip(), slug, data.note, data.enabled,
+            _expiry_utc(data.expires_at), data.title_override, data.traffic_limit_bytes, hide_traffic, include_sas,
             device_limit, device_status)
         if _test_environment.get() and data.geo_device_limit is not None:
             await conn.execute("INSERT INTO test_geo_state(user_id,geo_device_limit) VALUES($1,$2)", row["id"], data.geo_device_limit)
@@ -3122,6 +2956,7 @@ async def users_update(user_id: int, data: UserBody, request: Request):
         raise HTTPException(422, "Заголовок профиля не должен содержать переносы строк")
     pool = await state.db()
     async with pool.acquire() as conn:
+        await _release_expired_public_ids(conn)
         old_limit = await conn.fetchrow("SELECT slug,drive_file_id,device_limit FROM users WHERE id=$1 AND status='active'", user_id)
         if not old_limit:
             raise HTTPException(404, "Пользователь не найден")
@@ -3146,17 +2981,19 @@ async def users_update(user_id: int, data: UserBody, request: Request):
         clear_provider_limit_state = (limit_changed or
             bool(test_mode and data.test_activation_enabled) or
             bool(not test_mode and data.activation_enabled))
-        row = await conn.fetchrow("""UPDATE users SET name=$2,note=$3,enabled=$4,expires_at=$5,title_override=$6,
-            announce_override=$7,traffic_limit_bytes=$8,
-            hide_traffic_usage=CASE WHEN slug='legacy' OR drive_file_id=$10 THEN FALSE ELSE COALESCE($9,hide_traffic_usage) END,
-            include_sas=COALESCE($11,include_sas),
-            device_limit=CASE WHEN $12 THEN $13 ELSE device_limit END,
-            happ_install_code=CASE WHEN $14 THEN NULL ELSE happ_install_code END,
-            limited_link=CASE WHEN $14 THEN NULL ELSE limited_link END,
-            device_limit_status=CASE WHEN $14 THEN CASE WHEN $13 IS NULL THEN 'none' ELSE 'waiting' END ELSE device_limit_status END,
-            device_limit_error=CASE WHEN $14 THEN NULL ELSE device_limit_error END,
+        row = await conn.fetchrow("""UPDATE users SET name=$2,note=$3,enabled=$4,expires_at=$5,
+            public_id=CASE WHEN $4=FALSE OR ($5 IS NOT NULL AND $5<=now()) THEN NULL ELSE public_id END,
+            title_override=$6,
+            traffic_limit_bytes=$7,
+            hide_traffic_usage=CASE WHEN slug='legacy' OR drive_file_id=$9 THEN FALSE ELSE COALESCE($8,hide_traffic_usage) END,
+            include_sas=COALESCE($10,include_sas),
+            device_limit=CASE WHEN $11 THEN $12 ELSE device_limit END,
+            happ_install_code=CASE WHEN $13 THEN NULL ELSE happ_install_code END,
+            limited_link=CASE WHEN $13 THEN NULL ELSE limited_link END,
+            device_limit_status=CASE WHEN $13 THEN CASE WHEN $12 IS NULL THEN 'none' ELSE 'waiting' END ELSE device_limit_status END,
+            device_limit_error=CASE WHEN $13 THEN NULL ELSE device_limit_error END,
             updated_at=now() WHERE id=$1 AND status='active' RETURNING *""", user_id,
-            data.name.strip(), data.note, data.enabled, _expiry_utc(data.expires_at), data.title_override, data.announce_override,
+            data.name.strip(), data.note, data.enabled, _expiry_utc(data.expires_at), data.title_override,
             data.traffic_limit_bytes, data.hide_traffic_usage, LEGACY_DRIVE_FILE_ID, data.include_sas,
             limit_supplied, effective_device_limit, clear_provider_limit_state)
         if _test_environment.get() and "geo_device_limit" in data.model_fields_set:
@@ -3214,7 +3051,7 @@ async def users_delete(user_id: int, request: Request):
     _auth(request, csrf=True)
     pool = await state.db()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("UPDATE users SET status='pending_delete',enabled=FALSE,updated_at=now() WHERE id=$1 RETURNING id", user_id)
+        row = await conn.fetchrow("UPDATE users SET status='pending_delete',enabled=FALSE,public_id=NULL,updated_at=now() WHERE id=$1 RETURNING id", user_id)
     if not row: raise HTTPException(404, "Пользователь не найден")
     drive_sync = await state.request_drive_sync([user_id])
     return {"ok": True, "status": "pending_delete", "drive_sync": drive_sync}
@@ -3889,9 +3726,6 @@ async def settings_get(request: Request):
 async def settings_put(data: SettingsBody, request: Request):
     _auth(request, csrf=True)
     values = dict(data.values)
-    if "announce_refresh_minutes" in values:
-        try: values["announce_refresh_minutes"] = max(5, min(1440, int(values["announce_refresh_minutes"])))
-        except Exception: raise HTTPException(422, "announce_refresh_minutes должен быть числом не меньше 5")
     if "update_interval" in values:
         try: values["update_interval"] = max(1, min(168, int(values["update_interval"])))
         except Exception: raise HTTPException(422, "Интервал профиля должен быть числом от 1 до 168")
@@ -3936,21 +3770,15 @@ async def settings_put(data: SettingsBody, request: Request):
             parsed = urlsplit(values[key])
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise HTTPException(422, f"{key} должен быть HTTP(S)-адресом")
-    if "announce_enabled" in values and not isinstance(values["announce_enabled"], bool):
-        raise HTTPException(422, "announce_enabled должен быть логическим значением")
     if "hide_traffic_for_new_users" in values and not isinstance(values["hide_traffic_for_new_users"], bool):
         raise HTTPException(422, "hide_traffic_for_new_users должен быть логическим значением")
     if "include_sas_for_new_users" in values and not isinstance(values["include_sas_for_new_users"], bool):
         raise HTTPException(422, "include_sas_for_new_users должен быть логическим значением")
-    for key in ("quotes", "footers", "days"):
-        if key in values and (not isinstance(values[key], list) or len(values[key]) > 100 or any(not isinstance(x, str) or len(x) > 500 for x in values[key])):
-            raise HTTPException(422, f"Некорректное поле {key}")
     pool = await state.db()
     async with pool.acquire() as conn:
         async with conn.transaction():
             for key, value in values.items():
                 await conn.execute("INSERT INTO settings(key,value) VALUES($1,$2::jsonb) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", key, json.dumps(value, ensure_ascii=False))
-    state.announce_cache = None
     drive_sync = await state.request_drive_sync() if set(values) - {
         "default_traffic_limit_bytes", "hide_traffic_for_new_users", "include_sas_for_new_users",
         "device_limit_for_new_users"
@@ -4000,6 +3828,7 @@ async def sync_manifest(request: Request):
     pool = await state.db()
     query = "SELECT * FROM users WHERE id=ANY($1::bigint[]) ORDER BY id" if selected_ids else "SELECT * FROM users ORDER BY id"
     async with pool.acquire() as conn:
+        await _release_expired_public_ids(conn)
         rows_before_fetch = await conn.fetch(query, selected_ids) if selected_ids else await conn.fetch(query)
         await conn.execute("INSERT INTO app_state(key,value) VALUES('last_script_request',to_jsonb(now())) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value")
 
@@ -4042,9 +3871,8 @@ async def sync_manifest(request: Request):
             activation_manifest = []
             if activation_rows:
                 settings = await _settings(conn)
-                settings["announce_enabled"] = False
                 for user in activation_rows:
-                    content = await build_manifest_content(conn, user, b"", {}, settings, announce="", servers=[],
+                    content = await build_manifest_content(conn, user, b"", {}, settings, servers=[],
                         public_base_url=str(request.base_url).rstrip("/"))
                     activation_manifest.append({"id": user["id"], "slug": user["slug"], "status": user["status"],
                         "enabled": user["enabled"], "drive_file_id": user["drive_file_id"],
@@ -4071,13 +3899,10 @@ async def sync_manifest(request: Request):
                 WHERE user_id=ANY($1::bigint[])""", [int(user["id"]) for user in rows])
             activation_generations = {int(item["user_id"]): int(item["drive_generation"])
                                       for item in generation_rows}
-        # Same announcement text shared across every user in this manifest response.
-        weather_payload = _weather_payload_from_sync_request(request)
-        announce = await _announce(settings, weather_payload) if settings.get("announce_enabled", True) else ""
         manifest = []
         for user in rows:
             content = "" if user["status"] == "pending_delete" else await build_manifest_content(
-                conn, user, body, headers, settings, announce, servers,
+                conn, user, body, headers, settings, servers,
                 public_base_url=str(request.base_url).rstrip("/"))
             item = {"id": user["id"], "slug": user["slug"], "status": user["status"], "enabled": user["enabled"],
                     "drive_file_id": user["drive_file_id"], "name": user["name"], "content": content}

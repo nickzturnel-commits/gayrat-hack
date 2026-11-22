@@ -9,7 +9,7 @@ import re
 import secrets
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 import httpx
@@ -219,7 +219,7 @@ def install(app: FastAPI, panel) -> bool:
         """Изменяет подписку через штатную логику /admin. Пришли только меняемые поля и confirm=true."""
         await require_confirm(confirm)
         allowed = {
-            "name", "note", "enabled", "expires_at", "title_override", "announce_override",
+            "name", "note", "enabled", "expires_at", "title_override",
             "traffic_limit_bytes", "hide_traffic_usage", "include_sas", "device_limit",
             "activation_enabled", "activation_limit",
         }
@@ -229,7 +229,7 @@ def install(app: FastAPI, panel) -> bool:
         if current is None:
             raise ToolError("Подписка не найдена")
         body = {key: current.get(key) for key in (
-            "name", "note", "enabled", "expires_at", "title_override", "announce_override",
+            "name", "note", "enabled", "expires_at", "title_override",
             "traffic_limit_bytes", "hide_traffic_usage", "include_sas", "device_limit",
         )}
         body.update(changes)
@@ -256,7 +256,7 @@ def install(app: FastAPI, panel) -> bool:
                 async with conn.transaction():
                     rows = await conn.fetch(
                         "SELECT id,name,slug,status,enabled,expires_at,include_sas,hide_traffic_usage,"
-                        "traffic_limit_bytes,note,title_override,announce_override,device_limit,drive_file_id "
+                        "traffic_limit_bytes,note,title_override,device_limit,drive_file_id "
                         "FROM users WHERE id=ANY($1::bigint[]) FOR UPDATE", ids,
                     )
                     if len(rows) != len(ids):
@@ -275,6 +275,7 @@ def install(app: FastAPI, panel) -> bool:
                     rebuild_ids: list[int] = []
                     skipped = []
                     update_batches: dict[tuple[str, ...], list[tuple[Any, ...]]] = {}
+                    now_utc = datetime.now(timezone.utc)
                     for row in rows:
                         user_id = int(row["id"])
                         if row["status"] != "active":
@@ -286,9 +287,15 @@ def install(app: FastAPI, panel) -> bool:
                             if new_name != row["name"]:
                                 values["name"] = new_name
                         for field in ("enabled", "include_sas", "hide_traffic_usage", "note",
-                                      "title_override", "announce_override", "traffic_limit_bytes", "expires_at"):
+                                      "title_override", "traffic_limit_bytes", "expires_at"):
                             if field in normalized:
                                 values[field] = normalized[field]
+                        effective_expiry = normalized.get("expires_at", row["expires_at"])
+                        was_expired = row["expires_at"] is not None and row["expires_at"] <= now_utc
+                        will_expire = effective_expiry is not None and effective_expiry <= now_utc
+                        will_disable = normalized.get("enabled", row["enabled"]) is False
+                        if was_expired or will_expire or will_disable:
+                            values["public_id"] = None
                         limit_changed = ("device_limit" in normalized
                                          and normalized["device_limit"] != row["device_limit"])
                         if limit_changed:
@@ -341,7 +348,7 @@ def install(app: FastAPI, panel) -> bool:
                     if any(row["slug"] == "legacy" or row["drive_file_id"] == panel.LEGACY_DRIVE_FILE_ID for row in rows):
                         raise ToolError("Основная legacy-подписка защищена от массового отключения")
                     await conn.execute(
-                        "UPDATE users SET status='pending_delete',enabled=FALSE,updated_at=now() "
+                        "UPDATE users SET status='pending_delete',enabled=FALSE,public_id=NULL,updated_at=now() "
                         "WHERE id=ANY($1::bigint[])", ids,
                     )
         delivery = await panel.state.request_drive_sync(ids)
@@ -639,7 +646,7 @@ def _path_part(value: str) -> str:
 def _validate_bulk_changes(changes: dict[str, Any], panel) -> dict[str, Any]:
     allowed = {
         "enabled", "include_sas", "hide_traffic_usage", "expires_at", "note", "title_override",
-        "announce_override", "traffic_limit_bytes", "device_limit", "name_prefix", "name_suffix",
+        "traffic_limit_bytes", "device_limit", "name_prefix", "name_suffix",
         "find_text", "replace_text",
     }
     if not isinstance(changes, dict) or not changes or set(changes) - allowed:
@@ -648,7 +655,7 @@ def _validate_bulk_changes(changes: dict[str, Any], panel) -> dict[str, Any]:
     for field in ("enabled", "include_sas", "hide_traffic_usage"):
         if field in result and not isinstance(result[field], bool):
             raise ToolError(f"{field} должен быть логическим значением")
-    for field, limit in (("note", 2000), ("title_override", 200), ("announce_override", 4000),
+    for field, limit in (("note", 2000), ("title_override", 200),
                          ("name_prefix", 120), ("name_suffix", 120), ("find_text", 200),
                          ("replace_text", 200)):
         if field in result and result[field] is not None and (not isinstance(result[field], str)
