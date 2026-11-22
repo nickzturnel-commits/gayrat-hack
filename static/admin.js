@@ -15,9 +15,11 @@
   let deviceStatusPollTimer = null;
   let deviceStatusPollRounds = 0;
   let deviceLimitBounds = null;
+  let pendingPublicIdFocus = '';
 
   if (testMode) {
     document.body.classList.add('test-environment');
+    $$('[data-main-only]').forEach(item => item.classList.add('hidden'));
     $$('[data-test-only]').forEach(item => item.classList.remove('hidden'));
     const banner = document.createElement('div');
     banner.textContent = 'ТЕСТОВАЯ СРЕДА / ДАННЫЕ ИЗОЛИРОВАНЫ';
@@ -68,6 +70,7 @@
   const icons = {
     dashboard: '<path d="m3 10 9-7 9 7M5 9v11h14V9m-9 11v-6h4v6"/>',
     users: '<circle cx="9" cy="8" r="4"/><path d="M2 21v-2a7 7 0 0 1 14 0v2m1-17a4 4 0 0 1 0 8m1 3a6 6 0 0 1 4 5v1"/>',
+    search: '<circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5M8 10h5m-5 3h3"/>',
     servers: '<rect x="3" y="4" width="18" height="6" rx="2"/><rect x="3" y="14" width="18" height="6" rx="2"/><path d="M7 7h.01M7 17h.01M11 7h6m-6 10h6"/>',
     settings: '<circle cx="12" cy="12" r="3"/><path d="m19 13 2 1-2 4-2-1a8 8 0 0 1-2 1l-.4 2h-4L10 18a8 8 0 0 1-2-1l-2 1-2-4 2-1a8 8 0 0 1 0-2l-2-1 2-4 2 1a8 8 0 0 1 2-1l.4-2h4L15 6a8 8 0 0 1 2 1l2-1 2 4-2 1a8 8 0 0 1 0 2Z"/>',
     plus: '<path d="M12 5v14M5 12h14"/>',
@@ -168,6 +171,7 @@
     try {
       if (page === 'dashboard') await dashboard(content);
       else if (page === 'users') await users(content);
+      else if (page === 'id-search' && !testMode) await idSearch(content);
       else if (page === 'activation') await activations(content);
       else if (page === 'servers') await servers(content);
       else await settings(content);
@@ -358,6 +362,79 @@
     return user.enabled ? ['Включена', 'badge-good'] : ['Отключена', 'badge-warn'];
   }
 
+  async function idSearch(root) {
+    root.innerHTML = pageHead('Поиск ID') + `<section class="id-search-panel surface-card">
+      <div><p class="eyebrow">ТОЧНЫЙ ПОИСК</p><h2>Найти подписку по ID профиля</h2>
+        <p class="muted">Введите шестисимвольный ID из описания подписки Secure X.</p></div>
+      <form id="publicIdSearchForm" class="id-search-form" novalidate>
+        <label for="publicIdSearchInput">ID подписки
+          <input id="publicIdSearchInput" name="public_id" type="text" minlength="6" maxlength="6"
+            pattern="[A-HJ-NP-Z2-9]{6}" autocomplete="off" autocapitalize="characters"
+            spellcheck="false" placeholder="Например, 7K2M9Q" aria-describedby="publicIdSearchHint" required>
+        </label>
+        <button class="button button-primary" type="submit">${svg('search')}<span>Найти пользователя</span></button>
+      </form>
+      <p class="field-hint" id="publicIdSearchHint">Поиск выполняется по точному ID. Срок и статус подписки будут показаны ниже.</p>
+      <div id="publicIdSearchResult" aria-live="polite"></div>
+    </section>`;
+
+    const form = $('#publicIdSearchForm', root);
+    const input = $('#publicIdSearchInput', form);
+    const submit = $('button[type="submit"]', form);
+    const resultNode = $('#publicIdSearchResult', root);
+    input.addEventListener('input', () => {
+      const rawStart = input.selectionStart;
+      const rawEnd = input.selectionEnd;
+      const caretStart = rawStart === null ? null : input.value.slice(0, rawStart).toUpperCase().replace(/[^A-Z0-9]/g, '').length;
+      const caretEnd = rawEnd === null ? null : input.value.slice(0, rawEnd).toUpperCase().replace(/[^A-Z0-9]/g, '').length;
+      input.value = input.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+      input.setCustomValidity('');
+      if (caretStart !== null && caretEnd !== null) {
+        input.setSelectionRange(Math.min(caretStart, input.value.length), Math.min(caretEnd, input.value.length));
+      }
+    });
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      const publicId = input.value.trim().toUpperCase();
+      if (!/^[A-HJ-NP-Z2-9]{6}$/.test(publicId)) {
+        input.setCustomValidity('Введите ровно шесть букв или цифр из ID подписки.');
+        input.reportValidity();
+        return;
+      }
+      submit.disabled = true;
+      resultNode.innerHTML = '<div class="id-search-message" role="status"><span class="spinner"></span>Ищем подписку…</div>';
+      try {
+        const response = await api(`/api/admin/users/by-public-id/${encodeURIComponent(publicId)}`);
+        const user = response.user;
+        const [status, tone] = userStatus(user);
+        const remaining = user.remaining_days === null
+          ? 'Без ограничения по сроку'
+          : `${Number(user.remaining_days)} дн.`;
+        resultNode.innerHTML = `<article class="id-search-result">
+          <div class="id-result-heading"><div><p class="eyebrow">НАЙДЕНА ПОДПИСКА</p><h3>${esc(user.name)}</h3>
+            <p class="muted">${esc(user.note || 'Без заметки')}</p></div>
+            <div class="id-result-mark"><span>ID профиля</span><code>${esc(user.public_id)}</code></div></div>
+          <span class="badge ${tone}">${esc(status)}</span>
+          <dl class="id-result-facts">
+            <div><dt>Подписка создана</dt><dd>${esc(date(user.created_at))}</dd></div>
+            <div><dt>Дата окончания</dt><dd>${user.expires_at ? esc(date(user.expires_at)) : 'Без срока'}</dd></div>
+            <div><dt>Осталось</dt><dd>${esc(remaining)}</dd></div>
+            <div><dt>Активация</dt><dd>${user.activation_enabled ? `Включена · ${Number(user.activation_devices_count) || 0}/${Number(user.activation_limit) || 0} устройств` : 'Не включена'}</dd></div>
+          </dl>
+          <button type="button" class="button button-secondary" data-manage-public-id="${esc(user.public_id)}">${svg('edit')}<span>Открыть полное управление подпиской</span></button>
+        </article>`;
+      } catch (failure) {
+        resultNode.innerHTML = `<div class="id-search-message id-search-error" role="alert">${esc(failure.message)}</div>`;
+      } finally { submit.disabled = false; }
+    });
+    root.onclick = event => {
+      const button = event.target.closest('[data-manage-public-id]');
+      if (!button) return;
+      pendingPublicIdFocus = button.dataset.managePublicId;
+      setPage('users');
+    };
+  }
+
   async function users(root) {
     const data = await api('/api/admin/users');
     const list = data.users || [];
@@ -414,8 +491,8 @@
           : hasLimit
           ? (user.limited_link ? 'QR с лимитом' : 'QR появится с Happ-ссылкой')
           : 'QR-код Drive';
-        return `<article class="surface-card user-card" data-user-card data-user-name="${esc(`${user.name || ''} ${user.note || ''}`.toLowerCase())}" data-user-state="${state}" data-user-sas="${user.include_sas === false ? 'off' : 'on'}" data-user-limit="${hasLimit ? 'limited' : 'unlimited'}">
-          <div class="user-card-head"><div class="avatar-mark">${esc((user.name || '?').trim().slice(0, 1).toUpperCase())}</div><div class="user-main"><h2>${esc(user.name)}</h2><p>${esc(user.note || 'Без заметки')}</p></div><span class="badge ${tone}">${status}</span><span class="badge ${user.drive_file_id ? 'badge-good' : 'badge-muted'}">${user.drive_file_id ? 'Drive готов' : 'Ожидает Drive'}</span><span class="badge ${user.include_sas === false ? 'badge-muted' : 'source-sas'}">${user.include_sas === false ? 'Только Secure X' : 'Secure X + SAS'}</span>${user.hide_traffic_usage && user.slug !== 'legacy' ? '<span class="badge badge-muted">Счётчик скрыт</span>' : ''}${renderActivation ? `<span class="badge ${testActivation ? (user.test_activation_at ? 'badge-good' : 'badge-warn') : (user.activation_at ? 'badge-good' : 'badge-warn')}">Render ${testMode ? 'ТЕСТ · ' : ''}${(testActivation ? user.test_activation_at : user.activation_at) ? 'подтверждена' : 'ожидает'} · ID ${esc(testActivation ? user.test_activation_id || '—' : user.activation_id || '—')}</span>` : hasLimit ? `<span class="badge ${limitStatusTone}">Устройств: ${esc(user.device_limit)} · ${limitStatusLabel}</span>` : '<span class="badge badge-muted">Без лимита устройств</span>'}${testMode ? `<span class="badge ${user.geo_device_limit ? (user.geo_activated_at ? 'badge-good' : 'badge-muted') : 'badge-muted'}">Geo ТЕСТ · ${user.geo_device_limit ? `${user.geo_activated_at ? 'активировано' : 'ожидает'} · лимит ${esc(user.geo_device_limit)}` : 'выключено'} · IP ${Number(user.geoip_requests) || 0}/${esc(user.geo_device_limit || '—')} · Sites ${Number(user.geosite_requests) || 0}/${esc(user.geo_device_limit || '—')}</span>` : ''}</div>
+        return `<article class="surface-card user-card" data-user-card data-user-id="${user.id}" data-public-id="${esc(user.public_id || '')}" data-user-name="${esc(`${user.name || ''} ${user.note || ''}`.toLowerCase())}" data-user-state="${state}" data-user-sas="${user.include_sas === false ? 'off' : 'on'}" data-user-limit="${hasLimit ? 'limited' : 'unlimited'}">
+          <div class="user-card-head"><div class="avatar-mark">${esc((user.name || '?').trim().slice(0, 1).toUpperCase())}</div><div class="user-main"><h2>${esc(user.name)}</h2><p>${esc(user.note || 'Без заметки')}</p></div>${!testMode && user.public_id ? `<span class="badge public-id-badge">ID профиля · ${esc(user.public_id)}</span>` : ''}<span class="badge ${tone}">${status}</span><span class="badge ${user.drive_file_id ? 'badge-good' : 'badge-muted'}">${user.drive_file_id ? 'Drive готов' : 'Ожидает Drive'}</span><span class="badge ${user.include_sas === false ? 'badge-muted' : 'source-sas'}">${user.include_sas === false ? 'Только Secure X' : 'Secure X + SAS'}</span>${user.hide_traffic_usage && user.slug !== 'legacy' ? '<span class="badge badge-muted">Счётчик скрыт</span>' : ''}${renderActivation ? `<span class="badge ${testActivation ? (user.test_activation_at ? 'badge-good' : 'badge-warn') : (user.activation_at ? 'badge-good' : 'badge-warn')}">Render ${testMode ? 'ТЕСТ · ' : ''}${(testActivation ? user.test_activation_at : user.activation_at) ? 'подтверждена' : 'ожидает'} · ID ${esc(testActivation ? user.test_activation_id || '—' : user.activation_id || '—')}</span>` : hasLimit ? `<span class="badge ${limitStatusTone}">Устройств: ${esc(user.device_limit)} · ${limitStatusLabel}</span>` : '<span class="badge badge-muted">Без лимита устройств</span>'}${testMode ? `<span class="badge ${user.geo_device_limit ? (user.geo_activated_at ? 'badge-good' : 'badge-muted') : 'badge-muted'}">Geo ТЕСТ · ${user.geo_device_limit ? `${user.geo_activated_at ? 'активировано' : 'ожидает'} · лимит ${esc(user.geo_device_limit)}` : 'выключено'} · IP ${Number(user.geoip_requests) || 0}/${esc(user.geo_device_limit || '—')} · Sites ${Number(user.geosite_requests) || 0}/${esc(user.geo_device_limit || '—')}</span>` : ''}</div>
           ${hasLimit && user.device_limit_error ? `<p class="tone-warn device-limit-error" role="status">${esc(user.device_limit_error)}</p>` : ''}
           <div class="user-meta"><span>Срок действия</span><strong>${esc(date(user.expires_at))}</strong></div>
           <div class="user-actions">
@@ -468,6 +545,20 @@
       });
     }
     root.onclick = event => handleUserAction(event, list);
+    if (pendingPublicIdFocus) {
+      const publicId = pendingPublicIdFocus;
+      pendingPublicIdFocus = '';
+      requestAnimationFrame(() => {
+        const target = $$('[data-user-card]', root).find(card => card.dataset.publicId === publicId);
+        if (!target) { toast('Подписка по этому ID больше недоступна'); return; }
+        target.scrollIntoView({
+          behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+          block: 'center'
+        });
+        target.classList.add('id-search-focus');
+        setTimeout(() => target.classList.remove('id-search-focus'), 2400);
+      });
+    }
     const hasPendingLimit = list.some(user => user.device_limit !== null && user.device_limit !== undefined
       && user.device_limit_status === 'waiting' && user.status === 'active' && user.enabled !== false);
     const hasPendingActivationDrive = list.some(user => (testMode ? user.test_activation_enabled : user.activation_enabled)
