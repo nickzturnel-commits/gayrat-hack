@@ -765,7 +765,6 @@
       </section>` : ''}
       <section class="form-section"><p class="eyebrow">${testMode && !isLegacy ? '07' : '06'} / ВИД ПРОФИЛЯ</p><h3>Заголовок и сообщение</h3>
         <label>Заголовок профиля<input name="title_override" maxlength="200" value="${esc(user?.title_override || '')}" placeholder="Использовать название по умолчанию"></label>
-        <label>Объявление<textarea name="announce_override" maxlength="4000" rows="3" placeholder="Оставьте пустым для общего объявления">${esc(user?.announce_override || '')}</textarea></label>
       </section>
       <div class="form-actions"><button class="button button-primary" type="submit">${user ? 'Сохранить изменения' : 'Создать и синхронизировать'}</button></div>
     </form>`);
@@ -832,7 +831,6 @@
           name: values.get('name'), note: values.get('note'), enabled: values.has('enabled'),
           expires_at: expiryValue ? new Date(expiryValue).toISOString() : null,
           title_override: values.get('title_override') || null,
-          announce_override: values.get('announce_override') || null,
           // The legacy account always keeps the provider counter visible.
           hide_traffic_usage: isLegacy ? false : values.has('hide_traffic_usage'),
           include_sas: values.get('include_sas') === 'with-sas',
@@ -1123,16 +1121,11 @@
     deviceLimitBounds = data.device_limit_bounds || deviceLimitBounds;
     const deviceMin = Number(deviceLimitBounds?.min);
     const deviceMax = Number(deviceLimitBounds?.max);
-    const textarea = (name, label, hint = '') => `<label>${label}<textarea name="${name}" rows="${name === 'days' ? 5 : 7}">${esc((settings[name] || []).join('\n'))}</textarea>${hint ? `<span class="field-hint">${hint}</span>` : ''}</label>`;
     root.innerHTML = pageHead('Настройки') + `<form id="settingsForm" class="surface-card settings-form">
       <div class="form-section"><p class="eyebrow">ПРОФИЛЬ</p><h2>Внешний вид подписки</h2>
         <label>Название по умолчанию<input name="title" maxlength="200" value="${esc(settings.title)}"></label>
         <div class="field-pair"><label>Ссылка поддержки<input name="support_url" value="${esc(settings.support_url)}"></label><label>Страница профиля<input name="web_page_url" value="${esc(settings.web_page_url)}"></label></div>
         <div class="field-pair"><label>Интервал обновления (часы)<input name="update_interval" type="number" min="1" max="168" value="${settings.update_interval}"></label><label>Часовой пояс<input name="timezone" value="${esc(settings.timezone)}"></label></div>
-      </div>
-      <div class="form-section"><p class="eyebrow">ОБЪЯВЛЕНИЯ</p><h2>Сообщения пользователям</h2>
-        <label class="switch-row"><input name="announce_enabled" type="checkbox" ${settings.announce_enabled ? 'checked' : ''}><span class="switch"></span><span><b>Объявления включены</b><small>Показываются в профиле подписки.</small></span></label>
-        <label>Частота обновления объявления (минуты)<input name="announce_refresh_minutes" type="number" min="5" max="1440" value="${settings.announce_refresh_minutes || 5}"><span class="field-hint">День/приветствие, цитата и подпись меняются с этим интервалом; погода запрашивается при каждой синхронизации. Happ получает новый текст после записи в Drive. Для 10+ пользователей рекомендуем 60 минут, чтобы беречь квоту Apps Script. Минимум — 5 минут.</span></label>
       </div>
       <div class="form-section"><p class="eyebrow">НОВЫЕ ПОДПИСКИ</p><h2>Счётчик трафика в клиенте</h2>
         <label class="switch-row"><input name="hide_traffic_for_new_users" type="checkbox" ${settings.hide_traffic_for_new_users ? 'checked' : ''}><span class="switch"></span><span><b>Скрывать счётчик по умолчанию</b><small>Применяется только к новым пользователям. Переключатель можно изменить отдельно в каждой подписке. Основная подписка всегда показывает общий трафик аккаунта.</small></span></label>
@@ -1156,11 +1149,6 @@
         </article>
         <label class="switch-row"><input name="include_sas_for_new_users" type="checkbox" ${settings.include_sas_for_new_users !== false ? 'checked' : ''}><span class="switch"></span><span><b>Добавлять SAS в новые подписки по умолчанию</b><small>При создании каждой подписки это значение можно поменять отдельно. На уже существующие профили настройка не влияет.</small></span></label>
       </div>
-      <div class="form-section"><p class="eyebrow">ТЕКСТЫ</p><h2>Дни, цитаты и подписи</h2>
-        ${textarea('days', 'Дни недели — по одному на строку')}
-        ${textarea('quotes', 'Цитаты — по одной на строку')}
-        ${textarea('footers', 'Нижние строки; {t} заменяется текущим временем')}
-      </div>
       <div class="form-actions"><button class="button button-primary" type="submit">Сохранить настройки</button></div>
     </form>`;
     $('#settingsForm').addEventListener('submit', async event => {
@@ -1174,13 +1162,9 @@
       const values = {
         title: fields.get('title'), support_url: fields.get('support_url'), web_page_url: fields.get('web_page_url'),
         update_interval: Number(fields.get('update_interval')), timezone: fields.get('timezone'),
-        announce_enabled: fields.has('announce_enabled'), announce_refresh_minutes: Number(fields.get('announce_refresh_minutes')),
         hide_traffic_for_new_users: fields.has('hide_traffic_for_new_users'),
         include_sas_for_new_users: fields.has('include_sas_for_new_users'),
-        device_limit_for_new_users: fields.get('device_limit_for_new_users') === '' ? null : Number(fields.get('device_limit_for_new_users')),
-        days: fields.get('days').split('\n').map(line => line.trim()).filter(Boolean),
-        quotes: fields.get('quotes').split('\n').map(line => line.trim()).filter(Boolean),
-        footers: fields.get('footers').split('\n').map(line => line.trim()).filter(Boolean)
+        device_limit_for_new_users: fields.get('device_limit_for_new_users') === '' ? null : Number(fields.get('device_limit_for_new_users'))
       };
       try {
         const saved = await api('/api/admin/settings', { method: 'PUT', body: { values } });
