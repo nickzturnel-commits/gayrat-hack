@@ -71,36 +71,36 @@ DEFAULT_SETTINGS = {
     "device_limit_for_new_users": None,
 }
 
-# Applied only to test subscriptions. Happ accepts custom color-profile metadata
-# and subscription pinning in the profile body; the palette keeps the app UI
-# near-black while retaining readable text and a restrained green accent.
+# Applied only to test subscriptions. Keep the palette aligned with the black
+# Happ theme used as the visual reference; no Provider ID or domain is copied.
 TEST_HAPP_COLOR_PROFILE = {
+    "backgroundColors": ["#050505FF", "#0B0B0BFF", "#151515FF"],
     "backgroundGradientRotationAngle": 0,
-    "serverRowBackgroundColor": "#111415F2",
-    "subsHeaderColor": "#080A0BFF",
-    "profileWebPageIconColor": "#B7D19BFF",
-    "selectedServerRowColor": "#26332BFF",
-    "disclosureSubHeaderTextColor": "#B7C0BAFF",
-    "buttonTextColor": "#080A09FF",
-    "buttonTimerColor": "#E7ECE7FF",
-    "subscriptionInfoBackgroundColor": "#111516FF",
-    "backgroundColors": ["#030404FF", "#070909FF", "#0A0C0DFF"],
-    "disclosureHeaderTextColor": "#F2F5F2FF",
     "backgroundGradientColorIntensity": 1,
-    "additionalOptionsButtonColor": "#E2E8E3FF",
-    "buttonImageType": "light",
-    "serverRowSubTitleTextColor": "#AAB3ACFF",
-    "supportIconColor": "#EAF0EAFF",
-    "topBarButtonsColor": "#EAF0EAFF",
-    "subscriptionTrafficBackgroundColor": "#26312AFF",
-    "subHeaderButtonColor": "#EAF0EAFF",
-    "buttonColor": "#B7D19BFF",
-    "powerIconColor": "#B7D19BFF",
-    "subscriptionInfoTextColor": "#E4E8E4FF",
-    "serverRowTitleTextColor": "#F1F3F1FF",
     "backgroundImageType": "system",
-    "elipseColors": ["#A1C181FF", "#CDD99AFF", "#E2B862FF"],
-    "serverRowChevronColor": "#DCE2DDFF",
+    "buttonImageType": "light",
+    "buttonColor": "#242424FF",
+    "buttonTextColor": "#FFFFFFFF",
+    "buttonTimerColor": "#FFFFFFFF",
+    "powerIconColor": "#000000CC",
+    "serverRowBackgroundColor": "#161616CC",
+    "serverRowTitleTextColor": "#FFFFFFFF",
+    "serverRowSubTitleTextColor": "#A6A6A6FF",
+    "serverRowChevronColor": "#FFFFFFFF",
+    "selectedServerRowColor": "#303030E6",
+    "subsHeaderColor": "#101010FF",
+    "subscriptionInfoBackgroundColor": "#0D0D0DFF",
+    "subscriptionInfoTextColor": "#FFFFFFFF",
+    "subscriptionTrafficBackgroundColor": "#202020FF",
+    "disclosureHeaderTextColor": "#FFFFFFFF",
+    "disclosureSubHeaderTextColor": "#A6A6A6FF",
+    "topBarButtonsColor": "#FFFFFFFF",
+    "supportIconColor": "#FFFFFFFF",
+    "profileWebPageIconColor": "#BDBDBDFF",
+    "subHeaderButtonColor": "#FFFFFFFF",
+    "additionalOptionsButtonColor": "#FFFFFF99",
+    "settingsControlsTintColor": "#FFFFFFFF",
+    "elipseColors": ["#FFFFFFCC", "#8A8A8AFF", "#404040FF"],
 }
 
 
@@ -2279,12 +2279,8 @@ async def build_manifest_content(conn, user, body: bytes, headers: dict, setting
              "#announce: base64:" + base64.b64encode(announcement.encode()).decode(),
              "#support-url: " + str(settings.get("support_url", "https://t.me/moserrr1"))]
     if test_mode:
-        # Let /test use its own Happ provider when configured. Existing
-        # deployments can reuse HAPP_PROVIDER_ID until a separate test ID is
-        # available; these directives are still emitted only for /test.
+        # Keep the test theme and pin bound only to the test Happ account.
         provider_id = os.getenv("TEST_HAPP_PROVIDER_ID", "").strip()
-        if not provider_id:
-            provider_id = os.getenv("HAPP_PROVIDER_ID", "").strip()
     else:
         provider_id = os.getenv("HAPP_PROVIDER_ID", "").strip()
     if re.fullmatch(r"[A-Za-z0-9]{8}", provider_id):
@@ -3726,6 +3722,11 @@ async def user_servers_list(user_id: int, request: Request):
 @router.get("/api/admin/settings")
 async def settings_get(request: Request):
     _auth(request)
+    test_mode = _test_environment.get()
+    provider_id_env = "TEST_HAPP_PROVIDER_ID" if test_mode else "HAPP_PROVIDER_ID"
+    profile_provider_id = os.getenv(provider_id_env, "").strip()
+    test_profile_host = (urlsplit(_public_service_base_url(str(request.base_url).rstrip("/"))).hostname
+                         if test_mode else None)
     if request.query_params.get("cached") != "1":
         try:
             await state.fetch_upstream()
@@ -3744,7 +3745,8 @@ async def settings_get(request: Request):
         return {"settings": await _settings(conn),
             "device_limit_bounds": {"min": happ_limit.MIN_LIMIT, "max": happ_limit.MAX_LIMIT},
             "happ": {"configured": happ_limit.is_configured(os.getenv("HAPP_PROVIDER_CODE"), os.getenv("HAPP_AUTH_KEY")),
-                     "provider_id_configured": bool(re.fullmatch(r"[A-Za-z0-9]{8}", os.getenv("HAPP_PROVIDER_ID", "").strip()))},
+                     "provider_id_configured": bool(re.fullmatch(r"[A-Za-z0-9]{8}", profile_provider_id)),
+                     **({"subscription_host": test_profile_host} if test_mode else {})},
             "sas": {
             "configured": bool(os.getenv("SAS_SUBSCRIPTION_URL", "").strip()),
             "server_count": len(sas_uris),
