@@ -1226,7 +1226,8 @@
         <article class="device-limit-settings-card surface-card">
           <div><b>${happ.configured ? 'API Happ настроен' : 'Нужны переменные Happ'}</b><small>${happ.configured ? 'Ссылки можно создавать из карточек подписок.' : 'Добавьте HAPP_PROVIDER_CODE и HAPP_AUTH_KEY в Secrets сервиса Secure X на Render.'}</small></div>
           <span class="badge ${happ.configured ? 'badge-good' : 'badge-warn'}">${happ.configured ? 'Подключён' : 'Не настроен'}</span>
-          <div class="device-limit-settings-meta"><span>Provider ID для профилей</span><strong class="${happ.provider_id_configured ? 'tone-good' : 'tone-warn'}">${happ.provider_id_configured ? 'Задан' : 'Не задан'}</strong></div>
+          <div class="device-limit-settings-meta"><span>${testMode ? 'Provider ID тестового профиля' : 'Provider ID для профилей'}</span><strong class="${happ.provider_id_configured ? 'tone-good' : 'tone-warn'}">${happ.provider_id_configured ? 'Задан' : 'Не задан'}</strong></div>
+          ${testMode ? `<p class="field-hint">Тестовая активация отдаёт Happ ссылку через Render: <b>${esc(happ.subscription_host || 'домен не определён')}</b>. Этот домен должен быть активен в аккаунте Happ, которому принадлежит TEST_HAPP_PROVIDER_ID.</p>` : ''}
         </article>
         <label>Лимит устройств для новых подписок по умолчанию<input name="device_limit_for_new_users" type="number" min="${deviceMin}" max="${deviceMax}" step="1" inputmode="numeric" value="${esc(settings.device_limit_for_new_users ?? '')}" placeholder="Без лимита"><span class="field-hint">Пустое поле — новые подписки создаются без лимита. Допустимый диапазон: ${deviceMin}–${deviceMax}; для отдельных пользователей значение можно изменить в форме подписки.</span></label>
         <span class="field-hint">Устройства считает Happ по install code и HWID. Обычная ссылка Drive остаётся без ограничения.</span>
