@@ -819,9 +819,6 @@
     const activationEnabled = testMode ? testActivationEnabled : user?.activation_enabled === true;
     const activationEnabledField = testMode ? 'test_activation_enabled' : 'activation_enabled';
     const activationLimitField = testMode ? 'test_activation_limit' : 'activation_limit';
-    const deviceStatus = user?.device_limit_status || (user?.limited_link ? 'ready' : user?.device_limit ? 'waiting' : 'none');
-    const deviceStatusText = ({ready: 'Ссылка Happ готова.', waiting: 'Ссылка создастся автоматически после появления файла в Google Drive.', error: `Ошибка Happ: ${user?.device_limit_error || 'повторите создание ссылки в настройках лимита.'}`})[deviceStatus]
-      || 'Без лимита. Ссылка Drive остаётся обычной.';
     const expiry = user?.expires_at ? new Date(user.expires_at) : null;
     const localExpiry = expiry ? new Date(expiry.getTime() - expiry.getTimezoneOffset() * 60000).toISOString().slice(0, 16) : '';
     openModal(user ? 'Настройки подписки' : 'Создание подписки', `<form id="userForm" class="subscription-form">
@@ -841,20 +838,16 @@
           <label class="switch-row access-switch"><input name="enabled" type="checkbox" ${user?.enabled === false ? '' : 'checked'}><span class="switch"></span><span><b>Подписка включена</b><small>При отключении ссылка покажет заглушку.</small></span></label></div>
         ${isLegacy ? '<div class="setting-note"><b>Счётчик трафика всегда виден</b><span>Это основная подписка; Happ показывает общий расход аккаунта провайдера.</span></div>' : `<label class="switch-row"><input name="hide_traffic_usage" type="checkbox" ${hideTraffic ? 'checked' : ''}><span class="switch"></span><span><b>Скрыть счётчик трафика</b><small>Управляет отображением общих данных провайдера в Happ.</small></span></label>`}
       </section>
-      <section class="form-section device-limit-form-section"><p class="eyebrow">04 / УСТРОЙСТВА</p><h3>${activationEnabled ? 'Лимит устройств Render' : 'Лимит устройств Happ'}</h3>
-        <label>Максимальное количество устройств<input name="device_limit" type="number" min="${Number(bounds.min)}" max="${Number(bounds.max)}" step="1" inputmode="numeric" value="${esc(deviceLimitValue)}" placeholder="Без лимита" ${(isLegacy || activationEnabled) ? 'disabled' : ''}><span class="field-hint">${activationEnabled ? `Лимит задаётся в разделе активации и применяется на Render. Happ Provider API и его ключи для этой ${testMode ? 'тестовой ' : ''}подписки не используются.` : `Пустое поле — без лимита. Допустимо от ${Number(bounds.min)} до ${Number(bounds.max)}. Новая или изменённая ссылка создаётся через Happ после появления файла в Drive.`}</span></label>
-        ${isLegacy ? '<p class="setting-note"><b>Для основной (legacy) подписки лимит отключён</b><span>Её Drive-ссылка и профиль не изменяются этой функцией.</span></p>' : `<p class="device-limit-current ${deviceStatus === 'error' ? 'tone-warn' : ''}" role="status">${esc(deviceStatusText)}</p>`}
-      </section>
-      ${testMode && !isLegacy ? `<section class="form-section device-limit-form-section"><p class="eyebrow">05 / GEO-ТЕСТ</p><h3>Лимит устройств через Geo-файлы · ТЕСТ</h3>
+      ${testMode && !isLegacy ? `<section class="form-section device-limit-form-section"><p class="eyebrow">04 / GEO-ТЕСТ</p><h3>Лимит устройств через Geo-файлы · ТЕСТ</h3>
         <label>Лимит запросов каждого geo-файла<input name="geo_device_limit" type="number" min="1" max="20" step="1" inputmode="numeric" value="${esc(geoDeviceLimitValue)}" placeholder="Не использовать geo-активацию"><span class="field-hint">Пустое поле отключает geo-активацию. При заданном лимите сначала будет один рабочий сервер. После успешной загрузки обоих файлов Drive сразу обновится и добавит остальные серверы. Считаются запросы geo-файлов, не уникальные HWID.</span></label>
       </section>` : ''}
-      ${!isLegacy ? `<section class="form-section activation-section"><p class="eyebrow">${testMode ? '06 / АКТИВАЦИЯ · ТЕСТ' : '05 / АКТИВАЦИЯ'}</p><h3>Ссылка активации и устройства</h3>
+      ${!isLegacy ? `<section class="form-section activation-section"><p class="eyebrow">${testMode ? '05 / АКТИВАЦИЯ · ТЕСТ' : '04 / АКТИВАЦИЯ'}</p><h3>Ссылка активации и устройства</h3>
         <label class="switch-row"><input name="${activationEnabledField}" type="checkbox" ${activationEnabled ? 'checked' : ''}><span class="switch"></span><span><b>Лимитировать доступ через Render${testMode ? ' · ТЕСТ' : ''}</b><small>Каждая подписка получает собственную ссылку. В Happ сначала появится заглушка; кнопка информации откроет страницу подтверждения, после чего сайт предложит импортировать персональную ссылку.</small></span></label>
         <label>Лимит устройств<input name="${activationLimitField}" type="number" min="1" max="20" step="1" inputmode="numeric" value="${esc(activationLimitValue)}"><span class="field-hint">От 1 до 20 браузерных регистраций. Render выдаёт каждому подтверждённому слоту отдельную зашифрованную ссылку на профиль Drive. Happ Provider API и его ключи для этого лимита не нужны.</span></label>
         <div class="setting-note"><b>Как распознаётся слот</b><span>Случайный cookie этого браузера и выбранная платформа. Если очистить cookie или открыть ссылку в другом браузере, это будет новый слот. Это не аппаратный отпечаток и не гарантирует распознавание физического устройства. IP и скрытый fingerprint не собираются.</span></div>
         ${activationEnabled ? `<p class="device-limit-current" role="status">ID ${esc(testMode ? user?.test_activation_id || 'создаётся' : user?.activation_id || 'создаётся')} · занято слотов ${Number(testMode ? user?.test_activation_devices_count : user?.activation_devices_count) || 0}/${esc(activationLimitValue)} · ${Number(testMode ? user?.test_activation_links_count : user?.activation_links_count) || 0} зашифрованных Render-ссылок готово</p>` : ''}
       </section>` : ''}
-      <section class="form-section"><p class="eyebrow">${testMode && !isLegacy ? '07' : '06'} / ВИД ПРОФИЛЯ</p><h3>Заголовок и сообщение</h3>
+      <section class="form-section"><p class="eyebrow">${testMode && !isLegacy ? '06' : !isLegacy ? '05' : '04'} / ВИД ПРОФИЛЯ</p><h3>Заголовок и сообщение</h3>
         <label>Заголовок профиля<input name="title_override" maxlength="200" value="${esc(user?.title_override || '')}" placeholder="Использовать название по умолчанию"></label>
       </section>
       <div class="form-actions"><button class="button button-primary" type="submit">${user ? 'Сохранить изменения' : 'Создать и синхронизировать'}</button></div>
@@ -865,10 +858,6 @@
           choice.classList.toggle('selected', $('input[name="include_sas"]', choice).checked);
         });
       }
-      if (event.target.name === activationEnabledField) {
-        const deviceField = $('input[name="device_limit"]', $('#userForm'));
-        if (deviceField) deviceField.disabled = isLegacy || event.target.checked;
-      }
     });
     $('#userForm').addEventListener('submit', async event => {
       event.preventDefault();
@@ -876,7 +865,8 @@
       const submit = $('button[type="submit"]', form);
       if (form.dataset.busy === '1') return;
       const values = new FormData(form);
-      const rawDeviceLimit = String(values.get('device_limit') || '').trim();
+      // Keep the existing/default Happ limit when its editor is hidden from this form.
+      const rawDeviceLimit = isLegacy ? '' : String(deviceLimitValue ?? '').trim();
       const requestedDeviceLimit = rawDeviceLimit === '' ? null : Number(rawDeviceLimit);
       if (requestedDeviceLimit !== null && (!Number.isInteger(requestedDeviceLimit)
         || requestedDeviceLimit < Number(bounds.min) || requestedDeviceLimit > Number(bounds.max))) {
