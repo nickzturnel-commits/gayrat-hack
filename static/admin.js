@@ -1199,6 +1199,7 @@
     const settings = data.settings || {};
     const sas = data.sas || {};
     const happ = data.happ || {};
+    let currentProfileFormat = settings.profile_format === 'json' ? 'json' : 'url';
     deviceLimitBounds = data.device_limit_bounds || deviceLimitBounds;
     const deviceMin = Number(deviceLimitBounds?.min);
     const deviceMax = Number(deviceLimitBounds?.max);
@@ -1207,6 +1208,12 @@
         <label>Название по умолчанию<input name="title" maxlength="200" value="${esc(settings.title)}"></label>
         <div class="field-pair"><label>Ссылка поддержки<input name="support_url" value="${esc(settings.support_url)}"></label><label>Страница профиля<input name="web_page_url" value="${esc(settings.web_page_url)}"></label></div>
         <div class="field-pair"><label>Интервал обновления (часы)<input name="update_interval" type="number" min="1" max="168" value="${settings.update_interval}"></label><label>Часовой пояс<input name="timezone" value="${esc(settings.timezone)}"></label></div>
+      </div>
+      <div class="form-section"><p class="eyebrow">ФОРМАТ DRIVE</p><h2>Что получает Happ</h2>
+        <label class="switch-row"><input id="profileFormatToggle" type="checkbox" ${currentProfileFormat === 'json' ? 'checked' : ''}><span class="switch"></span><span><b>Отдавать Xray JSON</b><small>Выключено — список ссылок. Включено — Xray JSON напрямую из основного источника и SAS.</small></span></label>
+        <span class="field-hint">Перед записью JSON проверяется. Если в нём есть meta.serverDescription, значение будет заменено на SecureX.</span>
+        <span class="field-hint">В JSON не попадают текстовые заголовок Happ, счётчик трафика и кнопка активации. Неактивные профили остаются закрыты заглушкой.</span>
+        <div id="profileFormatAction" class="form-actions" hidden><button id="applyProfileFormat" class="button button-primary" type="button"></button></div>
       </div>
       <div class="form-section"><p class="eyebrow">НОВЫЕ ПОДПИСКИ</p><h2>Счётчик трафика в клиенте</h2>
         <label class="switch-row"><input name="hide_traffic_for_new_users" type="checkbox" ${settings.hide_traffic_for_new_users ? 'checked' : ''}><span class="switch"></span><span><b>Скрывать счётчик по умолчанию</b><small>Применяется только к новым пользователям. Переключатель можно изменить отдельно в каждой подписке. Основная подписка всегда показывает общий трафик аккаунта.</small></span></label>
@@ -1233,6 +1240,39 @@
       </div>
       <div class="form-actions"><button class="button button-primary" type="submit">Сохранить настройки</button></div>
     </form>`;
+    const formatToggle = $('#profileFormatToggle');
+    const formatAction = $('#profileFormatAction');
+    const formatButton = $('#applyProfileFormat');
+    const updateFormatAction = () => {
+      const requestedFormat = formatToggle.checked ? 'json' : 'url';
+      formatAction.hidden = requestedFormat === currentProfileFormat;
+      formatButton.textContent = requestedFormat === 'json'
+        ? 'Изменить все подписки на JSON?'
+        : 'Изменить все подписки на ссылки URL?';
+    };
+    formatToggle.addEventListener('change', updateFormatAction);
+    formatButton.addEventListener('click', async () => {
+      const requestedFormat = formatToggle.checked ? 'json' : 'url';
+      if (requestedFormat === currentProfileFormat || formatButton.disabled) return;
+      const targetName = requestedFormat === 'json' ? 'Xray JSON' : 'список ссылок URL';
+      if (!window.confirm(`Перевести все подписки на формат «${targetName}» и сразу обновить Google Drive?`)) return;
+      formatButton.disabled = true;
+      formatButton.innerHTML = '<span class="spinner"></span><span>Обновляю подписки и Drive…</span>';
+      try {
+        const saved = await api('/api/admin/settings', {
+          method: 'PUT', body: { values: { profile_format: requestedFormat } }
+        });
+        currentProfileFormat = saved.settings?.profile_format === 'json' ? 'json' : 'url';
+        toast(resultText(saved, `Все подписки переведены на ${targetName}`));
+        updateFormatAction();
+      } catch (failure) {
+        toast(failure.message);
+      } finally {
+        formatButton.disabled = false;
+        updateFormatAction();
+      }
+    });
+    updateFormatAction();
     $('#settingsForm').addEventListener('submit', async event => {
       event.preventDefault();
       const form = event.currentTarget;
