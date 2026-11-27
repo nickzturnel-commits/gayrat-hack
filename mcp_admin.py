@@ -198,8 +198,7 @@ def install(app: FastAPI, panel) -> bool:
     async def list_subscriptions() -> dict[str, Any]:
         """Перечисляет все подписки основной панели без секретных ссылок и ID Drive."""
         result = await admin_api("GET", "/api/admin/users")
-        return {"subscriptions": _public(result.get("users", [])),
-                "device_limit_bounds": result.get("device_limit_bounds")}
+        return {"subscriptions": _public(result.get("users", []))}
 
     @mcp.tool()
     async def get_subscription(user_id: int) -> dict[str, Any]:
@@ -221,8 +220,14 @@ def install(app: FastAPI, panel) -> bool:
 
     @mcp.tool()
     async def create_subscription(subscription: dict[str, Any], confirm: bool) -> dict[str, Any]:
-        """Создаёт подписку через штатную валидацию панели. Передай поля UserBody; действие требует confirm=true."""
+        """Создаёт подписку без Happ-лимита устройств через штатную панель. Требует confirm=true."""
         await require_confirm(confirm)
+        if not isinstance(subscription, dict) or subscription.get("device_limit") not in (None, ""):
+            raise ToolError("Создание Happ-лимита устройств доступно только в админ-панели, не через MCP")
+        subscription = dict(subscription)
+        # An explicit null prevents the panel's optional default Happ limit
+        # from turning this MCP action into an install-counter creation.
+        subscription["device_limit"] = None
         result = await admin_api("POST", "/api/admin/users", subscription)
         return _public(result)
 
@@ -232,7 +237,7 @@ def install(app: FastAPI, panel) -> bool:
         await require_confirm(confirm)
         allowed = {
             "name", "note", "enabled", "expires_at", "title_override",
-            "traffic_limit_bytes", "hide_traffic_usage", "include_sas", "device_limit",
+            "traffic_limit_bytes", "hide_traffic_usage", "include_sas",
             "activation_enabled", "activation_limit",
         }
         if not changes or set(changes) - allowed:
@@ -242,7 +247,7 @@ def install(app: FastAPI, panel) -> bool:
             raise ToolError("Подписка не найдена")
         body = {key: current.get(key) for key in (
             "name", "note", "enabled", "expires_at", "title_override",
-            "traffic_limit_bytes", "hide_traffic_usage", "include_sas", "device_limit",
+            "traffic_limit_bytes", "hide_traffic_usage", "include_sas",
         )}
         body.update(changes)
         if "activation_limit" in changes and "activation_enabled" not in changes:
@@ -267,24 +272,13 @@ def install(app: FastAPI, panel) -> bool:
             async with pool.acquire() as conn:
                 async with conn.transaction():
                     rows = await conn.fetch(
-                        "SELECT id,name,slug,status,enabled,expires_at,include_sas,hide_traffic_usage,"
-                        "traffic_limit_bytes,note,title_override,device_limit,drive_file_id "
+                        "SELECT id,name,status,enabled,expires_at,include_sas,hide_traffic_usage,"
+                        "traffic_limit_bytes,note,title_override "
                         "FROM users WHERE id=ANY($1::bigint[]) FOR UPDATE", ids,
                     )
                     if len(rows) != len(ids):
                         raise ToolError("Один или несколько ID подписок не найдены")
-                    activation_ids = set()
-                    if "device_limit" in normalized:
-                        activation_ids = set(await conn.fetchval(
-                            "SELECT COALESCE(array_agg(user_id), ARRAY[]::bigint[]) FROM subscription_activation "
-                            "WHERE user_id=ANY($1::bigint[])", ids))
-                    legacy_ids = {int(row["id"]) for row in rows
-                                  if row["slug"] == "legacy" or row["drive_file_id"] == panel.LEGACY_DRIVE_FILE_ID}
-                    if "device_limit" in normalized and (legacy_ids or activation_ids):
-                        raise ToolError("Массовую смену Happ-лимита нельзя применять к legacy- или Render-активациям")
-
                     changed_ids: list[int] = []
-                    rebuild_ids: list[int] = []
                     skipped = []
                     update_batches: dict[tuple[str, ...], list[tuple[Any, ...]]] = {}
                     now_utc = datetime.now(timezone.utc)
@@ -308,24 +302,12 @@ def install(app: FastAPI, panel) -> bool:
                         will_disable = normalized.get("enabled", row["enabled"]) is False
                         if was_expired or will_expire or will_disable:
                             values["public_id"] = None
-                        limit_changed = ("device_limit" in normalized
-                                         and normalized["device_limit"] != row["device_limit"])
-                        if limit_changed:
-                            values.update({
-                                "device_limit": normalized["device_limit"],
-                                "happ_install_code": None,
-                                "limited_link": None,
-                                "device_limit_status": "waiting" if normalized["device_limit"] is not None else "none",
-                                "device_limit_error": None,
-                            })
                         if not values:
                             continue
                         columns = tuple(values)
                         update_batches.setdefault(columns, []).append(
                             (user_id, *(values[column] for column in columns)))
                         changed_ids.append(user_id)
-                        if limit_changed and normalized["device_limit"] is not None and row["enabled"]:
-                            rebuild_ids.append(user_id)
                     for columns, batch in update_batches.items():
                         setters = [f"{column}=${index}" for index, column in enumerate(columns, 2)]
                         setters.append("updated_at=now()")
@@ -333,10 +315,8 @@ def install(app: FastAPI, panel) -> bool:
                             f"UPDATE users SET {', '.join(setters)} WHERE id=$1", batch,
                         )
         delivery = await panel.state.request_drive_sync(changed_ids) if changed_ids else None
-        for user_id in rebuild_ids:
-            panel._schedule_limited_link(user_id)
         return {"updated": changed_ids, "skipped_inactive": skipped,
-                "device_limit_rebuild_scheduled": rebuild_ids, "drive_sync": delivery}
+                "drive_sync": delivery}
 
     @mcp.tool()
     async def deactivate_subscription(user_id: int, confirm: bool) -> dict[str, Any]:
@@ -402,8 +382,14 @@ def install(app: FastAPI, panel) -> bool:
     async def set_activation_limit(user_id: int, limit: int, confirm: bool) -> dict[str, Any]:
         """Sets a Render activation slot limit from 1 to 20; lowering it removes newest slots. Requires confirm=true."""
         await require_confirm(confirm)
-        if not 1 <= limit <= 20:
+        _validate_ids([user_id])
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
             raise ToolError("Лимит Render-активации должен быть от 1 до 20")
+        user = await raw_subscription(user_id)
+        if user is None:
+            raise ToolError("Подписка не найдена")
+        if not user.get("activation_enabled"):
+            raise ToolError("Render-активация не включена для этой подписки. Сначала включи её в настройках подписки.")
         return await admin_api("PUT", f"/api/admin/users/{user_id}/activation/limit", {"limit": limit})
 
     @mcp.tool()
@@ -457,40 +443,6 @@ def install(app: FastAPI, panel) -> bool:
         """Retries immediate Apps Script delivery for one activated subscription. Requires confirm=true."""
         await require_confirm(confirm)
         return await admin_api("POST", f"/api/admin/users/{user_id}/activation/retry", {})
-
-    @mcp.tool()
-    async def retry_happ_device_limit(user_id: int, action: Literal["retry", "rebuild"], confirm: bool) -> dict[str, Any]:
-        """Creates or rebuilds one Happ limited link using configured Happ provider credentials. Requires confirm=true."""
-        await require_confirm(confirm)
-        result = await admin_api("POST", f"/api/admin/users/{user_id}/device-limit", {"action": action})
-        return _public(result)
-
-    @mcp.tool()
-    async def bulk_retry_happ_device_limits(
-        user_ids: list[int], action: Literal["retry", "rebuild"], confirm: bool,
-    ) -> dict[str, Any]:
-        """Retries/rebuilds limited Happ links for selected users, at most three provider calls concurrently."""
-        await require_confirm(confirm)
-        ids = _validate_ids(user_ids, max_count=30)
-        semaphore = asyncio.Semaphore(3)
-
-        async def run_one(user_id: int) -> dict[str, Any]:
-            async with semaphore:
-                try:
-                    result = await admin_api("POST", f"/api/admin/users/{user_id}/device-limit", {"action": action})
-                    return {"user_id": user_id, "ok": True, "result": _public(result)}
-                except Exception as exc:
-                    return {"user_id": user_id, "ok": False, "error": str(exc)[:500]}
-
-        results = await asyncio.gather(*(run_one(user_id) for user_id in ids))
-        return {"results": results, "succeeded": sum(bool(row["ok"]) for row in results),
-                "failed": sum(not row["ok"] for row in results)}
-
-    @mcp.tool()
-    async def clear_happ_device_limit(user_id: int, confirm: bool) -> dict[str, Any]:
-        """Clears local Happ limit state for a subscription. Already-issued Happ counters are not revoked. Requires confirm=true."""
-        await require_confirm(confirm)
-        return await admin_api("DELETE", f"/api/admin/users/{user_id}/device-limit")
 
     @mcp.tool()
     async def list_servers() -> dict[str, Any]:
@@ -586,6 +538,8 @@ def install(app: FastAPI, panel) -> bool:
         await require_confirm(confirm)
         if not values:
             raise ToolError("Передай хотя бы одну настройку")
+        if "device_limit_for_new_users" in values:
+            raise ToolError("Настройка Happ-лимита для новых подписок доступна только в админ-панели, не через MCP")
         return _public(await admin_api("PUT", "/api/admin/settings", {"values": values}))
 
     @mcp.tool()
@@ -667,7 +621,7 @@ def _path_part(value: str) -> str:
 def _validate_bulk_changes(changes: dict[str, Any], panel) -> dict[str, Any]:
     allowed = {
         "enabled", "include_sas", "hide_traffic_usage", "expires_at", "note", "title_override",
-        "traffic_limit_bytes", "device_limit", "name_prefix", "name_suffix",
+        "traffic_limit_bytes", "name_prefix", "name_suffix",
         "find_text", "replace_text",
     }
     if not isinstance(changes, dict) or not changes or set(changes) - allowed:
@@ -686,10 +640,6 @@ def _validate_bulk_changes(changes: dict[str, Any], panel) -> dict[str, Any]:
         value = result["traffic_limit_bytes"]
         if isinstance(value, bool) or not isinstance(value, int) or not 1_000_000 <= value <= 1_000_000_000_000:
             raise ToolError("traffic_limit_bytes должен быть от 1 МБ до 1 ТБ или null")
-    if "device_limit" in result and result["device_limit"] is not None:
-        value = result["device_limit"]
-        if isinstance(value, bool) or not isinstance(value, int) or not panel.happ_limit.MIN_LIMIT <= value <= panel.happ_limit.MAX_LIMIT:
-            raise ToolError(f"device_limit должен быть от {panel.happ_limit.MIN_LIMIT} до {panel.happ_limit.MAX_LIMIT} или null")
     if "expires_at" in result and result["expires_at"] is not None:
         value = result["expires_at"]
         if not isinstance(value, str):

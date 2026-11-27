@@ -464,6 +464,124 @@ class UriTests(unittest.TestCase):
         self.assertEqual(panel.parse_server_uri(uri)["scheme"], "ss")
 
 
+class NativeXrayJsonTests(unittest.TestCase):
+    @staticmethod
+    def outbound(host: str, user_id: str, *, tag: str = "proxy") -> dict:
+        return {
+            "protocol": "vless", "tag": tag,
+            "settings": {"vnext": [{"address": host, "port": 443, "users": [
+                {"id": user_id, "encryption": "none"},
+            ]}]},
+            "streamSettings": {"network": "tcp", "security": "none"},
+        }
+
+    def test_native_json_merge_preserves_raw_configs_and_only_renames_description(self):
+        primary_outbound = self.outbound("main.example", "00000000-0000-4000-8000-000000000061",
+                                         tag="Primary node")
+        opaque_outbound = {
+            "protocol": "vendor-tunnel", "tag": "Opaque node",
+            "settings": {"servers": [{"address": "opaque.example", "port": 8443, "token": "fixture"}]},
+            "streamSettings": {"network": "quic"},
+        }
+        sas_outbound = self.outbound("sas.example", "00000000-0000-4000-8000-000000000062",
+                                     tag="SAS node")
+        primary = {
+            "remarks": "Provider", "meta": {"serverDescription": "Old", "keep": "intact"},
+            "inbounds": [{"tag": "local-in"}], "routing": {"rules": []},
+            "outbounds": [primary_outbound, opaque_outbound],
+        }
+        sas = {"meta": {"serverDescription": "Old SAS"}, "outbounds": [sas_outbound]}
+
+        merged = json.loads(panel.merge_xray_json_bodies(
+            json.dumps(primary).encode(), json.dumps(sas).encode()))
+
+        self.assertEqual(merged["meta"], {"serverDescription": "SecureX", "keep": "intact"})
+        self.assertEqual(merged["inbounds"], primary["inbounds"])
+        self.assertEqual(merged["routing"], primary["routing"])
+        self.assertEqual(merged["outbounds"], [primary_outbound, opaque_outbound, sas_outbound])
+
+    def test_native_json_array_is_flattened_and_missing_description_is_not_added(self):
+        first = {"remarks": "Main profile", "outbounds": [self.outbound(
+            "main.example", "00000000-0000-4000-8000-000000000063")]}
+        second = {"remarks": "SAS profile", "outbounds": [self.outbound(
+            "sas.example", "00000000-0000-4000-8000-000000000064")]}
+
+        merged = json.loads(panel.merge_xray_json_bodies(
+            json.dumps([first]).encode(), json.dumps([second]).encode()))
+
+        self.assertNotIn("meta", merged)
+        self.assertEqual(len(merged["outbounds"]), 2)
+        self.assertEqual(merged["outbounds"][1]["remarks"], "SAS profile")
+
+    def test_json_mode_accepts_valid_xray_outbounds_the_url_converter_does_not_map(self):
+        native = {
+            "outbounds": [{
+                "protocol": "vendor-tunnel", "tag": "Opaque node",
+                "settings": {"servers": [{"address": "opaque.example", "port": 443, "token": "fixture"}]},
+                "streamSettings": {"network": "quic"},
+            }],
+        }
+        body = json.dumps(native).encode()
+
+        self.assertIsNone(panel._invalid_payload(body, "application/json", allow_native_json=True))
+        self.assertEqual(json.loads(panel.merge_xray_json_bodies(body))["outbounds"], native["outbounds"])
+
+
+class NativeJsonCatalogTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fetch_upstream_combines_native_json_without_url_text_output(self):
+        primary = json.dumps({
+            "meta": {"serverDescription": "Old"},
+            "outbounds": [NativeXrayJsonTests.outbound(
+                "main.example", "00000000-0000-4000-8000-000000000066", tag="Main")],
+        }).encode()
+        sas = json.dumps({
+            "outbounds": [NativeXrayJsonTests.outbound(
+                "sas.example", "00000000-0000-4000-8000-000000000067", tag="SAS")],
+        }).encode()
+        state = panel.PanelState()
+        state._profile_output_format = AsyncMock(return_value="json")
+        state._fetch_primary_locked = AsyncMock(return_value=(primary, False))
+        state._fetch_sas_locked = AsyncMock(return_value=(sas, False))
+        try:
+            with patch.dict(os.environ, {
+                "SUBSCRIPTION_URL": "https://provider.example/sub",
+                "SAS_SUBSCRIPTION_URL": "https://sas.example/sub",
+            }, clear=False):
+                body, _headers, stale = await state.fetch_upstream(force=True)
+        finally:
+            await state.close()
+
+        result = json.loads(body)
+        self.assertFalse(stale)
+        self.assertEqual(result["meta"]["serverDescription"], "SecureX")
+        self.assertEqual([item["tag"] for item in result["outbounds"]], ["Main", "SAS"])
+
+    async def test_unconvertible_native_json_keeps_catalog_refresh_from_failing(self):
+        body = json.dumps({"outbounds": [{
+            "protocol": "vendor-tunnel", "settings": {"servers": [{"address": "opaque", "port": 443}]},
+            "streamSettings": {"network": "quic"},
+        }]}).encode()
+
+        result = await panel._sync_servers(FakeConn(), body)
+
+        self.assertEqual(result, [])
+
+    async def test_database_lock_timeout_is_a_retryable_503(self):
+        class LockedConn(FakeConn):
+            async def execute(self, query, *args):
+                if "pg_advisory_xact_lock" in query:
+                    raise TimeoutError
+                return await super().execute(query, *args)
+
+        body = json.dumps({"outbounds": [NativeXrayJsonTests.outbound(
+            "main.example", "00000000-0000-4000-8000-000000000065", tag="Main")]}).encode()
+
+        with self.assertRaises(HTTPException) as raised:
+            await panel._sync_servers(LockedConn(), body)
+
+        self.assertEqual(raised.exception.status_code, 503)
+
+
 class ServerReconciliationTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_base64_nodes_with_spaced_labels_reach_generated_manifest(self):
         provider_text = "\n".join([

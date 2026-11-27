@@ -150,7 +150,7 @@ def _slugify(name: str) -> str:
     return f"{base}-{secrets.token_hex(3)}"
 
 
-def _xray_json_uris(text: str) -> list[str] | None:
+def _xray_json_uris(text: str, *, tolerate_unsupported: bool = False) -> list[str] | None:
     """Convert supported Xray JSON outbounds to standard proxy share links."""
     try:
         document = json.loads(text)
@@ -541,7 +541,7 @@ def _xray_json_uris(text: str) -> list[str] | None:
     # Xray profile lists often repeat a generic auto-selector beside the
     # individually named nodes. Drop only that lower-ranked generic alias;
     # retain distinct provider labels for the same connection.
-    if unsupported:
+    if unsupported and not tolerate_unsupported:
         raise UnsupportedProxyConfig(
             "В JSON найдены неподдерживаемые прокси-конфиги: " + ", ".join(sorted(unsupported)))
     converted = [uri for (connection_id, _name), (rank, uri) in by_identity.items()
@@ -795,15 +795,18 @@ def _clash_yaml_uris(text: str) -> list[str] | None:
     return _singbox_json_uris(json.dumps({"outbounds": normalized}, ensure_ascii=False))
 
 
-def _structured_config_uris(text: str) -> list[str] | None:
-    for parser in (_xray_json_uris, _singbox_json_uris, _clash_yaml_uris):
+def _structured_config_uris(text: str, *, tolerate_unsupported: bool = False) -> list[str] | None:
+    converted = _xray_json_uris(text, tolerate_unsupported=tolerate_unsupported)
+    if converted:
+        return converted
+    for parser in (_singbox_json_uris, _clash_yaml_uris):
         converted = parser(text)
         if converted:
             return converted
     return None
 
 
-def _decode_subscription(body: bytes) -> str:
+def _decode_subscription(body: bytes, *, tolerate_unsupported: bool = False) -> str:
     text = body.decode("utf-8-sig", errors="replace").strip()
     if not text:
         raise ValueError("Апстрим вернул пустую подписку")
@@ -815,9 +818,19 @@ def _decode_subscription(body: bytes) -> str:
         decoded_text = decoded.decode("utf-8-sig").strip()
         if URI_ANY.search(decoded_text):
             return decoded_text
-        converted = _structured_config_uris(decoded_text)
+        converted = _structured_config_uris(decoded_text, tolerate_unsupported=tolerate_unsupported)
         if converted:
             return "\n".join(converted)
+        if tolerate_unsupported:
+            try:
+                parsed = json.loads(decoded_text)
+                if isinstance(parsed, dict) and isinstance(parsed.get("outbounds"), list):
+                    return decoded_text
+                if isinstance(parsed, list) and parsed and all(
+                        isinstance(item, dict) and isinstance(item.get("outbounds"), list) for item in parsed):
+                    return decoded_text
+            except (TypeError, json.JSONDecodeError):
+                pass
     except UnsupportedProxyConfig:
         raise
     except (ValueError, UnicodeDecodeError):
@@ -852,11 +865,34 @@ def _parse_xray_json_body(body: bytes, source: str = "источник") -> dict
             break
         except (json.JSONDecodeError, ValueError):
             continue
-    if not isinstance(document, dict) or not isinstance(document.get("outbounds"), list):
-        raise ValueError(f"{source} не вернул Xray JSON с массивом outbounds")
-    if not _xray_json_uris(json.dumps(document, ensure_ascii=False)):
-        raise ValueError(f"{source} JSON не содержит поддерживаемых VPN-серверов")
-    return document
+    profiles = document if isinstance(document, list) else [document]
+    if not profiles or any(not isinstance(profile, dict) or not isinstance(profile.get("outbounds"), list)
+                           or not profile["outbounds"] for profile in profiles):
+        raise ValueError(f"{source} не вернул Xray JSON с непустым массивом outbounds")
+    for profile in profiles:
+        if any(not isinstance(outbound, dict) for outbound in profile["outbounds"]):
+            raise ValueError(f"{source} содержит некорректный элемент outbounds")
+        _set_xray_server_description(profile)
+
+    # Some providers publish a JSON array of individual Xray profiles. Drive
+    # stores one profile, so retain the first profile's settings and append the
+    # remaining raw outbound objects. Preserve each secondary profile's label
+    # when its outbound uses a generic Xray tag.
+    normalized = copy.deepcopy(profiles[0])
+    outbounds: list[dict] = []
+    for profile in profiles:
+        profile_name = str(profile.get("remarks") or profile.get("name") or "").strip()
+        for outbound in profile["outbounds"]:
+            item = copy.deepcopy(outbound)
+            protocol = str(item.get("protocol", "")).lower()
+            tag = str(item.get("remarks") or item.get("tag") or "").strip()
+            generic_tag = not tag or bool(re.fullmatch(
+                rf"(?:proxy|outbound|{re.escape(protocol)})(?:[-_ ]?\d+)?", tag, flags=re.I))
+            if profile_name and generic_tag and profile is not profiles[0]:
+                item["remarks"] = profile_name
+            outbounds.append(item)
+    normalized["outbounds"] = outbounds
+    return normalized
 
 
 def _set_xray_server_description(document: dict) -> None:
@@ -877,7 +913,7 @@ def _xray_outbound_records(document: dict, outbound: dict) -> list[tuple[str, di
     candidate["outbounds"] = [outbound] + [
         {"protocol": protocol, "settings": {}} for item in siblings if item is not outbound
     ]
-    uris = _xray_json_uris(json.dumps(candidate, ensure_ascii=False)) or []
+    uris = _xray_json_uris(json.dumps(candidate, ensure_ascii=False), tolerate_unsupported=True) or []
     if not uris:
         return []
 
@@ -908,11 +944,24 @@ def _xray_outbound_records(document: dict, outbound: dict) -> list[tuple[str, di
     return list(zip(uris, clones))
 
 
+def _xray_outbound_is_proxy(outbound: dict) -> bool:
+    protocol = str(outbound.get("protocol", "")).lower()
+    if protocol in {"freedom", "blackhole", "dns", "loopback", "direct",
+                    "selector", "balancer", "observatory"}:
+        return False
+    settings = outbound.get("settings") if isinstance(outbound.get("settings"), dict) else {}
+    return (isinstance(settings.get("servers"), list)
+            or isinstance(settings.get("vnext"), list)
+            or isinstance(outbound.get("streamSettings"), dict))
+
+
 def merge_xray_json_bodies(primary_body: bytes, secondary_body: bytes | None = None) -> bytes:
     """Merge two native Xray JSON feeds by combining their outbound objects."""
     primary = _parse_xray_json_body(primary_body, "Основная подписка")
     secondary = (_parse_xray_json_body(secondary_body, "SAS") if secondary_body is not None else None)
     _set_xray_server_description(primary)
+    if secondary is not None:
+        _set_xray_server_description(secondary)
 
     seen: set[tuple[str, str]] = set()
     def add_source(document: dict, *, sas: bool) -> list[dict]:
@@ -922,7 +971,13 @@ def merge_xray_json_bodies(primary_body: bytes, secondary_body: bytes | None = N
                 continue
             records = _xray_outbound_records(document, outbound)
             if not records:
-                if not sas:
+                protocol = str(outbound.get("protocol", "")).lower()
+                if sas and _xray_outbound_is_proxy(outbound):
+                    names = [str(outbound.get("remarks") or outbound.get("tag") or ""),
+                             str(document.get("remarks") or document.get("name") or "")]
+                    if any(_is_excluded_sas_name(name) for name in names):
+                        continue
+                if not sas or _xray_outbound_is_proxy(outbound):
                     selected.append(copy.deepcopy(outbound))
                 continue
             keep: list[dict] = []
@@ -1030,13 +1085,13 @@ def rename_server_uri(uri: str, name: str) -> str:
     return head + "#" + quote(name, safe="")
 
 
-def _extract_uris(text: str) -> list[str]:
+def _extract_uris(text: str, *, tolerate_unsupported: bool = False) -> list[str]:
     # Upstream supports one URI per line. Ignore human-readable metadata lines.
     # Provider labels are not always percent-encoded: a fragment such as
     # `#Germany West` is valid input for clients even though it contains spaces.
     # Only allow those spaces after `#`; whitespace in the connection part
     # would make the URI ambiguous and is treated as malformed.
-    converted = _structured_config_uris(text)
+    converted = _structured_config_uris(text, tolerate_unsupported=tolerate_unsupported)
     if converted is not None:
         text = "\n".join(converted)
     uris = []
@@ -1066,11 +1121,17 @@ def _is_html(body: bytes, content_type: str) -> bool:
     return "text/html" in (content_type or "").lower() or start.startswith((b"<!doctype html", b"<html"))
 
 
-def _invalid_payload(body: bytes, content_type: str) -> str | None:
+def _invalid_payload(body: bytes, content_type: str, *, allow_native_json: bool = False) -> str | None:
     if len(body) > 8 * 1024 * 1024:
         return "Подписка превышает допустимый размер"
     if _is_html(body, content_type):
         return "Апстрим вернул HTML вместо списка серверов"
+    if allow_native_json:
+        try:
+            _parse_xray_json_body(body, "Апстрим")
+            return None
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError, base64.binascii.Error):
+            pass
     compact = b"".join(body.split())
     candidates = [body]
     if compact:
@@ -1122,9 +1183,14 @@ def merge_subscription_bodies(primary_body: bytes, secondary_body: bytes,
 def is_excluded_sas_server(uri: str) -> bool:
     """Exclude every numbered or unnumbered LTE bypass node from the SAS feed."""
     try:
-        name = _server_name_key(parse_server_uri(uri)["name"])
+        name = parse_server_uri(uri)["name"]
     except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return False
+    return _is_excluded_sas_name(name)
+
+
+def _is_excluded_sas_name(value: str) -> bool:
+    name = _server_name_key(value)
     if "lte" not in name or not re.search(r"обход\s+глушилок", name):
         return False
     return True
@@ -1490,7 +1556,8 @@ class PanelState:
         headers.setdefault("User-Agent", PANEL_UPSTREAM_DEFAULT_USER_AGENT)
         return headers
 
-    async def _fetch_primary_locked(self, url: str, headers: dict[str, str], force: bool):
+    async def _fetch_primary_locked(self, url: str, headers: dict[str, str], force: bool,
+                                    *, allow_native_json: bool = False):
         now = time.monotonic()
         fresh = self.upstream_body is not None and now - self.upstream_fetched_at < PANEL_CACHE_TTL_SECONDS
         if fresh and not force:
@@ -1500,7 +1567,8 @@ class PanelState:
             response = await self.upstream_client.get(url, headers=headers)
             if response.status_code >= 400:
                 raise ValueError(f"Апстрим ответил HTTP {response.status_code}")
-            invalid = _invalid_payload(response.content, response.headers.get("content-type", ""))
+            invalid = _invalid_payload(response.content, response.headers.get("content-type", ""),
+                                       allow_native_json=allow_native_json)
             if invalid:
                 raise ValueError(invalid)
             self.upstream_body = response.content
@@ -1508,7 +1576,9 @@ class PanelState:
             self.upstream_fetched_at = time.monotonic()
             self.upstream_success_at = time.time()
             self.upstream_warning = None
-            log.info("Panel upstream cache updated: bytes=%d; servers=%d", len(response.content), len(_extract_uris(_decode_subscription(response.content))))
+            decoded = _decode_subscription(response.content, tolerate_unsupported=allow_native_json)
+            server_count = len(_extract_uris(decoded, tolerate_unsupported=allow_native_json))
+            log.info("Panel upstream cache updated: bytes=%d; servers=%d", len(response.content), server_count)
             return self.upstream_body, False
         except Exception as exc:
             self.upstream_warning = "Не удалось получить актуальную подписку от основного апстрима"
@@ -1519,7 +1589,8 @@ class PanelState:
                 return self.upstream_body, True
             raise HTTPException(502, self.upstream_warning) from exc
 
-    async def _fetch_sas_locked(self, url: str, headers: dict[str, str], force: bool):
+    async def _fetch_sas_locked(self, url: str, headers: dict[str, str], force: bool,
+                                *, allow_native_json: bool = False):
         now = time.monotonic()
         fresh = self.sas_body is not None and now - self.sas_fetched_at < PANEL_CACHE_TTL_SECONDS
         if fresh and not force:
@@ -1529,14 +1600,17 @@ class PanelState:
             response = await self.upstream_client.get(url, headers=headers)
             if response.status_code >= 400:
                 raise ValueError(f"SAS ответил HTTP {response.status_code}")
-            invalid = _invalid_payload(response.content, response.headers.get("content-type", ""))
+            invalid = _invalid_payload(response.content, response.headers.get("content-type", ""),
+                                       allow_native_json=allow_native_json)
             if invalid:
                 raise ValueError(invalid)
             self.sas_body = response.content
             self.sas_fetched_at = time.monotonic()
             self.sas_success_at = time.time()
             self.sas_warning = None
-            log.info("SAS subscription cache updated: bytes=%d; servers=%d", len(response.content), len(_extract_uris(_decode_subscription(response.content))))
+            decoded = _decode_subscription(response.content, tolerate_unsupported=allow_native_json)
+            server_count = len(_extract_uris(decoded, tolerate_unsupported=allow_native_json))
+            log.info("SAS subscription cache updated: bytes=%d; servers=%d", len(response.content), server_count)
             return self.sas_body, False
         except Exception as exc:
             self.sas_warning = "Не удалось обновить подписку SAS; используется последняя удачная копия"
@@ -1582,7 +1656,8 @@ class PanelState:
                 self.upstream_client = httpx.AsyncClient(follow_redirects=True, timeout=UPSTREAM_TIMEOUT_SECONDS)
             headers = self._upstream_headers_for_panel()
             if primary_url:
-                primary_body, primary_stale = await self._fetch_primary_locked(primary_url, headers, force)
+                primary_body, primary_stale = await self._fetch_primary_locked(
+                    primary_url, headers, force, allow_native_json=output_format == "json")
             elif self.upstream_body is not None:
                 self.upstream_warning = "SUBSCRIPTION_URL не задан; используется последняя удачная копия"
                 primary_body, primary_stale = self.upstream_body, True
@@ -1594,7 +1669,8 @@ class PanelState:
             sas_stale = False
             if sas_url:
                 try:
-                    sas_body, sas_stale = await self._fetch_sas_locked(sas_url, headers, force or force_sas)
+                    sas_body, sas_stale = await self._fetch_sas_locked(
+                        sas_url, headers, force or force_sas, allow_native_json=output_format == "json")
                 except HTTPException:
                     if not allow_sas_failure:
                         raise
@@ -1621,7 +1697,9 @@ class PanelState:
                             )
                     except ValueError as exc:
                         self.sas_warning = "Не удалось сформировать объединённый профиль SAS"
-                        log.warning("Combined subscription rejected (%s)", type(exc).__name__)
+                        detail = _safe_sync_error(str(exc))
+                        log.warning("Combined subscription rejected (%s%s)", type(exc).__name__,
+                                    f": {detail}" if detail else "")
                         if self.combined_body is None or self.combined_format != output_format:
                             raise HTTPException(502, self.sas_warning) from exc
                         combined_body = self.combined_body
@@ -1997,23 +2075,55 @@ def _plan_server_reconciliation(parsed: list[dict], existing: list[dict],
     return reconciled, merge_ids
 
 
+async def _lock_server_catalog(conn) -> None:
+    """Serialize catalog refreshes and admin writes across all Render workers."""
+    await conn.execute("SELECT pg_advisory_xact_lock(841207, 1)")
+
+
+@asynccontextmanager
+async def _server_catalog_transaction(conn):
+    try:
+        async with conn.transaction():
+            await _lock_server_catalog(conn)
+            yield
+    except TimeoutError as exc:
+        log.warning("Server catalog operation timed out while waiting on the database")
+        raise HTTPException(503, "Каталог серверов сейчас обновляется. Повторите синхронизацию через несколько секунд.") from exc
+
+
+def _subscription_uris_for_catalog(body: bytes | None) -> tuple[list[str], bool]:
+    if not body:
+        return [], False
+    try:
+        _parse_xray_json_body(body, "Подписка")
+        native_json = True
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError, base64.binascii.Error):
+        native_json = False
+    text = _decode_subscription(body, tolerate_unsupported=native_json)
+    return _extract_uris(text, tolerate_unsupported=native_json), native_json
+
+
 async def _sync_servers(conn, body: bytes, *, primary_body: bytes | None = None,
                         sas_body: bytes | None = None):
-    text = _decode_subscription(body)
-    uris = _extract_uris(text)
+    uris, native_json = _subscription_uris_for_catalog(body)
     if not uris:
+        if native_json:
+            # The JSON profile may contain valid proxy types which the admin
+            # URI catalog does not understand. Keep the last catalog snapshot;
+            # JSON delivery still preserves those raw outbounds.
+            return []
         raise HTTPException(502, "В списке апстрима нет VPN-серверов")
     parsed = [parse_server_uri(uri) for uri in uris]
     primary_entries: set[tuple[str, str]] = set()
     sas_entries: set[tuple[str, str]] = set()
     if primary_body is not None:
-        primary_entries = {(server["id"], server["source_key"]) for server in
-                           (parse_server_uri(uri) for uri in
-                            _extract_uris(_decode_subscription(primary_body)))}
+        primary_uris, _ = _subscription_uris_for_catalog(primary_body)
+        primary_entries = {(server["id"], server["source_key"])
+                           for server in (parse_server_uri(uri) for uri in primary_uris)}
     if sas_body is not None:
+        sas_uris, _ = _subscription_uris_for_catalog(sas_body)
         sas_entries = {(server["id"], server["source_key"]) for server in
-                       (parse_server_uri(uri) for uri in
-                        _extract_uris(_decode_subscription(sas_body))
+                       (parse_server_uri(uri) for uri in sas_uris
                         if not is_excluded_sas_server(uri))}
     for server in parsed:
         entry = (server["id"], server["source_key"])
@@ -2034,7 +2144,7 @@ async def _sync_servers(conn, body: bytes, *, primary_body: bytes | None = None,
                 f"provider-alias\0{identity}\0{alias_key}".encode("utf-8")
             ).hexdigest()[:24]
 
-    async with conn.transaction():
+    async with _server_catalog_transaction(conn):
         existing = await conn.fetch("""SELECT id,original_name,source_key,source,custom_name,hidden,sort_order,
             provider_order,present_upstream,first_seen_at,last_seen_at FROM servers""")
         counts = await conn.fetch("SELECT server_id,COUNT(*) AS override_count FROM user_servers GROUP BY server_id")
@@ -2067,7 +2177,8 @@ async def _sync_servers(conn, body: bytes, *, primary_body: bytes | None = None,
             if bool(_server_row_value(old, "present_upstream", False)) and str(old["id"]) not in incoming_ids:
                 reset_sources.add("sas" if _server_row_value(old, "source") == "sas" else "primary")
 
-        await conn.execute("UPDATE servers SET present_upstream=FALSE")
+        await conn.execute("""UPDATE servers SET present_upstream=FALSE
+            WHERE present_upstream=TRUE AND NOT (id=ANY($1::text[]))""", list(incoming_ids))
         for server in parsed:
             server_id = str(server["id"])
             provider_order = provider_order_by_id[server_id]
@@ -2458,11 +2569,7 @@ def _xray_placeholder_outbound(reason: str) -> dict:
 
 def _serialize_xray_document(document: dict) -> str:
     serialized = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
-    parsed = json.loads(serialized, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
-    if not isinstance(parsed, dict) or not isinstance(parsed.get("outbounds"), list):
-        raise ValueError("Сформирован некорректный Xray JSON")
-    if not _xray_json_uris(serialized):
-        raise ValueError("Сформированный Xray JSON не содержит поддерживаемого сервера")
+    _parse_xray_json_body(serialized.encode("utf-8"), "Сформированная подписка")
     return serialized
 
 
@@ -2547,6 +2654,13 @@ async def _build_manifest_json(conn, user, body: bytes, servers: list[dict]) -> 
         records = _xray_outbound_records(document, outbound)
         if not records:
             output_outbounds.append(copy.deepcopy(outbound))
+            if _xray_outbound_is_proxy(outbound):
+                # Keep native Xray proxy outbounds that the URI-based admin
+                # catalog does not know how to inspect. JSON mode must not
+                # reject or rewrite a valid provider config just to list it.
+                visible_count += 1
+                if first_visible_outbound is None:
+                    first_visible_outbound = copy.deepcopy(outbound)
             continue
 
         selected: list[tuple[dict, dict, str]] = []
@@ -3332,8 +3446,8 @@ async def users_create(data: UserBody, request: Request):
             nonce, token_hash = _main_activation_credentials(int(row["id"]))
             await conn.execute("""INSERT INTO subscription_activation(user_id,token_nonce,token_hash,device_limit)
                 VALUES($1,$2,$3,$4)""", row["id"], nonce, token_hash, data.activation_limit)
-    if row["device_limit"] is not None and not (test_mode and data.test_activation_enabled):
-        _schedule_limited_link(row["id"])
+    # A new subscription has no Drive file ID yet. sync_report schedules the
+    # Happ counter after Apps Script confirms the file was created.
     drive_sync = await state.request_drive_sync([row["id"]])
     return {"user": _serialize(row), "drive_sync": drive_sync}
 
@@ -3434,7 +3548,8 @@ async def users_update(user_id: int, data: UserBody, request: Request):
             else:
                 await conn.execute("DELETE FROM subscription_activation WHERE user_id=$1", user_id)
     if not row: raise HTTPException(404, "Пользователь не найден")
-    if row["device_limit"] is not None and not (test_mode and data.test_activation_enabled):
+    if (row["device_limit"] is not None and old_limit["drive_file_id"]
+            and not (test_mode and data.test_activation_enabled)):
         _schedule_limited_link(user_id)
     drive_sync = await state.request_drive_sync([user_id])
     return {"user": _serialize(row), "drive_sync": drive_sync}
@@ -3563,7 +3678,10 @@ async def _background_limited_link(user_id: int) -> None:
     except (HTTPException, happ_limit.HappLimitError) as exc:
         # The status and safe reason are stored for the administrator; do not
         # log credentials, provider URLs, subscription links, or response bodies.
-        log.info("Happ link is not ready: user=%d reason=%s", user_id, type(exc).__name__)
+        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        safe_detail = _safe_sync_error(str(detail))
+        log.info("Happ link is not ready: user=%d error=%s", user_id,
+                 safe_detail or type(exc).__name__)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -3979,7 +4097,8 @@ async def servers_update(server_id: str, data: ServerBody, request: Request):
     _auth(request, csrf=True)
     pool = await state.db()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("UPDATE servers SET custom_name=$2,hidden=$3,sort_order=$4 WHERE id=$1 AND present_upstream=TRUE RETURNING *", server_id, data.custom_name, data.hidden, data.sort_order)
+        async with _server_catalog_transaction(conn):
+            row = await conn.fetchrow("UPDATE servers SET custom_name=$2,hidden=$3,sort_order=$4 WHERE id=$1 AND present_upstream=TRUE RETURNING *", server_id, data.custom_name, data.hidden, data.sort_order)
     if not row: raise HTTPException(404, "Сервер не найден")
     return {"server": _serialize(row), "drive_sync": await state.request_drive_sync()}
 
@@ -3997,7 +4116,7 @@ async def servers_batch(data: ServerBatchBody, request: Request):
         raise HTTPException(422, "В пакете есть повторяющиеся серверы")
     pool = await state.db()
     async with pool.acquire() as conn:
-        async with conn.transaction():
+        async with _server_catalog_transaction(conn):
             for item in data.servers:
                 row = await conn.fetchrow("""UPDATE servers SET custom_name=$2,hidden=$3,sort_order=$4
                     WHERE id=$1 AND present_upstream=TRUE RETURNING id""",
@@ -4012,7 +4131,8 @@ async def servers_bulk(data: BulkServerBody, request: Request):
     _auth(request, csrf=True)
     pool = await state.db()
     async with pool.acquire() as conn:
-        result = await conn.execute("UPDATE servers SET hidden=$1 WHERE id=ANY($2::text[]) AND present_upstream=TRUE", data.hidden, data.server_ids)
+        async with _server_catalog_transaction(conn):
+            result = await conn.execute("UPDATE servers SET hidden=$1 WHERE id=ANY($2::text[]) AND present_upstream=TRUE", data.hidden, data.server_ids)
     return {"ok": True, "updated": int(result.rsplit(" ", 1)[-1]), "drive_sync": await state.request_drive_sync()}
 
 

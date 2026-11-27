@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import unittest
+from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -153,7 +154,7 @@ class DeviceLimitApiTests(unittest.IsolatedAsyncioTestCase):
             make_user(drive_file_id=None),
             make_user(enabled=False),
             make_user(status="pending_delete"),
-            make_user(expires_at=panel.datetime.now(panel.timezone.utc) - panel.timedelta(seconds=1)),
+            make_user(expires_at=panel.datetime.now(panel.timezone.utc) - timedelta(seconds=1)),
         )
         for user in invalid_users:
             with self.subTest(user=user):
@@ -171,7 +172,7 @@ class DeviceLimitApiTests(unittest.IsolatedAsyncioTestCase):
                     return {"slug": "ann", "drive_file_id": "file-1", "device_limit": 3}
                 if query.startswith("UPDATE users SET name=$2"):
                     self.update_query, self.update_args = query, args
-                    return {"id": 5, "device_limit": args[12], "device_limit_status": "waiting",
+                return {"id": 5, "device_limit": args[11], "device_limit_status": "waiting",
                             "happ_install_code": None, "limited_link": None}
                 return await super().fetchrow(query, *args)
 
@@ -182,9 +183,9 @@ class DeviceLimitApiTests(unittest.IsolatedAsyncioTestCase):
              patch.object(panel.state, "push_drive_sync", new=AsyncMock(return_value={"ok": True})):
             result = await panel.users_update(5, panel.UserBody(name="Ann", device_limit=99), make_request())
         self.assertEqual(result["user"]["device_limit"], 99)
-        self.assertIn("happ_install_code=CASE WHEN $14 THEN NULL", conn.update_query)
-        self.assertIn("limited_link=CASE WHEN $14 THEN NULL", conn.update_query)
-        self.assertTrue(conn.update_args[13])
+        self.assertIn("happ_install_code=CASE WHEN $13 THEN NULL", conn.update_query)
+        self.assertIn("limited_link=CASE WHEN $13 THEN NULL", conn.update_query)
+        self.assertTrue(conn.update_args[12])
         schedule.assert_called_once_with(5)
 
     async def test_legacy_limit_edit_is_rejected_without_update(self):
@@ -222,7 +223,7 @@ class DeviceLimitSettingsAndManifestTests(unittest.IsolatedAsyncioTestCase):
             async def fetchrow(self, query, *args):
                 self.insert_args = args
                 self.insert_query = query
-                return {"id": 21, "device_limit": args[10], "device_limit_status": args[11],
+                return {"id": 21, "device_limit": args[9], "device_limit_status": args[10],
                         "happ_install_code": None, "limited_link": None}
 
         for supplied, expected in ((False, 99), (True, None)):
@@ -236,10 +237,10 @@ class DeviceLimitSettingsAndManifestTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(panel.state, "push_drive_sync", new=AsyncMock(return_value={"ok": True})):
                 data = panel.UserBody(name="New profile", **({"device_limit": None} if supplied else {}))
                 result = await panel.users_create(data, make_request())
-            self.assertEqual(conn.insert_args[10], expected)
-            self.assertEqual(conn.insert_args[11], "none" if expected is None else "waiting")
+            self.assertEqual(conn.insert_args[9], expected)
+            self.assertEqual(conn.insert_args[10], "none" if expected is None else "waiting")
             self.assertEqual(result["user"]["device_limit"], expected)
-            self.assertEqual(schedule.call_count, 0 if expected is None else 1)
+            schedule.assert_not_called()
 
     async def test_creation_and_drive_sync_are_not_blocked_by_async_happ_generation(self):
         class CreateConn(FakeConn):
@@ -247,7 +248,7 @@ class DeviceLimitSettingsAndManifestTests(unittest.IsolatedAsyncioTestCase):
                 return 0
 
             async def fetchrow(self, query, *args):
-                return {"id": 22, "device_limit": args[10], "device_limit_status": args[11],
+                return {"id": 22, "device_limit": args[9], "device_limit_status": args[10],
                         "happ_install_code": None, "limited_link": None}
 
         drive_sync = AsyncMock(return_value={"ok": True, "pending": False})
@@ -259,7 +260,7 @@ class DeviceLimitSettingsAndManifestTests(unittest.IsolatedAsyncioTestCase):
             response = await panel.users_create(panel.UserBody(name="Async Happ", device_limit=3), make_request())
         self.assertEqual(response["drive_sync"]["ok"], True)
         drive_sync.assert_awaited_once_with([22])
-        schedule.assert_called_once_with(22)
+        schedule.assert_not_called()
 
     async def test_default_limit_settings_accept_none_1_and_99_and_reject_out_of_range(self):
         class SettingsConn(FakeConn):
